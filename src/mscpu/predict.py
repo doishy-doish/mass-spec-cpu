@@ -18,11 +18,14 @@ from . import run as R
 
 
 def aggregate(ranked_lists: list, k: int = 25) -> list:
-    """Top-k keys by sum of reciprocal rank across per-spectrum rankings."""
+    """Top-k keys by sum of reciprocal rank across per-spectrum rankings.
+    Only ranks <= 25 can score (MRR@25); k caps the output length."""
     score: dict = {}
     for rl in ranked_lists:
         seen = set()
-        for i, key in enumerate(rl[:k]):
+        for i, key in enumerate(rl):
+            if i >= 25:
+                break
             if not key or key in seen:
                 continue
             seen.add(key)
