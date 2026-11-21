@@ -11,7 +11,7 @@ TEST_MZ = (240.0, 465.0)
 
 def query_pool(meta: pd.DataFrame, instrument_regex: str = "timsTOF",
                mz_range: tuple = TEST_MZ) -> pd.DataFrame:
-    pool = meta[meta["instrument"].str.contains(instrument_regex, case=False, na=False)]
+    pool = meta[meta["instrument_type"].str.contains(instrument_regex, case=False, na=False)]
     return pool[(pool["precursor_mz"] >= mz_range[0]) & (pool["precursor_mz"] <= mz_range[1])]
 
 
@@ -48,7 +48,7 @@ def split_cross_instrument(meta: pd.DataFrame, pool_idx, n_struct: int = 400,
                            seed: int = 0, instrument_regex: str = "timsTOF"):
     """Harsh class 2: query structure's timsTOF spectra held; stays via other instruments."""
     rng = np.random.default_rng(seed)
-    is_inst = meta["instrument"].str.contains(instrument_regex, case=False, na=False)
+    is_inst = meta["instrument_type"].str.contains(instrument_regex, case=False, na=False)
     with_other = set(meta.loc[~is_inst, "key14"])
     keys = [k for k in pd.Index(pool_idx).map(meta["key14"]).unique() if k in with_other]
     held = set(rng.choice(keys, size=min(n_struct, len(keys)), replace=False))
