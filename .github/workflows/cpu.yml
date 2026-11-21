@@ -10,6 +10,11 @@ on:
       n:
         description: "queries"
         default: "200"
+      task:
+        description: "validate or predict"
+        default: "validate"
+        type: choice
+        options: [validate, predict]
 permissions:
   contents: write
   actions: read
@@ -29,21 +34,24 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          python -c "import os,json; open(os.path.expanduser('~/.kaggle.json'),'w').write(json.dumps({'username':os.environ['KAGGLE_USERNAME'],'key':os.environ['KAGGLE_KEY']}))"
+          python -c "import os; open(os.path.expanduser('~/.kaggle.json'),'w').write('{\"username\":\"'$KAGGLE_USERNAME'\",\"key\":\"'$KAGGLE_KEY'\"}')"
           chmod 600 ~/.kaggle.json
           kaggle competitions download -c enveda-CASMI26-molecule-id-mass-spectra -p data
-          unzip -o data/*.zip -d data
           ls -la data/
       - run: python -m pytest -q tests/
         env:
           PYTHONPATH: src
       - name: run mask
+        if: ${{ inputs.task == 'validate' }}
         run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --out results/${{ inputs.mask }}.json
+      - name: run predict
+        if: ${{ inputs.task == 'predict' }}
+        run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
       - name: scramble + commit
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
         run: |
-          node scripts/scramble.mjs encrypt results/${{ inputs.mask }}.json
+          node scripts/scramble.mjs encrypt results/*.json
           git config user.name "mscpu"
           git config user.email "mscpu@users.noreply.github.com"
           git add results/${{ inputs.mask }}.json
