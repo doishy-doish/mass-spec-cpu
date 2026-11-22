@@ -249,6 +249,7 @@ def _run_query(task):
     line = ("shard " + str(_G["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
             + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V))
+    print(line, flush=True)  # HEARTBEAT (M180): workers print as they finish; parent used to print only at the very end
     return (qi, row, len(cands), ranked_z, line)
 
 
@@ -350,6 +351,7 @@ def main() -> None:
               lib_precs=[p for p, _ in _prec_pairs], lib_pkeys=[k for _, k in _prec_pairs],
               variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
               shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
+    print("precompute done lib_keys=" + str(len(lib_clean_by_key)) + " queries=" + str(len(queries)) + " jobs=" + str(a.jobs), flush=True)  # HEARTBEAT (M180)
     tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
     if a.jobs > 1 and len(tasks) > 1:
         with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
@@ -360,7 +362,6 @@ def main() -> None:
         if res is None:
             continue
         qi, row, plen, ranked, line = res
-        print(line, flush=True)
         pools.append(plen)
         for v in VARIANTS:
             rrs[v].append(row[v])
