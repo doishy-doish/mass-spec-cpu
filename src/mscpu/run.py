@@ -195,6 +195,21 @@ def _run_query(task):
         cl, prec = _G["lib_clean"][key][0]
         nearby.append((abs(prec - q["precursor_mz"]), key, cl, prec))
     nearby.sort(key=lambda t: t[0])
+    # FUNNEL (I2-1): bin-prefilter 1500 -> top 300 by Jaccard before any cosine.
+    # Jaccard is C popcount; cosine is a Python peak loop. Saves ~1200 cosines/query.
+    if len(nearby) > 400 and qbits:
+        _lb = _G.get("lib_bits") or {}
+        scored_near = []
+        for dist, key, cl, prec in nearby:
+            bl = _lb.get(key)
+            b0 = bl[0] if bl else 0
+            try:
+                j = B.jaccard(qbits, b0)
+            except Exception:
+                j = 0.0
+            scored_near.append((j, dist, key, cl, prec))
+        scored_near.sort(key=lambda t: (-t[0], t[1]))
+        nearby = [(d, k, c, p) for _, d, k, c, p in scored_near[:300]]
     analog_pool = [(k, p, pr, _G["lib_norms"][k][0]) for _, k, p, pr in nearby[:1500]]
     scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
                          _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits,
@@ -207,10 +222,25 @@ def _run_query(task):
     scored["rrfb"] = M.rrf_fuse(scored, channels=("lib", "analog", "frag", "bin"))
     lzmax = float(scored["libz"].max()) if len(scored) else 0.0
     scored["cascade"] = scored["libz"] if lzmax > 3.0 else scored["analogz"]
+    # ROUTER (I3-1): mask-conditional fusion. Fixed fusions lose somewhere
+    # (rrfb helps easy / hurts hard). Overlap regime -> cascade, novel -> analog.
+    # Signal: per-query max lib/bin/binw (easy ~0.9, hard ~chance). 10 lines, no deps.
+    lib_max = float(scored["lib"].max()) if len(scored) else 0.0
+    bin_max = float(scored["bin"].max()) if len(scored) else 0.0
+    try:
+        binw_max = float(scored["binw"].max()) if len(scored) else 0.0
+    except Exception:
+        binw_max = 0.0
+    overlap = (lib_max > 0.5) or (bin_max > 0.4) or (binw_max > 0.4)
+    router_col = "cascade" if overlap else "analog"
     truth = q["key14"]
     row = {}
     ranked_z = None
     for v in V:
+        if v == "router":
+            ranked = scored.sort_values(router_col, ascending=False)["key14"].tolist()[:25]
+            row[v] = M.reciprocal_rank(truth, ranked)
+            continue
         col = {"lib": "lib", "analog": "analog", "frag": "frag"}.get(v, v)
         ranked = scored.sort_values(col, ascending=False)["key14"].tolist()[:25]
         row[v] = M.reciprocal_rank(truth, ranked)
@@ -260,7 +290,6 @@ def main() -> None:
         library, queries, _ = V.split_class3(meta, pool, a.n, a.seed)
     else:
         library, queries, _ = V.split_cross_instrument(meta, pool, a.n, a.seed)
-    queries = queries[a.shard::a.shards]
     lib_set = set(library)
     lib_clean_by_key: dict = {}
     for idx in library:
@@ -285,7 +314,33 @@ def main() -> None:
     struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
     masses = struct_m["neutral"].to_numpy()
 
-    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw"]
+    # SNAKE-DRAFT (I4-1): balance 5 runners by ppm pool size, not stride.
+    # Stride caused 8.3 vs 15.3min spread (slowest shard = fleet wall).
+    # Cost proxy = candidate count via masses; snake 0,1,2,3,4,4,3,2,1,0...
+    if a.shards > 1 and len(queries) > 1:
+        qcosts = []
+        for qi in queries:
+            r = meta.loc[qi]
+            qnm = S.neutral_mass(r["precursor_mz"], r["adduct"])
+            if not qnm:
+                qcosts.append(0)
+                continue
+            tol = qnm * a.ppm * 1e-6
+            lo = np.searchsorted(masses, qnm - tol)
+            hi = np.searchsorted(masses, qnm + tol, side="right")
+            qcosts.append(int(hi - lo))
+        order = sorted(range(len(queries)), key=lambda i: -qcosts[i])
+        buckets: list = [[] for _ in range(a.shards)]
+        for rank, idx in enumerate(order):
+            rnd = rank // a.shards
+            pos = rank % a.shards
+            b = pos if (rnd % 2 == 0) else (a.shards - 1 - pos)
+            buckets[b].append(queries[idx])
+        queries = sorted(buckets[a.shard])
+    else:
+        queries = queries[a.shard::a.shards]
+
+    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router"]
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
@@ -319,7 +374,7 @@ def main() -> None:
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
            "mrr_cascade": _avg(rrs["cascade"]),
            "mrr_bin": _avg(rrs["bin"]), "mrr_rrfb": _avg(rrs["rrfb"]),
-           "mrr_binw": _avg(rrs["binw"]),
+           "mrr_binw": _avg(rrs["binw"]), "mrr_router": _avg(rrs["router"]),
            "qpeak": a.qpeak, "qloss": a.qloss,
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
