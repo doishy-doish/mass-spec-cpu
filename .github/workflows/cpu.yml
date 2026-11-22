@@ -11,10 +11,10 @@ on:
         description: "queries"
         default: "200"
       task:
-        description: "validate or predict"
+        description: "validate, predict, or measure store"
         default: "validate"
         type: choice
-        options: [validate, predict]
+        options: [validate, predict, measure]
       engine:
         description: "binary channel engine"
         default: "python"
@@ -80,6 +80,11 @@ jobs:
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
+      - name: run measure
+        if: ${{ inputs.task == 'measure' }}
+        run: |
+          pip install -q zstd
+          PYTHONPATH=src python scripts/measure_store.py --data data/train.parquet --out results/measure.json
       - name: scramble + commit
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
