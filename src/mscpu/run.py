@@ -115,8 +115,7 @@ def main() -> None:
     struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
     masses = struct_m["neutral"].to_numpy()
 
-    preds, rrs, pools = {}, [], []
-    ch_rrs = {"lib": [], "analog": [], "frag": []}
+    preds, rrs = {}, []
     for qi in queries:
         q = meta.loc[qi]
         qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
@@ -135,30 +134,19 @@ def main() -> None:
                 continue
             for mzs, ints, prec in spec_list[:1]:
                 if abs(prec - q["precursor_mz"]) <= 50:
-                    analog_pool.append((key, S.clean(mzs, ints, prec), prec, abs(prec - q["precursor_mz"])))
+                    analog_pool.append((key, S.clean(mzs, ints, prec), prec))
                     break
-        analog_pool.sort(key=lambda t: t[3])
-        analog_pool = [(k, p, pr) for k, p, pr, _ in analog_pool[:1500]]
+            if len(analog_pool) >= 1500:
+                break
         scored = score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, analog_pool)
-        for ch in ["lib", "analog", "frag"]:
-            m, s = scored[ch].mean(), scored[ch].std() + 1e-9
-            scored[ch + "z"] = (scored[ch] - m) / s
-        scored["score"] = scored[["libz", "analogz", "fragz"]].sum(axis=1)
-        truth = q["key14"]
+        scored["score"] = M.rrf_fuse(scored)
         ranked = scored.sort_values("score", ascending=False)["key14"].tolist()[:25]
+        truth = q["key14"]
         preds[str(qi)] = ranked
         rrs.append(M.reciprocal_rank(truth, ranked))
-        for ch in ["lib", "analog", "frag"]:
-            ch_ranked = scored.sort_values(ch, ascending=False)["key14"].tolist()[:25]
-            ch_rrs[ch].append(M.reciprocal_rank(truth, ch_ranked))
-        pools.append(len(cands))
         print(f"q={qi} pool={len(cands)} rr={rrs[-1]:.3f}", flush=True)
 
     out = {"mask": a.mask, "n": len(rrs), "mrr": float(np.mean(rrs)) if rrs else 0.0,
-            "mrr_lib": float(np.mean(ch_rrs["lib"])) if rrs else 0.0,
-            "mrr_analog": float(np.mean(ch_rrs["analog"])) if rrs else 0.0,
-            "mrr_frag": float(np.mean(ch_rrs["frag"])) if rrs else 0.0,
-            "rrs": [round(float(x), 6) for x in rrs], "pools": pools, "qidx": queries,
            "hit1": float(np.mean([r == 1.0 for r in rrs])) if rrs else 0.0,
            "hit25": float(np.mean([r > 0 for r in rrs])) if rrs else 0.0}
     with open(a.out, "w") as f:
