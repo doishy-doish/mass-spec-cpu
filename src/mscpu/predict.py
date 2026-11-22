@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from . import spectra as S
+from . import metric as M
 from . import run as R
 
 
@@ -34,16 +35,6 @@ def aggregate(ranked_lists: list, k: int = 25) -> list:
     return sorted(score, key=lambda kk: -score[kk])[:k]
 
 
-def rrf_fuse(scored, channels=("lib", "analog", "frag"), base=60.0):
-    """Reciprocal-rank fusion over per-channel rankings (robust across masks:
-    z-sum let dead channels outvote live ones on class2/class3)."""
-    fused = pd.Series(0.0, index=scored.index)
-    for ch in channels:
-        order = scored[ch].rank(ascending=False, method="min")
-        fused = fused + 1.0 / (base + order)
-    return fused
-
-
 def rank_spectrum(q, cands, lib_by_key, fp_cache) -> list:
     qpeaks = S.clean(q["ms2_mzs"], q["ms2_normalized_intensities"], q["precursor_mz"])
     cand_keys = set(cands["key14"])
@@ -59,7 +50,7 @@ def rank_spectrum(q, cands, lib_by_key, fp_cache) -> list:
     pool.sort(key=lambda t: t[3])
     pool = [(k_, p, pr) for k_, p, pr, _ in pool[:1500]]
     scored = R.score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, pool)
-    scored["score"] = rrf_fuse(scored)
+    scored["score"] = M.rrf_fuse(scored)
     return scored.sort_values("score", ascending=False)["key14"].tolist()[:25]
 
 
