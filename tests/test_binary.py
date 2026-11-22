@@ -42,3 +42,31 @@ def test_bins_match_encode_bits():
     for q in lb:
         bits |= 1 << (B._mix(q, salt=1) % B.NBITS)
     assert bits == ref
+
+
+def test_weighted_empty():
+    assert B.encode_weighted([], 100.0) == {}
+    assert B.encode_weighted(None, 100.0) == {}
+    assert B.wjaccard({}, {1: 1.0}) == 0.0
+    assert B.wjaccard({1: 1.0}, {}) == 0.0
+
+
+def test_weighted_self_is_one():
+    import numpy as np
+    peaks = np.array([[100.0, 1.0], [200.5, 0.5], [350.25, 0.2]])
+    w = B.encode_weighted(peaks, 400.0)
+    assert len(w) > 0
+    assert B.wjaccard(w, w) == 1.0
+
+
+def test_weighted_binary_weights_equal_jaccard():
+    """0/1 weights reduce exactly to unweighted Jaccard over the key sets."""
+    a = {1: 1.0, 2: 1.0, 3: 1.0}
+    b = {2: 1.0, 3: 1.0, 4: 1.0}
+    assert B.wjaccard(a, b) == 0.5
+    # shared strong peak outscores shared weak peak
+    strong = B.wjaccard({1: 1.0, 2: 0.01}, {1: 1.0, 3: 0.01})
+    weak = B.wjaccard({1: 0.01, 2: 1.0}, {1: 0.01, 3: 1.0})
+    assert strong > 0.9
+    assert weak < 0.1
+    assert strong > weak
