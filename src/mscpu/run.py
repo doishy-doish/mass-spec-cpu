@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import concurrent.futures as CF
 import json
 import subprocess
@@ -49,12 +50,27 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 analog_pool: list, lib_bits_by_key: dict | None = None,
                 qbits: int = 0, bin_override: dict | None = None,
                 lib_wbits_by_key: dict | None = None,
-                qwbits: dict | None = None) -> pd.DataFrame:
-    """analog_pool: [(key14, cleaned_peaks, precursor)] once per query (mass-windowed)."""
+                qwbits: dict | None = None, qloss_pre: set | None = None,
+                floss_by_key: dict | None = None, nq: float | None = None,
+                lib_norms: dict | None = None) -> pd.DataFrame:
+    """FURNACE (bench-gated, one knob): two-pointer cosine with precomputed norms,
+    pool entries (key14, peaks, precursor[, norm]) — 4-tuples from run.py, 3-tuples
+    from predict.py (norm computed inline). qloss/floss hoisted: library is static,
+    so per-structure loss sets are built once in main, not per candidate per query."""
+    if nq is None:
+        nq = float((qpeaks[:, 1] ** 2).sum()) if len(qpeaks) else 0.0
+    qloss = qloss_pre
+    if qloss is None:
+        qloss = set(round(float(qprec - mz), 2) for mz, _ in qpeaks[:32])
     # analog matches once per query: top analog structures by mass-shift cosine
     analog_hits = []
-    for okey, opeaks, oprec in analog_pool:
-        ms = S.modified_cosine(qpeaks, opeaks, qprec - oprec)
+    for entry in analog_pool:
+        if len(entry) == 4:
+            okey, opeaks, oprec, onorm = entry
+        else:
+            okey, opeaks, oprec = entry
+            onorm = None
+        ms = S.modified_cosine(qpeaks, opeaks, qprec - oprec, na=nq, nb=onorm)
         if ms > 0.3:
             ofp = FP_CACHE.get(okey)
             if ofp is not None:
@@ -62,41 +78,53 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
     analog_hits.sort(key=lambda t: -t[1])
     analog_hits = analog_hits[:10]
     rows = []
-    for _, c in cands.iterrows():
+    for c in cands.itertuples():
+        ckey = c.key14
+        cl_list = lib_clean.get(ckey, [])
         # library channel: max cosine vs structure's own spectra
         lib = 0.0
-        for cl, prec in lib_clean.get(c["key14"], []):
-            lib = max(lib, S.cosine(qpeaks, cl))
+        norms = (lib_norms or {}).get(ckey) if lib_norms else None
+        for idx, (cl, prec) in enumerate(cl_list):
+            nn = norms[idx] if norms is not None and idx < len(norms) else None
+            s = S.cosine(qpeaks, cl, na=nq, nb=nn)
+            if s > lib:
+                lib = s
         # analog channel: best mass-shift match x Tanimoto to candidate
         analog = 0.0
-        cfp = c["fp"]
+        cfp = c.fp
         if cfp is not None:
             for ofp, ms in analog_hits:
-                analog = max(analog, ms * fp.tanimoto_fp(ofp, cfp))
+                v = ms * fp.tanimoto_fp(ofp, cfp)
+                if v > analog:
+                    analog = v
         # fragmentation proxy: shared neutral losses (precursor - fragment)
-        qloss = set(round(float(qprec - mz), 2) for mz, _ in qpeaks[:32])
+        fl = (floss_by_key or {}).get(ckey) if floss_by_key else None
+        if fl is None:
+            fl = [set(round(float(prec - mz), 2) for mz, _ in cl[:32]) if len(cl) else set()
+                  for cl, prec in cl_list[:2]]
         frag = 0.0
-        for cl, prec in lib_clean.get(c["key14"], [])[:2]:
-            if len(cl):
-                floss = set(round(float(prec - mz), 2) for mz, _ in cl[:32])
-                frag = max(frag, len(qloss & floss) / max(1, len(qloss)))
+        for floss in fl[:2]:
+            if floss:
+                v = len(qloss & floss) / max(1, len(qloss))
+                if v > frag:
+                    frag = v
         # binary channel: Rust inference when the driver passes scores, else local Jaccard
         bscore = 0.0
         if bin_override is not None:
-            bscore = float(bin_override.get(c["key14"], 0.0))
+            bscore = float(bin_override.get(ckey, 0.0))
         elif qbits and lib_bits_by_key:
-            for lb in lib_bits_by_key.get(c["key14"], []):
+            for lb in lib_bits_by_key.get(ckey, []):
                 j = B.jaccard(qbits, lb)
                 if j > bscore:
                     bscore = j
         # weighted-binary channel: Ruzicka Jaccard, intensity restored (BIN-WEIGHTS)
         bwscore = 0.0
         if qwbits and lib_wbits_by_key:
-            for wb in lib_wbits_by_key.get(c["key14"], []):
+            for wb in lib_wbits_by_key.get(ckey, []):
                 j = B.wjaccard(qwbits, wb)
                 if j > bwscore:
                     bwscore = j
-        rows.append({"key14": c["key14"], "lib": lib, "analog": analog, "frag": frag, "bin": bscore, "binw": bwscore})
+        rows.append({"key14": ckey, "lib": lib, "analog": analog, "frag": frag, "bin": bscore, "binw": bwscore})
     return pd.DataFrame(rows)
 
 
@@ -153,19 +181,26 @@ def _run_query(task):
         bin_override = rust_bin_scores(_G["rust_bin"], qbins, ref_bins)
         if bin_override is None:
             print("rust engine failed on q=" + str(qi) + ", falling back to python", flush=True)
-    # analog pool: library structures within +-50 Da, capped, cleaned once
-    analog_pool = []
-    for key, spec_list in _G["lib_clean"].items():
+    nq = float((qpeaks[:, 1] ** 2).sum()) if len(qpeaks) else 0.0
+    qloss = set(round(float(q["precursor_mz"] - mz), 2) for mz, _ in qpeaks[:32])
+    # analog pool: bisect on precomputed precursor-sorted library array
+    # (was: full dict scan + Python abs() per library key, per query)
+    precs = _G["lib_precs"]
+    pkeys = _G["lib_pkeys"]
+    plo = bisect.bisect_left(precs, q["precursor_mz"] - 50.0)
+    phi = bisect.bisect_right(precs, q["precursor_mz"] + 50.0, lo=plo)
+    nearby = []
+    for idx in range(plo, phi):
+        key = pkeys[idx]
         if key in cand_keys:
             continue
-        for cl, prec in spec_list[:1]:
-            if abs(prec - q["precursor_mz"]) <= 50:
-                analog_pool.append((key, cl, prec, abs(prec - q["precursor_mz"])))
-                break
-    analog_pool.sort(key=lambda e: e[3])
-    analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
+        cl, prec = _G["lib_clean"][key][0]
+        nearby.append((abs(prec - q["precursor_mz"]), key, cl, prec))
+    nearby.sort(key=lambda t: t[0])
+    analog_pool = [(k, p, pr, _G["lib_norms"][k][0]) for _, k, p, pr in nearby[:1500]]
     scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
-                         _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits)
+                         _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits,
+                         qloss, _G["lib_floss"], nq, _G["lib_norms"])
     for ch in ["lib", "analog", "frag"]:
         m, s = scored[ch].mean(), scored[ch].std() + 1e-9
         scored[ch + "z"] = (scored[ch] - m) / s
@@ -240,6 +275,14 @@ def main() -> None:
                        for k, v in lib_clean_by_key.items()}
     lib_wbits_by_key = {k: [B.encode_weighted(cl, prec, a.qpeak, a.qloss) for cl, prec in v]
                         for k, v in lib_clean_by_key.items()}
+    # FURNACE precomputes (library is static): spectrum norms, neutral-loss sets,
+    # precursor-sorted key array for bisect pool lookup
+    lib_norms_by_key = {k: [float((cl[:, 1] ** 2).sum()) if len(cl) else 0.0 for cl, _ in v]
+                        for k, v in lib_clean_by_key.items()}
+    lib_floss_by_key = {k: [set(round(float(prec - mz), 2) for mz, _ in cl[:32]) if len(cl) else set()
+                            for cl, prec in v[:2]]
+                        for k, v in lib_clean_by_key.items()}
+    _prec_pairs = sorted((prec, k) for k, v in lib_clean_by_key.items() for cl, prec in v[:1])
 
     # candidate pool: structures within ppm of query neutral mass (train structures only;
     # competition adds COCONUT — pool grows ~2.6x, noted in contracts)
@@ -252,6 +295,8 @@ def main() -> None:
     pools: list = []
     _G.update(meta=meta, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
               lib_bits=lib_bits_by_key, lib_bins=lib_bins_by_key, lib_wbits=lib_wbits_by_key,
+              lib_norms=lib_norms_by_key, lib_floss=lib_floss_by_key,
+              lib_precs=[p for p, _ in _prec_pairs], lib_pkeys=[k for _, k in _prec_pairs],
               variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
               shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
     tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
