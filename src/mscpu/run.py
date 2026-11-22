@@ -11,7 +11,11 @@ import argparse
 import bisect
 import concurrent.futures as CF
 import json
+import os
+import signal
 import subprocess
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -152,6 +156,41 @@ FP_CACHE: dict = {}
 _G = {}
 
 
+def _mem_state():
+    """(rss_mb, memavail_mb) or (None, None). Linux runners only; never raises."""
+    try:
+        rss = avail = None
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) // 1024
+                    break
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) // 1024
+                    break
+        return rss, avail
+    except Exception:
+        return None, None
+
+
+def _sigterm_loud(signum, frame):
+    """Host asked us to die: scream our memory state, then go. Distinguishes
+    infra reclaim (this line present, GBs free) from pressure (absent/ramp-to-zero)."""
+    rss, avail = _mem_state()
+    try:
+        print("LOUD-SIGTERM host shutdown rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
+    finally:
+        os._exit(143)
+
+
+def _mem_watch(stop, interval=20.0):
+    while not stop.wait(interval):
+        rss, avail = _mem_state()
+        print("LOUD-MEM rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
+
+
 def _run_query(task):
     """One query end-to-end. Fork-worker safe: reads only _G + module globals.
     Returns (qi, {variant: rr}, pool_len, ranked_z_or_None, logline), or None if skipped."""
@@ -272,6 +311,11 @@ def main() -> None:
                     help="inserted before the extension of --out, e.g. '-binwprobe'; "
                          "probes must use one so they never clobber fleet shard files")
     a = ap.parse_args()
+    signal.signal(signal.SIGTERM, _sigterm_loud)
+    _stop = threading.Event()
+    threading.Thread(target=_mem_watch, args=(_stop,), daemon=True).start()
+    _rss0, _avail0 = _mem_state()
+    print("LOUD-START rss_mb=" + str(_rss0) + " memavail_mb=" + str(_avail0), flush=True)
     out_path = a.out
     if a.out_suffix:
         head, sep, tail = out_path.rpartition("/")
@@ -351,7 +395,8 @@ def main() -> None:
               lib_precs=[p for p, _ in _prec_pairs], lib_pkeys=[k for _, k in _prec_pairs],
               variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
               shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
-    print("precompute done lib_keys=" + str(len(lib_clean_by_key)) + " queries=" + str(len(queries)) + " jobs=" + str(a.jobs), flush=True)  # HEARTBEAT (M180)
+    _rss, _avail = _mem_state()
+    print("precompute done lib_keys=" + str(len(lib_clean_by_key)) + " queries=" + str(len(queries)) + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail), flush=True)  # HEARTBEAT (M180)
     tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
     if a.jobs > 1 and len(tasks) > 1:
         with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
@@ -385,6 +430,10 @@ def main() -> None:
            "pools": pools, "qidx": [int(q) for q in queries]}
     with open(out_path, "w") as f:
         json.dump(out, f)
+    try:
+        _stop.set()
+    except Exception:
+        pass
     print(json.dumps(out))
 
 
