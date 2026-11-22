@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -45,7 +46,7 @@ def structure_table(meta: pd.DataFrame) -> pd.DataFrame:
 
 def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
                 analog_pool: list, lib_bits_by_key: dict | None = None,
-                qbits: int = 0) -> pd.DataFrame:
+                qbits: int = 0, bin_override: dict | None = None) -> pd.DataFrame:
     """analog_pool: [(key14, cleaned_peaks, precursor)] once per query (mass-windowed)."""
     # analog matches once per query: top analog structures by mass-shift cosine
     analog_hits = []
@@ -77,15 +78,38 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
             if len(cl):
                 floss = set(round(float(prec - mz), 2) for mz, _ in cl[:32])
                 frag = max(frag, len(qloss & floss) / max(1, len(qloss)))
-        # binary channel: max Jaccard vs structure's own spectra bitsets
+        # binary channel: Rust inference when the driver passes scores, else local Jaccard
         bscore = 0.0
-        if qbits and lib_bits_by_key:
+        if bin_override is not None:
+            bscore = float(bin_override.get(c["key14"], 0.0))
+        elif qbits and lib_bits_by_key:
             for lb in lib_bits_by_key.get(c["key14"], []):
                 j = B.jaccard(qbits, lb)
                 if j > bscore:
                     bscore = j
         rows.append({"key14": c["key14"], "lib": lib, "analog": analog, "frag": frag, "bin": bscore})
     return pd.DataFrame(rows)
+
+
+def rust_bin_scores(rust_bin, qbins, ref_bins) -> dict | None:
+    """Rust inference: one process call per query. ref_bins = [(tag, p, l)].
+    Returns tag->score, or None on any failure (caller falls back to Python)."""
+    try:
+        payload = {"q": {"p": qbins[0], "l": qbins[1]},
+                   "refs": [{"key": t, "p": p, "l": l} for t, p, l in ref_bins]}
+        pr = subprocess.run([rust_bin], input=json.dumps(payload), capture_output=True,
+                            text=True, timeout=600)
+        if pr.returncode != 0:
+            return None
+        data = json.loads(pr.stdout)
+        best: dict = {}
+        for tag, s in data.get("scores", []):
+            key = tag.rsplit("#", 1)[0]
+            if s > best.get(key, 0.0):
+                best[key] = float(s)
+        return best
+    except Exception:
+        return None
 
 
 FP_CACHE: dict = {}
@@ -98,6 +122,8 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ppm", type=float, default=8.5)
+    ap.add_argument("--engine", choices=["python", "rust"], default="python")
+    ap.add_argument("--rust-bin", default="rust-bitvec/target/release/binvec")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -123,6 +149,12 @@ def main() -> None:
         r = meta.loc[idx]
         lib_bits_by_key.setdefault(r["key14"], []).append(
             B.encode(S.clean(r["mzs"], r["ints"], r["precursor_mz"]), r["precursor_mz"]))
+    lib_bins_by_key: dict = {}
+    for idx in library:
+        r = meta.loc[idx]
+        cl = S.clean(r["mzs"], r["ints"], r["precursor_mz"])
+        lib_bins_by_key.setdefault(r["key14"], []).append(
+            B.encode_bins(cl, r["precursor_mz"]))
 
     # candidate pool: structures within ppm of query neutral mass (train structures only;
     # competition adds COCONUT — pool grows ~2.6x, noted in contracts)
@@ -140,6 +172,17 @@ def main() -> None:
             continue
         qpeaks = S.clean(q["mzs"], q["ints"], q["precursor_mz"])
         qbits = B.encode(qpeaks, q["precursor_mz"])
+        qbins = B.encode_bins(qpeaks, q["precursor_mz"])
+        bin_override = None
+        if a.engine == "rust":
+            cand_keys = set(cands["key14"])
+            ref_bins = []
+            for key in cand_keys:
+                for i, (p, l) in enumerate(lib_bins_by_key.get(key, [])):
+                    ref_bins.append((key + "#" + str(i), p, l))
+            bin_override = rust_bin_scores(a.rust_bin, qbins, ref_bins)
+            if bin_override is None:
+                print("rust engine failed on q=" + str(qi) + ", falling back to python", flush=True)
         tol = qnm * a.ppm * 1e-6
         lo = np.searchsorted(masses, qnm - tol)
         hi = np.searchsorted(masses, qnm + tol, side="right")
@@ -157,7 +200,7 @@ def main() -> None:
         analog_pool.sort(key=lambda e: e[3])
         analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
         scored = score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, analog_pool,
-                             lib_bits_by_key, qbits)
+                             lib_bits_by_key, qbits, bin_override)
         for ch in ["lib", "analog", "frag"]:
             m, s = scored[ch].mean(), scored[ch].std() + 1e-9
             scored[ch + "z"] = (scored[ch] - m) / s
@@ -179,7 +222,7 @@ def main() -> None:
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
-    out = {"mask": a.mask, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
+    out = {"mask": a.mask, "engine": a.engine, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
            "mrr_lib": _avg(rrs["lib"]), "mrr_analog": _avg(rrs["analog"]),
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
            "mrr_cascade": _avg(rrs["cascade"]),
