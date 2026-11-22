@@ -47,7 +47,9 @@ def structure_table(meta: pd.DataFrame) -> pd.DataFrame:
 
 def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 analog_pool: list, lib_bits_by_key: dict | None = None,
-                qbits: int = 0, bin_override: dict | None = None) -> pd.DataFrame:
+                qbits: int = 0, bin_override: dict | None = None,
+                lib_wbits_by_key: dict | None = None,
+                qwbits: dict | None = None) -> pd.DataFrame:
     """analog_pool: [(key14, cleaned_peaks, precursor)] once per query (mass-windowed)."""
     # analog matches once per query: top analog structures by mass-shift cosine
     analog_hits = []
@@ -87,7 +89,14 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 j = B.jaccard(qbits, lb)
                 if j > bscore:
                     bscore = j
-        rows.append({"key14": c["key14"], "lib": lib, "analog": analog, "frag": frag, "bin": bscore})
+        # weighted-binary channel: Ruzicka Jaccard, intensity restored (BIN-WEIGHTS)
+        bwscore = 0.0
+        if qwbits and lib_wbits_by_key:
+            for wb in lib_wbits_by_key.get(c["key14"], []):
+                j = B.wjaccard(qwbits, wb)
+                if j > bwscore:
+                    bwscore = j
+        rows.append({"key14": c["key14"], "lib": lib, "analog": analog, "frag": frag, "bin": bscore, "binw": bwscore})
     return pd.DataFrame(rows)
 
 
@@ -128,7 +137,8 @@ def _run_query(task):
         return None
     qpeaks = S.clean(q["mzs"], q["ints"], q["precursor_mz"])
     qbits = B.encode(qpeaks, q["precursor_mz"])
-    qbins = B.encode_bins(qpeaks, q["precursor_mz"])
+    qbins = B.encode_bins(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
+    qwbits = B.encode_weighted(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
     tol = qnm * _G["ppm"] * 1e-6
     lo = np.searchsorted(_G["masses"], qnm - tol)
     hi = np.searchsorted(_G["masses"], qnm + tol, side="right")
@@ -155,7 +165,7 @@ def _run_query(task):
     analog_pool.sort(key=lambda e: e[3])
     analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
     scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
-                         _G["lib_bits"], qbits, bin_override)
+                         _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits)
     for ch in ["lib", "analog", "frag"]:
         m, s = scored[ch].mean(), scored[ch].std() + 1e-9
         scored[ch + "z"] = (scored[ch] - m) / s
@@ -191,6 +201,8 @@ def main() -> None:
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--qpeak", type=float, default=0.05)
+    ap.add_argument("--qloss", type=float, default=0.01)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -215,21 +227,24 @@ def main() -> None:
         lib_clean_by_key.setdefault(r["key14"], []).append((cl, r["precursor_mz"]))
     lib_bits_by_key = {k: [B.encode(cl, prec) for cl, prec in v]
                        for k, v in lib_clean_by_key.items()}
-    lib_bins_by_key = {k: [B.encode_bins(cl, prec) for cl, prec in v]
+    lib_bins_by_key = {k: [B.encode_bins(cl, prec, a.qpeak, a.qloss) for cl, prec in v]
                        for k, v in lib_clean_by_key.items()}
+    lib_wbits_by_key = {k: [B.encode_weighted(cl, prec, a.qpeak, a.qloss) for cl, prec in v]
+                        for k, v in lib_clean_by_key.items()}
 
     # candidate pool: structures within ppm of query neutral mass (train structures only;
     # competition adds COCONUT — pool grows ~2.6x, noted in contracts)
     struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
     masses = struct_m["neutral"].to_numpy()
 
-    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb"]
+    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw"]
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
     _G.update(meta=meta, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
-              lib_bits=lib_bits_by_key, lib_bins=lib_bins_by_key, variants=VARIANTS,
-              engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm, shard=a.shard)
+              lib_bits=lib_bits_by_key, lib_bins=lib_bins_by_key, lib_wbits=lib_wbits_by_key,
+              variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
+              shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
     tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
     if a.jobs > 1 and len(tasks) > 1:
         with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
@@ -254,6 +269,7 @@ def main() -> None:
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
            "mrr_cascade": _avg(rrs["cascade"]),
            "mrr_bin": _avg(rrs["bin"]), "mrr_rrfb": _avg(rrs["rrfb"]),
+           "mrr_binw": _avg(rrs["binw"]),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
