@@ -9,7 +9,8 @@
 //!   {"scores": [["<key>", jaccard], ...]}
 
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{BufRead, Read, Write};
 
 const NBITS: u64 = 4096;
 const KNUTH: u64 = 2654435761;
@@ -72,6 +73,11 @@ fn jaccard(a: &[u64; 64], b: &[u64; 64]) -> f64 {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "worker") {
+        worker();
+        return;
+    }
     let mut buf = String::new();
     std::io::stdin()
         .read_to_string(&mut buf)
@@ -85,4 +91,58 @@ fn main() {
     }
     let out = Out { scores };
     println!("{}", serde_json::to_string(&out).expect("binvec: serialize"));
+}
+
+#[derive(Deserialize)]
+struct LibMsg {
+    lib: HashMap<String, Vec<Spec>>,
+}
+
+#[derive(Deserialize)]
+struct Query {
+    q: Spec,
+    cands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct Ready {
+    ready: bool,
+}
+
+fn worker() {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let first = lines.next().expect("binvec: eof").expect("binvec: read");
+    let libmsg: LibMsg = serde_json::from_str(&first).expect("binvec: parse lib");
+    let mut lib: HashMap<String, Vec<[u64; 64]>> = HashMap::with_capacity(libmsg.lib.len());
+    for (k, specs) in &libmsg.lib {
+        lib.insert(k.clone(), specs.iter().map(|s| encode(&s.p, &s.l)).collect());
+    }
+    let stdout = std::io::stdout();
+    let mut h = stdout.lock();
+    writeln!(h, "{}", serde_json::to_string(&Ready { ready: true }).unwrap()).unwrap();
+    h.flush().unwrap();
+    for line in lines {
+        let line = line.expect("binvec: read");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let q: Query = serde_json::from_str(&line).expect("binvec: parse query");
+        let qb = encode(&q.q.p, &q.q.l);
+        let mut scores = Vec::with_capacity(q.cands.len());
+        for key in &q.cands {
+            let mut best = 0.0;
+            if let Some(specs) = lib.get(key) {
+                for rb in specs {
+                    let j = jaccard(&qb, rb);
+                    if j > best {
+                        best = j;
+                    }
+                }
+            }
+            scores.push((key.clone(), best));
+        }
+        writeln!(h, "{}", serde_json::to_string(&Out { scores }).unwrap()).unwrap();
+        h.flush().unwrap();
+    }
 }
