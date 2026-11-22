@@ -191,6 +191,44 @@ def _mem_watch(stop, interval=20.0):
         print("LOUD-MEM rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
 
 
+class _LazyLayer(dict):
+    """dict interface, values built on demand from lib_clean. Bounded cache.
+
+    MEMORY FIX: full-corpus derived layers (bits/bins/wbits over ~2.5M spectra)
+    were GBs of dicts touched per-query only for candidate keys (~thousands).
+    Same B.encode* on same (cl, prec) => numeric-identical, RAM on demand.
+    score_query/predict/tests all use .get(ckey, default) — covered here.
+    Real dicts still work everywhere (predict/tests pass their own)."""
+
+    def __init__(self, build, cap=400000):
+        dict.__init__(self)
+        self._build = build
+        self._cap = cap
+
+    def get(self, k, default=None):
+        try:
+            return dict.__getitem__(self, k)
+        except KeyError:
+            pass
+        if len(self) >= self._cap:
+            self.clear()
+        v = self._build(k)
+        dict.__setitem__(self, k, v)
+        return v
+
+
+def _build_bits(ckey):
+    return [B.encode(cl, prec) for cl, prec in _G["lib_clean"].get(ckey, [])]
+
+
+def _build_bins(ckey):
+    return [B.encode_bins(cl, prec, _G["qpeak"], _G["qloss"]) for cl, prec in _G["lib_clean"].get(ckey, [])]
+
+
+def _build_wbits(ckey):
+    return [B.encode_weighted(cl, prec, _G["qpeak"], _G["qloss"]) for cl, prec in _G["lib_clean"].get(ckey, [])]
+
+
 def _run_query(task):
     """One query end-to-end. Fork-worker safe: reads only _G + module globals.
     Returns (qi, {variant: rr}, pool_len, ranked_z_or_None, logline), or None if skipped."""
@@ -200,7 +238,8 @@ def _run_query(task):
     qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
     if not qnm:
         return None
-    qpeaks = S.clean(q["mzs"], q["ints"], q["precursor_mz"])
+    qmzs, qints = _G["qspec"][qi]
+    qpeaks = S.clean(qmzs, qints, q["precursor_mz"])
     qbits = B.encode(qpeaks, q["precursor_mz"])
     qbins = B.encode_bins(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
     qwbits = B.encode_weighted(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
@@ -341,12 +380,8 @@ def main() -> None:
         r = meta.loc[idx]
         cl = S.clean(r["mzs"], r["ints"], r["precursor_mz"])
         lib_clean_by_key.setdefault(r["key14"], []).append((cl, r["precursor_mz"]))
-    lib_bits_by_key = {k: [B.encode(cl, prec) for cl, prec in v]
-                       for k, v in lib_clean_by_key.items()}
-    lib_bins_by_key = {k: [B.encode_bins(cl, prec, a.qpeak, a.qloss) for cl, prec in v]
-                       for k, v in lib_clean_by_key.items()}
-    lib_wbits_by_key = {k: [B.encode_weighted(cl, prec, a.qpeak, a.qloss) for cl, prec in v]
-                        for k, v in lib_clean_by_key.items()}
+    # derived layers (bits/bins/wbits) are LAZY (_LazyLayer, built per touched key):
+    # full-corpus dicts were GBs, per-query only candidate keys (~thousands) are read.
     # FURNACE precomputes (library is static): spectrum norms,
     # precursor-sorted key array for bisect pool lookup.
     # (No loss-set cache: ~0.5GB eager, blew the 16GB runner — M174.)
@@ -385,12 +420,19 @@ def main() -> None:
     else:
         queries = queries[a.shard::a.shards]
 
+    # MEMORY FIX: raw peak lists are duplicated into lib_clean (cleaned arrays);
+    # stash query spectra, then drop the object columns (GBs) before workers fork.
+    qspec = {qi: (meta.at[qi, "mzs"], meta.at[qi, "ints"]) for qi in queries}
+    meta = meta.drop(columns=["mzs", "ints"])
+    import gc as _gc
+    _gc.collect()
+
     VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router"]
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
-    _G.update(meta=meta, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
-              lib_bits=lib_bits_by_key, lib_bins=lib_bins_by_key, lib_wbits=lib_wbits_by_key,
+    _G.update(meta=meta, qspec=qspec, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
+              lib_bits=_LazyLayer(_build_bits), lib_bins=_LazyLayer(_build_bins), lib_wbits=_LazyLayer(_build_wbits),
               lib_norms=lib_norms_by_key,
               lib_precs=[p for p, _ in _prec_pairs], lib_pkeys=[k for _, k in _prec_pairs],
               variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
