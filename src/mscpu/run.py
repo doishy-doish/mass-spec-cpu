@@ -44,7 +44,7 @@ def structure_table(meta: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(recs)
 
 
-def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
+def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 analog_pool: list, lib_bits_by_key: dict | None = None,
                 qbits: int = 0, bin_override: dict | None = None) -> pd.DataFrame:
     """analog_pool: [(key14, cleaned_peaks, precursor)] once per query (mass-windowed)."""
@@ -62,8 +62,8 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
     for _, c in cands.iterrows():
         # library channel: max cosine vs structure's own spectra
         lib = 0.0
-        for mzs, ints, prec in lib_by_key.get(c["key14"], []):
-            lib = max(lib, S.cosine(qpeaks, S.clean(mzs, ints, prec)))
+        for cl, prec in lib_clean.get(c["key14"], []):
+            lib = max(lib, S.cosine(qpeaks, cl))
         # analog channel: best mass-shift match x Tanimoto to candidate
         analog = 0.0
         cfp = c["fp"]
@@ -73,8 +73,7 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
         # fragmentation proxy: shared neutral losses (precursor - fragment)
         qloss = set(round(float(qprec - mz), 2) for mz, _ in qpeaks[:32])
         frag = 0.0
-        for mzs, ints, prec in lib_by_key.get(c["key14"], [])[:2]:
-            cl = S.clean(mzs, ints, prec)
+        for cl, prec in lib_clean.get(c["key14"], [])[:2]:
             if len(cl):
                 floss = set(round(float(prec - mz), 2) for mz, _ in cl[:32])
                 frag = max(frag, len(qloss & floss) / max(1, len(qloss)))
@@ -140,21 +139,15 @@ def main() -> None:
     else:
         library, queries, _ = V.split_cross_instrument(meta, pool, a.n, a.seed)
     lib_set = set(library)
-    lib_by_key: dict = {}
-    for idx in library:
-        r = meta.loc[idx]
-        lib_by_key.setdefault(r["key14"], []).append((r["mzs"], r["ints"], r["precursor_mz"]))
-    lib_bits_by_key: dict = {}
-    for idx in library:
-        r = meta.loc[idx]
-        lib_bits_by_key.setdefault(r["key14"], []).append(
-            B.encode(S.clean(r["mzs"], r["ints"], r["precursor_mz"]), r["precursor_mz"]))
-    lib_bins_by_key: dict = {}
+    lib_clean_by_key: dict = {}
     for idx in library:
         r = meta.loc[idx]
         cl = S.clean(r["mzs"], r["ints"], r["precursor_mz"])
-        lib_bins_by_key.setdefault(r["key14"], []).append(
-            B.encode_bins(cl, r["precursor_mz"]))
+        lib_clean_by_key.setdefault(r["key14"], []).append((cl, r["precursor_mz"]))
+    lib_bits_by_key = {k: [B.encode(cl, prec) for cl, prec in v]
+                       for k, v in lib_clean_by_key.items()}
+    lib_bins_by_key = {k: [B.encode_bins(cl, prec) for cl, prec in v]
+                       for k, v in lib_clean_by_key.items()}
 
     # candidate pool: structures within ppm of query neutral mass (train structures only;
     # competition adds COCONUT — pool grows ~2.6x, noted in contracts)
@@ -190,16 +183,16 @@ def main() -> None:
         # analog pool: library structures within +-50 Da, capped, cleaned once
         cand_keys = set(cands["key14"])
         analog_pool = []
-        for key, spec_list in lib_by_key.items():
+        for key, spec_list in lib_clean_by_key.items():
             if key in cand_keys:
                 continue
-            for mzs, ints, prec in spec_list[:1]:
+            for cl, prec in spec_list[:1]:
                 if abs(prec - q["precursor_mz"]) <= 50:
-                    analog_pool.append((key, S.clean(mzs, ints, prec), prec, abs(prec - q["precursor_mz"])))
+                    analog_pool.append((key, cl, prec, abs(prec - q["precursor_mz"])))
                     break
         analog_pool.sort(key=lambda e: e[3])
         analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
-        scored = score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, analog_pool,
+        scored = score_query(qpeaks, q["precursor_mz"], cands, lib_clean_by_key, analog_pool,
                              lib_bits_by_key, qbits, bin_override)
         for ch in ["lib", "analog", "frag"]:
             m, s = scored[ch].mean(), scored[ch].std() + 1e-9
