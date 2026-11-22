@@ -53,9 +53,8 @@ jobs:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
         run: |
           node scripts/scramble.mjs encrypt results/*.json
-          git config user.name "mscpu"
-          git config user.email "mscpu@users.noreply.github.com"
-          git add results/${{ inputs.mask }}.json
-          git pull --rebase origin main || true
-          git diff --cached --quiet || git commit -m "cpu-r2 ${{ inputs.mask }} $(date -u +%F)"
+          git add results/
+          git diff --cached --quiet || git commit -m "cpu-r3 ${{ inputs.task }}-${{ inputs.mask }} $(date -u +%F)"
+          git pull --rebase origin main
           git push
+
