@@ -19,19 +19,30 @@ def _mix(x: int, salt: int = 0) -> int:
     return ((x + salt * 0x9E3779B9) * _KNUTH) & 0xFFFFFFFF
 
 
+def encode_bins(peaks, precursor: float) -> tuple:
+    """Pre-quantized bin lists (masked to u32) — the exact input the Rust core takes."""
+    p, l = [], []
+    if peaks is None or len(peaks) == 0:
+        return p, l
+    for mz, w in peaks:
+        if w <= 0:
+            continue
+        p.append(int(round(float(mz) / PEAK_Q)) & 0xFFFFFFFF)
+        if precursor:
+            l.append(int(round(float(precursor - mz) / LOSS_Q)) & 0xFFFFFFFF)
+    return p, l
+
+
 def encode(peaks, precursor: float, nbits: int = NBITS, loss_motifs: bool = True) -> int:
     """peaks: (n,2) cleaned array (mz, weight); precursor: precursor m/z. Returns bitset int."""
     bits = 0
     if peaks is None or len(peaks) == 0:
         return bits
-    for mz, w in peaks:
-        if w <= 0:
-            continue
-        q = int(round(float(mz) / PEAK_Q))
+    pb, lb = encode_bins(peaks, precursor if loss_motifs else 0.0)
+    for q in pb:
         bits |= 1 << (_mix(q) % nbits)
-        if loss_motifs and precursor:
-            lq = int(round(float(precursor - mz) / LOSS_Q))
-            bits |= 1 << (_mix(lq, salt=1) % nbits)
+    for q in lb:
+        bits |= 1 << (_mix(q, salt=1) % nbits)
     return bits
 
 
