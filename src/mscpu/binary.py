@@ -99,3 +99,22 @@ def wjaccard(a: dict, b: dict) -> float:
     if inter <= 0.0:
         return 0.0
     return inter / union if union else 0.0
+
+
+def encode_qlib(peaks, precursor, qpeak: float = PEAK_Q, qloss: float = LOSS_Q):
+    """Sender format for the Rust worker: quantized bins + raw weights per occurrence.
+    Rust takes max per mixed bit — reproduces encode_weighted() exactly (max is
+    order-independent). Same filtering: w<=0 dropped, no loss motifs w/o precursor."""
+    p, pw, l, lw = [], [], [], []
+    if peaks is None or len(peaks) == 0:
+        return p, pw, l, lw
+    for mz, w in peaks:
+        if w <= 0:
+            continue
+        w = float(w)
+        p.append(int(round(float(mz) / qpeak)) & 0xFFFFFFFF)
+        pw.append(w)
+        if precursor:
+            l.append(int(round(float(precursor - mz) / qloss)) & 0xFFFFFFFF)
+            lw.append(w)
+    return p, pw, l, lw
