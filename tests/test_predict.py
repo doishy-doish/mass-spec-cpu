@@ -1,6 +1,14 @@
 """Aggregation + submission-format tests (no RDKit, no data files)."""
+import pandas as pd
+
 from mscpu.metric import validate_submission
-from mscpu.predict import aggregate
+from mscpu.predict import aggregate, rrf_fuse
+
+
+def test_rrf_prefers_consensus():
+    df = pd.DataFrame({"lib": [3, 2, 1], "analog": [3, 2, 1], "frag": [1, 2, 3]})
+    s = rrf_fuse(df)
+    assert list(s.sort_values(ascending=False).index) == [0, 1, 2]
 
 
 def test_aggregate_sums_reciprocal_rank():
