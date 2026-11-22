@@ -55,7 +55,8 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 qbits: int = 0, bin_override: dict | None = None,
                 lib_wbits_by_key: dict | None = None,
                 qwbits: dict | None = None, qloss_pre: set | None = None,
-                nq: float | None = None, lib_norms: dict | None = None) -> pd.DataFrame:
+                nq: float | None = None, lib_norms: dict | None = None,
+                binw_override: dict | None = None) -> pd.DataFrame:
     """FURNACE (bench-gated, one knob): two-pointer cosine with precomputed norms,
     pool entries (key14, peaks, precursor[, norm]) — 4-tuples from run.py, 3-tuples
     from predict.py (norm computed inline). qloss hoisted (one set per query);
@@ -121,7 +122,9 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                     bscore = j
         # weighted-binary channel: Ruzicka Jaccard, intensity restored (BIN-WEIGHTS)
         bwscore = 0.0
-        if qwbits and lib_wbits_by_key:
+        if binw_override is not None:
+            bwscore = float(binw_override.get(ckey, 0.0))
+        elif qwbits and lib_wbits_by_key:
             for wb in lib_wbits_by_key.get(ckey, []):
                 j = B.wjaccard(qwbits, wb)
                 if j > bwscore:
@@ -149,6 +152,34 @@ def rust_bin_scores(rust_bin, qbins, ref_bins) -> dict | None:
         return best
     except Exception:
         return None
+
+
+class _RustWorker:
+    """Persistent binvec worker: preload once, one round trip per query.
+    Serves bin + binw; any failure -> exception -> caller falls back to python."""
+    def __init__(self, bin_path, lib_payload):
+        self.p = subprocess.Popen([bin_path, "worker"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.p.stdin.write(json.dumps({"lib": lib_payload}) + "\n")
+        self.p.stdin.flush()
+        ready = self.p.stdout.readline()
+        if "ready" not in ready:
+            raise RuntimeError("binvec worker not ready: " + ready[:200])
+    def query(self, q, cands):
+        self.p.stdin.write(json.dumps({"q": q, "cands": sorted(cands)}) + "\n")
+        self.p.stdin.flush()
+        out = json.loads(self.p.stdout.readline())
+        return ({k: float(v) for k, v in out["scores"]},
+                {k: float(v) for k, v in out["wscores"]})
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=10)
+        except Exception:
+            try:
+                self.p.kill()
+            except Exception:
+                pass
 
 
 FP_CACHE: dict = {}
@@ -241,22 +272,28 @@ def _run_query(task):
     qmzs, qints = _G["qspec"][qi]
     qpeaks = S.clean(qmzs, qints, q["precursor_mz"])
     qbits = B.encode(qpeaks, q["precursor_mz"])
-    qbins = B.encode_bins(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
-    qwbits = B.encode_weighted(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
     tol = qnm * _G["ppm"] * 1e-6
     lo = np.searchsorted(_G["masses"], qnm - tol)
     hi = np.searchsorted(_G["masses"], qnm + tol, side="right")
     cands = _G["struct_m"].iloc[lo:hi]
     cand_keys = set(cands["key14"])
     bin_override = None
+    binw_override = None
     if _G["engine"] == "rust":
-        ref_bins = []
-        for key in cand_keys:
-            for i, (p, l) in enumerate(_G["lib_bins"].get(key, [])):
-                ref_bins.append((key + "#" + str(i), p, l))
-        bin_override = rust_bin_scores(_G["rust_bin"], qbins, ref_bins)
-        if bin_override is None:
+        try:
+            p, pw, l, lw = B.encode_qlib(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
+            bin_override, binw_override = _G["rworker"].query(
+                {"p": p, "pw": pw, "l": l, "lw": lw}, cand_keys)
+        except Exception:
             print("rust engine failed on q=" + str(qi) + ", falling back to python", flush=True)
+    if bin_override is None:
+        qbins = B.encode_bins(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
+    else:
+        qbins = 0
+    if binw_override is None:
+        qwbits = B.encode_weighted(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
+    else:
+        qwbits = None
     nq = float((qpeaks[:, 1] ** 2).sum()) if len(qpeaks) else 0.0
     qloss = set(round(float(q["precursor_mz"] - mz), 2) for mz, _ in qpeaks[:32])
     # analog pool: bisect on precomputed precursor-sorted library array
@@ -291,7 +328,7 @@ def _run_query(task):
     analog_pool = [(k, p, pr, _G["lib_norms"][k][0]) for _, k, p, pr in nearby[:1500]]
     scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
                          _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits,
-                         qloss, nq, _G["lib_norms"])
+                         qloss, nq, _G["lib_norms"], binw_override)
     for ch in ["lib", "analog", "frag"]:
         m, s = scored[ch].mean(), scored[ch].std() + 1e-9
         scored[ch + "z"] = (scored[ch] - m) / s
@@ -350,6 +387,9 @@ def main() -> None:
                     help="inserted before the extension of --out, e.g. '-binwprobe'; "
                          "probes must use one so they never clobber fleet shard files")
     a = ap.parse_args()
+    if a.engine == "rust" and a.jobs != 1:
+        print("rust engine owns its worker: forcing jobs=1 (was " + str(a.jobs) + ")", flush=True)
+        a.jobs = 1
     signal.signal(signal.SIGTERM, _sigterm_loud)
     _stop = threading.Event()
     threading.Thread(target=_mem_watch, args=(_stop,), daemon=True).start()
@@ -439,6 +479,18 @@ def main() -> None:
               shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
     _rss, _avail = _mem_state()
     print("precompute done lib_keys=" + str(len(lib_clean_by_key)) + " queries=" + str(len(queries)) + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail), flush=True)  # HEARTBEAT (M180)
+    if a.engine == "rust":
+        lib_payload = {}
+        for k, v in lib_clean_by_key.items():
+            specs = []
+            for cl, prec in v:
+                p, pw, l, lw = B.encode_qlib(cl, prec, a.qpeak, a.qloss)
+                specs.append({"p": p, "pw": pw, "l": l, "lw": lw})
+            lib_payload[k] = specs
+        _G["rworker"] = _RustWorker(a.rust_bin, lib_payload)
+        del lib_payload
+        _gc.collect()
+        print("rust worker ready", flush=True)
     tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
     if a.jobs > 1 and len(tasks) > 1:
         with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
@@ -472,6 +524,11 @@ def main() -> None:
            "pools": pools, "qidx": [int(q) for q in queries]}
     with open(out_path, "w") as f:
         json.dump(out, f)
+    try:
+        if _G.get("rworker") is not None:
+            _G["rworker"].close()
+    except Exception:
+        pass
     try:
         _stop.set()
     except Exception:
