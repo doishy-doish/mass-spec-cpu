@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -94,7 +95,10 @@ def main() -> None:
     if not a.train or not a.test:
         raise SystemExit("no --train/--test and nothing discovered")
     if not a.out and not a.csv:
-        a.out = "results/predict.json"
+        if os.path.isdir("/kaggle/input"):
+            a.csv = "/kaggle/working/submission.csv"
+        else:
+            a.out = "results/predict.json"
 
     train = R.load_meta(a.train)
     struct = R.structure_table(train)
