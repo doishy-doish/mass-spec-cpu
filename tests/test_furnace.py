@@ -67,7 +67,7 @@ def test_main_precompute_mirror_with_norms_and_bisect():
     qloss = set(round(float(201.0 - mz), 2) for mz, _ in qpeaks[:32])
     lo = bisect.bisect_left(precs, 201.0 - 50.0)
     hi = bisect.bisect_right(precs, 201.0 + 50.0, lo=lo)
-    assert (lo, hi) == (0, 4)
+    assert (lo, hi) == (1, 4)  # v[:1]: one precursor per key -> [99, 151, 201, 201]
     pool = [("k1", lib_clean["k1"][0][0], 201.0, lib_norms["k1"][0])]
     cands = pd.DataFrame([{"key14": "k1", "fp": None}])
     R.FP_CACHE.clear()
