@@ -1,0 +1,62 @@
+name: kernel-submit
+on:
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: "kernel ref owner/slug"
+        default: "andralemisquitta/mass-spec-infer-v1"
+      version:
+        description: "kernel version"
+        default: "1"
+      file:
+        description: "output file produced by the kernel"
+        default: "submission.csv"
+      message:
+        description: "submission message"
+        default: "cpu retrieval v1 RRF"
+permissions:
+  contents: read
+jobs:
+  sub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "kaggle>=1.6" "six>=1.16"
+      - name: watch kernel then submit
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          python -c "import os,json; open(os.path.expanduser('~/.kaggle.json'),'w').write(json.dumps({'username':os.environ['KAGGLE_USERNAME'],'key':os.environ['KAGGLE_KEY']}))"
+          chmod 600 ~/.kaggle.json
+          python - <<'PYEOF'
+          import os, subprocess, sys, time
+          K = "${{ inputs.kernel }}"
+          F = "${{ inputs.file }}"
+          C = "enveda-CASMI26-molecule-id-mass-spectra"
+          def sh(*a):
+              p = subprocess.run(list(a), capture_output=True, text=True)
+              print("$", " ".join(list(a)), flush=True)
+              print((p.stdout or "")[-3000:], flush=True)
+              if p.stderr:
+                  print("STDERR:", (p.stderr or "")[-800:], flush=True)
+              return p
+          done = False
+          for i in range(60):
+              p = sh("kaggle", "kernels", "output", "-k", K, "-p", "out")
+              if p.returncode == 0 and os.path.isfile(os.path.join("out", F)):
+                  done = True
+                  break
+              print(f"[{i}] not ready, sleeping 300s", flush=True)
+              time.sleep(300)
+          if not done:
+              print("TIMEOUT waiting for kernel output", flush=True)
+              sys.exit(1)
+          print("OUTDIR:", os.listdir("out"), flush=True)
+          p = sh("kaggle", "competitions", "submit", "-c", C,
+                 "-f", os.path.join("out", F), "-m", "${{ inputs.message }}")
+          sys.exit(p.returncode)
+          PYEOF
