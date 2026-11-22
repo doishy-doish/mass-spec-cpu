@@ -204,7 +204,16 @@ def main() -> None:
     ap.add_argument("--qpeak", type=float, default=0.05)
     ap.add_argument("--qloss", type=float, default=0.01)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--out-suffix", default="",
+                    help="inserted before the extension of --out, e.g. '-binwprobe'; "
+                         "probes must use one so they never clobber fleet shard files")
     a = ap.parse_args()
+    out_path = a.out
+    if a.out_suffix:
+        head, sep, tail = out_path.rpartition("/")
+        stem, dot, ext = tail.rpartition(".")
+        tail2 = stem + a.out_suffix + dot + ext if dot else tail + a.out_suffix
+        out_path = head + sep + tail2 if sep else tail2
 
     meta = load_meta(a.data)
     struct = structure_table(meta)
@@ -270,13 +279,14 @@ def main() -> None:
            "mrr_cascade": _avg(rrs["cascade"]),
            "mrr_bin": _avg(rrs["bin"]), "mrr_rrfb": _avg(rrs["rrfb"]),
            "mrr_binw": _avg(rrs["binw"]),
+           "qpeak": a.qpeak, "qloss": a.qloss,
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
            "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
            "pools": pools, "qidx": [int(q) for q in queries]}
-    with open(a.out, "w") as f:
+    with open(out_path, "w") as f:
         json.dump(out, f)
     print(json.dumps(out))
 
