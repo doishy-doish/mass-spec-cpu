@@ -161,7 +161,7 @@ def main() -> None:
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
-    for qi in queries:
+    for qpos, qi in enumerate(queries):
         q = meta.loc[qi]
         qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
         if not qnm:
@@ -214,7 +214,7 @@ def main() -> None:
             if v == "z":
                 preds[str(qi)] = ranked
         pools.append(len(cands))
-        print("q=" + str(qi) + " pool=" + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % rrs[v][-1]) for v in VARIANTS), flush=True)
+        print("shard " + str(a.shard) + " " + str(qpos + 1) + "/" + str(len(queries)) + " (" + str(int(100 * (qpos + 1) / max(1, len(queries)))) + "%) q=" + str(qi) + " pool=" + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % rrs[v][-1]) for v in VARIANTS), flush=True)
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
