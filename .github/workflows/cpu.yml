@@ -26,6 +26,9 @@ on:
       shards:
         description: "shard count"
         default: "1"
+      jobs:
+        description: "local worker processes"
+        default: "1"
 permissions:
   contents: write
   actions: read
@@ -33,6 +36,10 @@ jobs:
   cpu:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,7 +75,7 @@ jobs:
           PYTHONPATH: src
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
