@@ -123,6 +123,8 @@ def main() -> None:
     ap.add_argument("--ppm", type=float, default=8.5)
     ap.add_argument("--engine", choices=["python", "rust"], default="python")
     ap.add_argument("--rust-bin", default="rust-bitvec/target/release/binvec")
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -138,6 +140,7 @@ def main() -> None:
         library, queries, _ = V.split_class3(meta, pool, a.n, a.seed)
     else:
         library, queries, _ = V.split_cross_instrument(meta, pool, a.n, a.seed)
+    queries = queries[a.shard::a.shards]
     lib_set = set(library)
     lib_clean_by_key: dict = {}
     for idx in library:
@@ -215,7 +218,7 @@ def main() -> None:
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
-    out = {"mask": a.mask, "engine": a.engine, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
+    out = {"mask": a.mask, "engine": a.engine, "shard": a.shard, "shards": a.shards, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
            "mrr_lib": _avg(rrs["lib"]), "mrr_analog": _avg(rrs["analog"]),
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
            "mrr_cascade": _avg(rrs["cascade"]),
