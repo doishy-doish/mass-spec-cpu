@@ -1,0 +1,83 @@
+name: cpu-fleet
+on:
+  workflow_dispatch:
+    inputs:
+      mask:
+        description: "validation mask"
+        default: "class3"
+        type: choice
+        options: [class2, class3, cross]
+      n:
+        description: "queries"
+        default: "500"
+      task:
+        description: "validate or predict"
+        default: "validate"
+        type: choice
+        options: [validate, predict]
+      engine:
+        description: "binary channel engine"
+        default: "python"
+        type: choice
+        options: [python, rust]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: mkdir -p data results
+      - name: build rust engine
+        if: ${{ inputs.engine == 'rust' }}
+        run: |
+          cd rust-bitvec
+          cargo build --release
+          echo '{"q":{"p":[1],"l":[2]},"refs":[{"key":"k#0","p":[1],"l":[3]}]}' | ./target/release/binvec
+      - name: restore data cache
+        id: datacache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: casmi26-data-v1
+      - name: download competition data
+        if: steps.datacache.outputs.cache-hit != 'true'
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          python -c "import os,json; open(os.path.expanduser('~/.kaggle.json'),'w').write(json.dumps({'username':os.environ['KAGGLE_USERNAME'],'key':os.environ['KAGGLE_KEY']}))"
+          chmod 600 ~/.kaggle.json
+          kaggle competitions download -c enveda-CASMI26-molecule-id-mass-spectra -p data
+          unzip -o data/*.zip -d data
+          ls -la data/
+      - run: python -m pytest -q tests/
+        env:
+          PYTHONPATH: src
+      - name: run mask
+        if: ${{ inputs.task == 'validate' }}
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ matrix.shard }}" --shards "20" --out results/${{ inputs.mask }}-${{ matrix.shard }}.json
+      - name: run predict
+        if: ${{ inputs.task == 'predict' }}
+        run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
+      - name: scramble + commit
+        env:
+          SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
+        run: |
+          node scripts/scramble.mjs encrypt results/*.json
+          git config user.name "mscpu"
+          git config user.email "mscpu@users.noreply.github.com"
+          git add results/
+          git diff --cached --quiet || git commit -m "cpu-fleet ${{ inputs.task }}-${{ inputs.mask }} shard ${{ matrix.shard }} $(date -u +%F)"
+          git pull --rebase origin main
+          git push
