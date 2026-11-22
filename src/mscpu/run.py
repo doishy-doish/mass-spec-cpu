@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as CF
 import json
 import subprocess
 
@@ -113,6 +114,70 @@ def rust_bin_scores(rust_bin, qbins, ref_bins) -> dict | None:
 
 FP_CACHE: dict = {}
 
+_G = {}
+
+
+def _run_query(task):
+    """One query end-to-end. Fork-worker safe: reads only _G + module globals.
+    Returns (qi, {variant: rr}, pool_len, ranked_z_or_None, logline), or None if skipped."""
+    qpos, qi, total = task
+    V = _G["variants"]
+    q = _G["meta"].loc[qi]
+    qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
+    if not qnm:
+        return None
+    qpeaks = S.clean(q["mzs"], q["ints"], q["precursor_mz"])
+    qbits = B.encode(qpeaks, q["precursor_mz"])
+    qbins = B.encode_bins(qpeaks, q["precursor_mz"])
+    tol = qnm * _G["ppm"] * 1e-6
+    lo = np.searchsorted(_G["masses"], qnm - tol)
+    hi = np.searchsorted(_G["masses"], qnm + tol, side="right")
+    cands = _G["struct_m"].iloc[lo:hi]
+    cand_keys = set(cands["key14"])
+    bin_override = None
+    if _G["engine"] == "rust":
+        ref_bins = []
+        for key in cand_keys:
+            for i, (p, l) in enumerate(_G["lib_bins"].get(key, [])):
+                ref_bins.append((key + "#" + str(i), p, l))
+        bin_override = rust_bin_scores(_G["rust_bin"], qbins, ref_bins)
+        if bin_override is None:
+            print("rust engine failed on q=" + str(qi) + ", falling back to python", flush=True)
+    # analog pool: library structures within +-50 Da, capped, cleaned once
+    analog_pool = []
+    for key, spec_list in _G["lib_clean"].items():
+        if key in cand_keys:
+            continue
+        for cl, prec in spec_list[:1]:
+            if abs(prec - q["precursor_mz"]) <= 50:
+                analog_pool.append((key, cl, prec, abs(prec - q["precursor_mz"])))
+                break
+    analog_pool.sort(key=lambda e: e[3])
+    analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
+    scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
+                         _G["lib_bits"], qbits, bin_override)
+    for ch in ["lib", "analog", "frag"]:
+        m, s = scored[ch].mean(), scored[ch].std() + 1e-9
+        scored[ch + "z"] = (scored[ch] - m) / s
+    scored["z"] = scored[["libz", "analogz", "fragz"]].sum(axis=1)
+    scored["rrf"] = M.rrf_fuse(scored)
+    scored["rrfb"] = M.rrf_fuse(scored, channels=("lib", "analog", "frag", "bin"))
+    lzmax = float(scored["libz"].max()) if len(scored) else 0.0
+    scored["cascade"] = scored["libz"] if lzmax > 3.0 else scored["analogz"]
+    truth = q["key14"]
+    row = {}
+    ranked_z = None
+    for v in V:
+        col = {"lib": "lib", "analog": "analog", "frag": "frag"}.get(v, v)
+        ranked = scored.sort_values(col, ascending=False)["key14"].tolist()[:25]
+        row[v] = M.reciprocal_rank(truth, ranked)
+        if v == "z":
+            ranked_z = ranked
+    line = ("shard " + str(_G["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
+            + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
+            + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V))
+    return (qi, row, len(cands), ranked_z, line)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -125,6 +190,7 @@ def main() -> None:
     ap.add_argument("--rust-bin", default="rust-bitvec/target/release/binvec")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
+    ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -161,60 +227,25 @@ def main() -> None:
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
-    for qpos, qi in enumerate(queries):
-        q = meta.loc[qi]
-        qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
-        if not qnm:
+    _G.update(meta=meta, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
+              lib_bits=lib_bits_by_key, lib_bins=lib_bins_by_key, variants=VARIANTS,
+              engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm, shard=a.shard)
+    tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
+    if a.jobs > 1 and len(tasks) > 1:
+        with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
+            results = list(ex.map(_run_query, tasks))
+    else:
+        results = [_run_query(t) for t in tasks]
+    for res in results:
+        if res is None:
             continue
-        qpeaks = S.clean(q["mzs"], q["ints"], q["precursor_mz"])
-        qbits = B.encode(qpeaks, q["precursor_mz"])
-        qbins = B.encode_bins(qpeaks, q["precursor_mz"])
-        bin_override = None
-        if a.engine == "rust":
-            cand_keys = set(cands["key14"])
-            ref_bins = []
-            for key in cand_keys:
-                for i, (p, l) in enumerate(lib_bins_by_key.get(key, [])):
-                    ref_bins.append((key + "#" + str(i), p, l))
-            bin_override = rust_bin_scores(a.rust_bin, qbins, ref_bins)
-            if bin_override is None:
-                print("rust engine failed on q=" + str(qi) + ", falling back to python", flush=True)
-        tol = qnm * a.ppm * 1e-6
-        lo = np.searchsorted(masses, qnm - tol)
-        hi = np.searchsorted(masses, qnm + tol, side="right")
-        cands = struct_m.iloc[lo:hi]
-        # analog pool: library structures within +-50 Da, capped, cleaned once
-        cand_keys = set(cands["key14"])
-        analog_pool = []
-        for key, spec_list in lib_clean_by_key.items():
-            if key in cand_keys:
-                continue
-            for cl, prec in spec_list[:1]:
-                if abs(prec - q["precursor_mz"]) <= 50:
-                    analog_pool.append((key, cl, prec, abs(prec - q["precursor_mz"])))
-                    break
-        analog_pool.sort(key=lambda e: e[3])
-        analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
-        scored = score_query(qpeaks, q["precursor_mz"], cands, lib_clean_by_key, analog_pool,
-                             lib_bits_by_key, qbits, bin_override)
-        for ch in ["lib", "analog", "frag"]:
-            m, s = scored[ch].mean(), scored[ch].std() + 1e-9
-            scored[ch + "z"] = (scored[ch] - m) / s
-        scored["z"] = scored[["libz", "analogz", "fragz"]].sum(axis=1)
-        scored["rrf"] = M.rrf_fuse(scored)
-        scored["rrfb"] = M.rrf_fuse(scored, channels=("lib", "analog", "frag", "bin"))
-        lzmax = float(scored["libz"].max()) if len(scored) else 0.0
-        scored["cascade"] = scored["libz"] if lzmax > 3.0 else scored["analogz"]
-        truth = q["key14"]
+        qi, row, plen, ranked, line = res
+        print(line, flush=True)
+        pools.append(plen)
         for v in VARIANTS:
-            col = {"lib": "lib", "analog": "analog", "frag": "frag"}.get(v, v)
-            ranked = scored.sort_values(col, ascending=False)["key14"].tolist()[:25]
-            r = M.reciprocal_rank(truth, ranked)
-            rrs[v].append(r)
-            if v == "z":
-                preds[str(qi)] = ranked
-        pools.append(len(cands))
-        print("shard " + str(a.shard) + " " + str(qpos + 1) + "/" + str(len(queries)) + " (" + str(int(100 * (qpos + 1) / max(1, len(queries)))) + "%) q=" + str(qi) + " pool=" + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % rrs[v][-1]) for v in VARIANTS), flush=True)
+            rrs[v].append(row[v])
+        if ranked is not None:
+            preds[str(qi)] = ranked
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
