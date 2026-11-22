@@ -1,8 +1,8 @@
 """Aggregation + submission-format tests (no RDKit, no data files)."""
 import pandas as pd
 
-from mscpu.metric import validate_submission
-from mscpu.predict import aggregate, rrf_fuse
+from mscpu.metric import rrf_fuse, validate_submission
+from mscpu.predict import aggregate
 
 
 def test_rrf_prefers_consensus():
