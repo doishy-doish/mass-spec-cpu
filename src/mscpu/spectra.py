@@ -32,27 +32,51 @@ def clean(mzs, ints, precursor: float, floor: float = 0.01, topn: int = 64):
     return np.stack([mzs[order], rel[order]], axis=1)
 
 
-def cosine(a, b, tol: float = 0.02) -> float:
-    if len(a) == 0 or len(b) == 0:
-        return 0.0
-    used = np.zeros(len(b), dtype=bool)
+def _match_dot(amz, ai, bmz, bi, delta: float, tol: float) -> float:
+    """Greedy mz-ordered peak matching, one linear pass, zero allocs.
+    Both inputs are mz-sorted (clean() sorts). Same greedy spirit as the old
+    argmin+used-mask version, minus ~2 numpy calls per peak pair."""
+    i = j = 0
     dot = 0.0
-    for mz, inten in a:
-        d = np.abs(b[:, 0] - mz)
-        d[used] = np.inf
-        k = int(np.argmin(d))
-        if d[k] <= tol:
-            used[k] = True
-            dot += inten * b[k, 1]
-    na = float((a[:, 1] ** 2).sum())
-    nb = float((b[:, 1] ** 2).sum())
-    return dot / np.sqrt(na * nb) if na and nb else 0.0
+    la, lb = len(amz), len(bmz)
+    while i < la and j < lb:
+        d = amz[i] - bmz[j] - delta
+        if d < -tol:
+            i += 1
+        elif d > tol:
+            j += 1
+        else:
+            dot += ai[i] * bi[j]
+            i += 1
+            j += 1
+    return dot
 
 
-def modified_cosine(a, b, delta: float, tol: float = 0.02) -> float:
-    """GNPS-style: allow matches shifted by precursor delta (analog channel)."""
+def _denorm(a, b, na: float | None, nb: float | None) -> float:
+    if na is None:
+        na = float(((a[:, 1] ** 2).sum())) if len(a) else 0.0
+    if nb is None:
+        nb = float(((b[:, 1] ** 2).sum())) if len(b) else 0.0
+    return np.sqrt(na * nb) if na and nb else 0.0
+
+
+def cosine(a, b, tol: float = 0.02, na: float | None = None,
+           nb: float | None = None) -> float:
     if len(a) == 0 or len(b) == 0:
         return 0.0
-    b_shifted = b.copy()
-    b_shifted[:, 0] = b_shifted[:, 0] + delta
-    return max(cosine(a, b, tol), cosine(a, b_shifted, tol))
+    dot = _match_dot(a[:, 0], a[:, 1], b[:, 0], b[:, 1], 0.0, tol)
+    den = _denorm(a, b, na, nb)
+    return dot / den if den else 0.0
+
+
+def modified_cosine(a, b, delta: float, tol: float = 0.02,
+                    na: float | None = None, nb: float | None = None) -> float:
+    """GNPS-style: max(unshifted, delta-shifted). Shift applied on the fly —
+    no b.copy(), no second full cosine."""
+    if len(a) == 0 or len(b) == 0:
+        return 0.0
+    amz, ai, bmz, bi = a[:, 0], a[:, 1], b[:, 0], b[:, 1]
+    dot = max(_match_dot(amz, ai, bmz, bi, 0.0, tol),
+              _match_dot(amz, ai, bmz, bi, delta, tol))
+    den = _denorm(a, b, na, nb)
+    return dot / den if den else 0.0
