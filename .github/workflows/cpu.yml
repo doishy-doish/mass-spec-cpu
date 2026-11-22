@@ -20,6 +20,12 @@ on:
         default: "python"
         type: choice
         options: [python, rust]
+      shard:
+        description: "shard index"
+        default: "0"
+      shards:
+        description: "shard count"
+        default: "1"
 permissions:
   contents: write
   actions: read
@@ -62,7 +68,7 @@ jobs:
           PYTHONPATH: src
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --out results/${{ inputs.mask }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
