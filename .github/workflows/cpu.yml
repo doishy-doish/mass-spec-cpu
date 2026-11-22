@@ -28,7 +28,10 @@ on:
         default: "1"
       jobs:
         description: "local worker processes"
-        default: "1"
+        default: "4"
+      suffix:
+        description: "output filename suffix, e.g. -furnace (probes must use one)"
+        default: ""
 permissions:
   contents: write
   actions: read
@@ -76,7 +79,7 @@ jobs:
           PYTHONPATH: src
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix "${{ inputs.suffix }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
