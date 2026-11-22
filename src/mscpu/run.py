@@ -51,12 +51,11 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 qbits: int = 0, bin_override: dict | None = None,
                 lib_wbits_by_key: dict | None = None,
                 qwbits: dict | None = None, qloss_pre: set | None = None,
-                floss_by_key: dict | None = None, nq: float | None = None,
-                lib_norms: dict | None = None) -> pd.DataFrame:
+                nq: float | None = None, lib_norms: dict | None = None) -> pd.DataFrame:
     """FURNACE (bench-gated, one knob): two-pointer cosine with precomputed norms,
     pool entries (key14, peaks, precursor[, norm]) — 4-tuples from run.py, 3-tuples
-    from predict.py (norm computed inline). qloss/floss hoisted: library is static,
-    so per-structure loss sets are built once in main, not per candidate per query."""
+    from predict.py (norm computed inline). qloss hoisted (one set per query);
+    per-candidate loss sets stay inline (library-size eager cache blew RAM — see M174)."""
     if nq is None:
         nq = float((qpeaks[:, 1] ** 2).sum()) if len(qpeaks) else 0.0
     qloss = qloss_pre
@@ -98,10 +97,9 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
                 if v > analog:
                     analog = v
         # fragmentation proxy: shared neutral losses (precursor - fragment)
-        fl = (floss_by_key or {}).get(ckey) if floss_by_key else None
-        if fl is None:
-            fl = [set(round(float(prec - mz), 2) for mz, _ in cl[:32]) if len(cl) else set()
-                  for cl, prec in cl_list[:2]]
+        # NOTE: built inline per candidate — the eager per-library cache cost ~0.5GB (M174)
+        fl = [set(round(float(prec - mz), 2) for mz, _ in cl[:32]) if len(cl) else set()
+              for cl, prec in cl_list[:2]]
         frag = 0.0
         for floss in fl[:2]:
             if floss:
@@ -200,7 +198,7 @@ def _run_query(task):
     analog_pool = [(k, p, pr, _G["lib_norms"][k][0]) for _, k, p, pr in nearby[:1500]]
     scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
                          _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits,
-                         qloss, _G["lib_floss"], nq, _G["lib_norms"])
+                         qloss, nq, _G["lib_norms"])
     for ch in ["lib", "analog", "frag"]:
         m, s = scored[ch].mean(), scored[ch].std() + 1e-9
         scored[ch + "z"] = (scored[ch] - m) / s
@@ -275,12 +273,10 @@ def main() -> None:
                        for k, v in lib_clean_by_key.items()}
     lib_wbits_by_key = {k: [B.encode_weighted(cl, prec, a.qpeak, a.qloss) for cl, prec in v]
                         for k, v in lib_clean_by_key.items()}
-    # FURNACE precomputes (library is static): spectrum norms, neutral-loss sets,
-    # precursor-sorted key array for bisect pool lookup
+    # FURNACE precomputes (library is static): spectrum norms,
+    # precursor-sorted key array for bisect pool lookup.
+    # (No loss-set cache: ~0.5GB eager, blew the 16GB runner — M174.)
     lib_norms_by_key = {k: [float((cl[:, 1] ** 2).sum()) if len(cl) else 0.0 for cl, _ in v]
-                        for k, v in lib_clean_by_key.items()}
-    lib_floss_by_key = {k: [set(round(float(prec - mz), 2) for mz, _ in cl[:32]) if len(cl) else set()
-                            for cl, prec in v[:2]]
                         for k, v in lib_clean_by_key.items()}
     _prec_pairs = sorted((prec, k) for k, v in lib_clean_by_key.items() for cl, prec in v[:1])
 
@@ -295,7 +291,7 @@ def main() -> None:
     pools: list = []
     _G.update(meta=meta, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
               lib_bits=lib_bits_by_key, lib_bins=lib_bins_by_key, lib_wbits=lib_wbits_by_key,
-              lib_norms=lib_norms_by_key, lib_floss=lib_floss_by_key,
+              lib_norms=lib_norms_by_key,
               lib_precs=[p for p, _ in _prec_pairs], lib_pkeys=[k for _, k in _prec_pairs],
               variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
               shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
