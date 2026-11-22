@@ -13,6 +13,7 @@ import json
 import numpy as np
 import pandas as pd
 
+from . import binary as B
 from . import fingerprints as fp
 from . import metric as M
 from . import spectra as S
@@ -43,7 +44,8 @@ def structure_table(meta: pd.DataFrame) -> pd.DataFrame:
 
 
 def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
-                analog_pool: list) -> pd.DataFrame:
+                analog_pool: list, lib_bits_by_key: dict | None = None,
+                qbits: int = 0) -> pd.DataFrame:
     """analog_pool: [(key14, cleaned_peaks, precursor)] once per query (mass-windowed)."""
     # analog matches once per query: top analog structures by mass-shift cosine
     analog_hits = []
@@ -75,7 +77,14 @@ def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_by_key: dict,
             if len(cl):
                 floss = set(round(float(prec - mz), 2) for mz, _ in cl[:32])
                 frag = max(frag, len(qloss & floss) / max(1, len(qloss)))
-        rows.append({"key14": c["key14"], "lib": lib, "analog": analog, "frag": frag})
+        # binary channel: max Jaccard vs structure's own spectra bitsets
+        bscore = 0.0
+        if qbits and lib_bits_by_key:
+            for lb in lib_bits_by_key.get(c["key14"], []):
+                j = B.jaccard(qbits, lb)
+                if j > bscore:
+                    bscore = j
+        rows.append({"key14": c["key14"], "lib": lib, "analog": analog, "frag": frag, "bin": bscore})
     return pd.DataFrame(rows)
 
 
@@ -109,13 +118,18 @@ def main() -> None:
     for idx in library:
         r = meta.loc[idx]
         lib_by_key.setdefault(r["key14"], []).append((r["mzs"], r["ints"], r["precursor_mz"]))
+    lib_bits_by_key: dict = {}
+    for idx in library:
+        r = meta.loc[idx]
+        lib_bits_by_key.setdefault(r["key14"], []).append(
+            B.encode(S.clean(r["mzs"], r["ints"], r["precursor_mz"]), r["precursor_mz"]))
 
     # candidate pool: structures within ppm of query neutral mass (train structures only;
     # competition adds COCONUT — pool grows ~2.6x, noted in contracts)
     struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
     masses = struct_m["neutral"].to_numpy()
 
-    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade"]
+    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb"]
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
@@ -125,6 +139,7 @@ def main() -> None:
         if not qnm:
             continue
         qpeaks = S.clean(q["mzs"], q["ints"], q["precursor_mz"])
+        qbits = B.encode(qpeaks, q["precursor_mz"])
         tol = qnm * a.ppm * 1e-6
         lo = np.searchsorted(masses, qnm - tol)
         hi = np.searchsorted(masses, qnm + tol, side="right")
@@ -141,12 +156,14 @@ def main() -> None:
                     break
         analog_pool.sort(key=lambda e: e[3])
         analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
-        scored = score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, analog_pool)
+        scored = score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, analog_pool,
+                             lib_bits_by_key, qbits)
         for ch in ["lib", "analog", "frag"]:
             m, s = scored[ch].mean(), scored[ch].std() + 1e-9
             scored[ch + "z"] = (scored[ch] - m) / s
         scored["z"] = scored[["libz", "analogz", "fragz"]].sum(axis=1)
         scored["rrf"] = M.rrf_fuse(scored)
+        scored["rrfb"] = M.rrf_fuse(scored, channels=("lib", "analog", "frag", "bin"))
         lzmax = float(scored["libz"].max()) if len(scored) else 0.0
         scored["cascade"] = scored["libz"] if lzmax > 3.0 else scored["analogz"]
         truth = q["key14"]
@@ -166,6 +183,7 @@ def main() -> None:
            "mrr_lib": _avg(rrs["lib"]), "mrr_analog": _avg(rrs["analog"]),
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
            "mrr_cascade": _avg(rrs["cascade"]),
+           "mrr_bin": _avg(rrs["bin"]), "mrr_rrfb": _avg(rrs["rrfb"]),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
