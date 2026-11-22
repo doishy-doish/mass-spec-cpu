@@ -35,21 +35,21 @@ def aggregate(ranked_lists: list, k: int = 25) -> list:
     return sorted(score, key=lambda kk: -score[kk])[:k]
 
 
-def rank_spectrum(q, cands, lib_by_key, fp_cache) -> list:
+def rank_spectrum(q, cands, lib_clean_by_key, fp_cache) -> list:
     qpeaks = S.clean(q["ms2_mzs"], q["ms2_normalized_intensities"], q["precursor_mz"])
     cand_keys = set(cands["key14"])
     pool = []
-    for key, spec_list in lib_by_key.items():
+    for key, spec_list in lib_clean_by_key.items():
         if key in cand_keys:
             continue
-        for mzs, ints, prec in spec_list[:1]:
+        for cl, prec in spec_list[:1]:
             if abs(prec - q["precursor_mz"]) <= 50:
-                pool.append((key, S.clean(mzs, ints, prec), prec,
+                pool.append((key, cl, prec,
                              abs(prec - q["precursor_mz"])))
                 break
     pool.sort(key=lambda t: t[3])
     pool = [(k_, p, pr) for k_, p, pr, _ in pool[:1500]]
-    scored = R.score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, pool)
+    scored = R.score_query(qpeaks, q["precursor_mz"], cands, lib_clean_by_key, pool)
     scored["score"] = M.rrf_fuse(scored)
     return scored.sort_values("score", ascending=False)["key14"].tolist()[:25]
 
@@ -98,10 +98,10 @@ def main() -> None:
     key2smi: dict = {}
     for _, r in struct.iterrows():
         key2smi.setdefault(r["key14"], r["smiles"])
-    lib_by_key: dict = {}
+    lib_clean_by_key: dict = {}
     for _, r in train.iterrows():
-        lib_by_key.setdefault(r["key14"], []).append(
-            (r["mzs"], r["ints"], r["precursor_mz"]))
+        cl = S.clean(r["mzs"], r["ints"], r["precursor_mz"])
+        lib_clean_by_key.setdefault(r["key14"], []).append((cl, r["precursor_mz"]))
     struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
     masses = struct_m["neutral"].to_numpy()
 
@@ -121,10 +121,10 @@ def main() -> None:
                 continue
             cn = pool(qnm, a.ppm)
             if len(cn):
-                narrow.append(rank_spectrum(q, cn, lib_by_key, R.FP_CACHE))
+                narrow.append(rank_spectrum(q, cn, lib_clean_by_key, R.FP_CACHE))
             cw = pool(qnm, a.wide)
             if len(cw):
-                wide_lists.append(rank_spectrum(q, cw, lib_by_key, R.FP_CACHE))
+                wide_lists.append(rank_spectrum(q, cw, lib_clean_by_key, R.FP_CACHE))
         top = aggregate(narrow)
         if len(top) < 25:
             for k_ in aggregate(wide_lists):
