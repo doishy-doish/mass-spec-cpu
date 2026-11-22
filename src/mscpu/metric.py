@@ -5,7 +5,19 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import pandas as pd
+
 K = 25
+
+
+def rrf_fuse(scored, channels=("lib", "analog", "frag"), base=60.0):
+    """Reciprocal-rank fusion over per-channel rankings (robust across masks:
+    z-sum let dead channels outvote live ones on class2/class3)."""
+    fused = pd.Series(0.0, index=scored.index)
+    for ch in channels:
+        order = scored[ch].rank(ascending=False, method="min")
+        fused = fused + 1.0 / (base + order)
+    return fused
 
 
 def _enum():
