@@ -80,8 +80,8 @@ def main() -> None:
             cc = rgm.column(c)
             name = ".".join(cc.path_in_schema)
             s = col_stats.setdefault(name, {"compressed": 0, "uncompressed": 0})
-            s["compressed"] += cc.compressed_size
-            s["uncompressed"] += cc.uncompressed_size
+            s["compressed"] += cc.total_compressed_size
+            s["uncompressed"] += cc.total_uncompressed_size
     out["columns"] = col_stats
     out["parquet_metadata_s"] = round(time.time() - t0, 1)
 
