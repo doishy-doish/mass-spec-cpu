@@ -70,3 +70,25 @@ def test_weighted_binary_weights_equal_jaccard():
     assert strong > 0.9
     assert weak < 0.1
     assert strong > weak
+
+
+def test_qlib_matches_weighted():
+    """encode_qlib is the exact sender for the Rust worker: same bins as
+    encode_bins, and max-per-mixed-bit rebuilds encode_weighted exactly."""
+    import numpy as np
+    peaks = np.array([[100.0, 1.0], [200.5, 0.5], [350.25, 0.2], [200.5, 0.9]])
+    p, pw, l, lw = B.encode_qlib(peaks, 400.0)
+    pb, lb = B.encode_bins(peaks, 400.0)
+    assert p == pb and l == lb
+    got = {}
+    for q, w in zip(p, pw):
+        b = B._mix(q) % B.NBITS
+        if w > got.get(b, 0.0):
+            got[b] = w
+    for q, w in zip(l, lw):
+        b = B._mix(q, salt=1) % B.NBITS
+        if w > got.get(b, 0.0):
+            got[b] = w
+    assert got == B.encode_weighted(peaks, 400.0)
+    assert B.encode_qlib([], 100.0) == ([], [], [], [])
+    assert B.encode_qlib(None, 100.0) == ([], [], [], [])
