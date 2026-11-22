@@ -115,7 +115,10 @@ def main() -> None:
     struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
     masses = struct_m["neutral"].to_numpy()
 
-    preds, rrs = {}, []
+    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade"]
+    preds: dict = {}
+    rrs: dict = {v: [] for v in VARIANTS}
+    pools: list = []
     for qi in queries:
         q = meta.loc[qi]
         qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
@@ -134,21 +137,41 @@ def main() -> None:
                 continue
             for mzs, ints, prec in spec_list[:1]:
                 if abs(prec - q["precursor_mz"]) <= 50:
-                    analog_pool.append((key, S.clean(mzs, ints, prec), prec))
+                    analog_pool.append((key, S.clean(mzs, ints, prec), prec, abs(prec - q["precursor_mz"])))
                     break
-            if len(analog_pool) >= 1500:
-                break
+        analog_pool.sort(key=lambda e: e[3])
+        analog_pool = [(k_, p_, pr_) for k_, p_, pr_, _ in analog_pool[:1500]]
         scored = score_query(qpeaks, q["precursor_mz"], cands, lib_by_key, analog_pool)
-        scored["score"] = M.rrf_fuse(scored)
-        ranked = scored.sort_values("score", ascending=False)["key14"].tolist()[:25]
+        for ch in ["lib", "analog", "frag"]:
+            m, s = scored[ch].mean(), scored[ch].std() + 1e-9
+            scored[ch + "z"] = (scored[ch] - m) / s
+        scored["z"] = scored[["libz", "analogz", "fragz"]].sum(axis=1)
+        scored["rrf"] = M.rrf_fuse(scored)
+        lzmax = float(scored["libz"].max()) if len(scored) else 0.0
+        scored["cascade"] = scored["libz"] if lzmax > 3.0 else scored["analogz"]
         truth = q["key14"]
-        preds[str(qi)] = ranked
-        rrs.append(M.reciprocal_rank(truth, ranked))
-        print(f"q={qi} pool={len(cands)} rr={rrs[-1]:.3f}", flush=True)
+        for v in VARIANTS:
+            col = {"lib": "lib", "analog": "analog", "frag": "frag"}.get(v, v)
+            ranked = scored.sort_values(col, ascending=False)["key14"].tolist()[:25]
+            r = M.reciprocal_rank(truth, ranked)
+            rrs[v].append(r)
+            if v == "z":
+                preds[str(qi)] = ranked
+        pools.append(len(cands))
+        print("q=" + str(qi) + " pool=" + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % rrs[v][-1]) for v in VARIANTS), flush=True)
 
-    out = {"mask": a.mask, "n": len(rrs), "mrr": float(np.mean(rrs)) if rrs else 0.0,
-           "hit1": float(np.mean([r == 1.0 for r in rrs])) if rrs else 0.0,
-           "hit25": float(np.mean([r > 0 for r in rrs])) if rrs else 0.0}
+    def _avg(x):
+        return float(np.mean(x)) if x else 0.0
+    out = {"mask": a.mask, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
+           "mrr_lib": _avg(rrs["lib"]), "mrr_analog": _avg(rrs["analog"]),
+           "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
+           "mrr_cascade": _avg(rrs["cascade"]),
+           "hit1": _avg([r == 1.0 for r in rrs["z"]]),
+           "hit25": _avg([r > 0 for r in rrs["z"]]),
+           "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
+           "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
+           "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
+           "pools": pools, "qidx": [int(q) for q in queries]}
     with open(a.out, "w") as f:
         json.dump(out, f)
     print(json.dumps(out))
