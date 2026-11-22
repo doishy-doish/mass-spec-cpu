@@ -11,10 +11,10 @@ on:
         description: "queries"
         default: "200"
       task:
-        description: "validate, predict, or measure store"
+        description: "validate, predict, measure store, or IPC bench"
         default: "validate"
         type: choice
-        options: [validate, predict, measure]
+        options: [validate, predict, measure, bench]
       engine:
         description: "binary channel engine"
         default: "python"
@@ -85,6 +85,12 @@ jobs:
         run: |
           pip install -q zstd
           PYTHONPATH=src python scripts/measure_store.py --data data/train.parquet --out results/measure.json
+      - name: run bench
+        if: ${{ inputs.task == 'bench' }}
+        run: |
+          cd rust-bitvec && cargo build --release && cd ..
+          echo '{"q":{"p":[1],"l":[2]},"refs":[{"key":"k#0","p":[1],"l":[3]}]}' | ./rust-bitvec/target/release/binvec
+          PYTHONPATH=src python scripts/bench_ipc.py --out results/bench.json
       - name: scramble + commit
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
