@@ -62,14 +62,39 @@ def rank_spectrum(q, cands, lib_by_key, fp_cache) -> list:
     return scored.sort_values("score", ascending=False)["key14"].tolist()[:25]
 
 
+def discover_kaggle():
+    """Kaggle kernels-only: locate competition parquet under /kaggle/input."""
+    import os
+    train = test = None
+    for dp, _, fns in os.walk("/kaggle/input"):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            ln = fn.lower()
+            if ln.endswith(".parquet") and "train" in ln and train is None:
+                train = p
+            if ln.endswith(".parquet") and "test" in ln and test is None:
+                test = p
+    return train, test
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train", required=True)
-    ap.add_argument("--test", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--train", default=None)
+    ap.add_argument("--test", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--csv", default=None,
+                    help="also/only write submission.csv (kernel mode)")
     ap.add_argument("--ppm", type=float, default=8.5)
     ap.add_argument("--wide", type=float, default=80.0)
     a = ap.parse_args()
+    if not a.train or not a.test:
+        dtrain, dtest = discover_kaggle()
+        a.train = a.train or dtrain
+        a.test = a.test or dtest
+    if not a.train or not a.test:
+        raise SystemExit("no --train/--test and nothing discovered")
+    if not a.out and not a.csv:
+        a.out = "results/predict.json"
 
     train = R.load_meta(a.train)
     struct = R.structure_table(train)
@@ -115,9 +140,20 @@ def main() -> None:
         cells = [key2smi[k_] for k_ in top[:25] if k_ in key2smi]
         rows.append([str(mid), ";".join(cells)])
         print(f"{mid} spectra={len(g)} guesses={len(cells)}", flush=True)
-    with open(a.out, "w") as f:
-        json.dump({"n": len(rows), "rows": rows}, f)
-    print(json.dumps({"n": len(rows)}))
+    if a.out:
+        with open(a.out, "w") as f:
+            json.dump({"n": len(rows), "rows": rows}, f)
+    print(json.dumps({"n": len(rows), "csv": bool(a.csv)}))
+    if a.csv:
+        from . import metric as M
+        errs = M.validate_submission(rows)
+        print(json.dumps({"csv_violations": errs[:5], "n": len(rows)}))
+        if errs:
+            raise SystemExit(f"submission invalid: {errs[:3]}")
+        with open(a.csv, "w") as f:
+            f.write("molecule_id,smiles\n")
+            for mid, cell in rows:
+                f.write(f"{mid},{cell}\n")
 
 
 if __name__ == "__main__":
