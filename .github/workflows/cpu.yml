@@ -40,7 +40,14 @@ jobs:
           cd rust-bitvec
           cargo build --release
           echo '{"q":{"p":[1],"l":[2]},"refs":[{"key":"k#0","p":[1],"l":[3]}]}' | ./target/release/binvec
+      - name: restore data cache
+        id: datacache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: casmi26-data-v1
       - name: download competition data
+        if: steps.datacache.outputs.cache-hit != 'true'
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
