@@ -1,0 +1,44 @@
+import sys
+sys.path.insert(0, "src")
+from mscpu import binary as B
+
+
+def test_encode_empty():
+    assert B.encode([], 100.0) == 0
+    assert B.encode(None, 100.0) == 0
+    assert B.encode_bins([], 100.0) == ([], [])
+
+
+def test_encode_self_jaccard():
+    import numpy as np
+    peaks = np.array([[100.0, 1.0], [200.5, 0.5], [350.25, 0.2]])
+    b = B.encode(peaks, 400.0)
+    assert b != 0
+    assert B.jaccard(b, b) == 1.0
+    assert B.jaccard(b, 0) == 0.0
+    assert B.jaccard(0, b) == 0.0
+
+
+def test_encode_deterministic_and_sized():
+    import numpy as np
+    peaks = np.array([[100.0, 1.0], [200.5, 0.5]])
+    a, b = B.encode(peaks, 400.0), B.encode(peaks, 400.0)
+    assert a == b
+    assert a.bit_length() <= 4096
+    other = B.encode(np.array([[900.0, 1.0]]), 950.0)
+    assert 0.0 <= B.jaccard(a, other) <= 1.0
+
+
+def test_bins_match_encode_bits():
+    """encode_bins is exactly the input the Rust core takes; re-mixing bins
+    must reproduce encode() bit-for-bit."""
+    import numpy as np
+    peaks = np.array([[100.0, 1.0], [200.5, 0.5], [350.25, 0.2]])
+    ref = B.encode(peaks, 400.0)
+    pb, lb = B.encode_bins(peaks, 400.0)
+    bits = 0
+    for q in pb:
+        bits |= 1 << (B._mix(q) % B.NBITS)
+    for q in lb:
+        bits |= 1 << (B._mix(q, salt=1) % B.NBITS)
+    assert bits == ref
