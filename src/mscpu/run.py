@@ -526,6 +526,29 @@ def main() -> None:
         selected = [select_task(t) for t in tasks]
     union = union_selected_keys(selected)
     sub = subset_lib(lib_by_key, union)
+    # M217: silent-skip coverage heartbeat. The engine SKIPS keys absent from
+    # the preload with no error, so a coverage hole reads as MRR 0.00, not a
+    # crash (C3-RED: 463/463 zeros, pools non-empty). Count it here, where
+    # the keys still exist to be counted. sel layout (qpos,qi,total,cand,pool,
+    # prec,tsel) copied from select_task (M212-class: producer is source).
+    _subkeys = set(sub)
+    _ncand = _npool = _hit = 0
+    for _sel in selected:
+        if _sel is None:
+            continue
+        for _k in _sel[3]:
+            _ncand += 1
+            if _k in _subkeys:
+                _hit += 1
+        for _k in _sel[4]:
+            _npool += 1
+            if _k in _subkeys:
+                _hit += 1
+    _truths = [str(_SE["qkey"][int(_qi)]) for _, _qi, _ in tasks]
+    _tin = sum(1 for _t in _truths if _t in _subkeys)
+    print("coverage truth_in_union=" + str(_tin) + "/" + str(len(_truths))
+          + " keys_in_lib=" + str(_hit) + "/" + str(_ncand + _npool)
+          + " dropped=" + str(len(union) - len(sub)), flush=True)
     # protocol v2: engine preloads the touched library subset once, then
     # key-only per-query messages. Streamed chunk-by-chunk (M207).
     print("preload build union=" + str(len(union)) + " lib_keys=" + str(len(lib_by_key)), flush=True)
