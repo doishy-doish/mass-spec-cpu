@@ -1665,8 +1665,8 @@ mod engine_tests {
         // M209: prepare-on-first-use == eager values bit-for-bit; raw dropped,
         // second call a no-op; empty-smiles fp is zeros (pool skips it).
         let raws = vec![
-            RawSpec { mzs: vec![100.0, 200.0], ints: vec![1.0, 0.5], prec: 201.0 },
-            RawSpec { mzs: vec![150.0], ints: vec![1.0], prec: 251.0 },
+            RawSpec { mzs: vec![100.0, 200.0], ints: vec![1.0, 0.5], prec: 201.0, ce: None },
+            RawSpec { mzs: vec![150.0], ints: vec![1.0], prec: 251.0, ce: None },
         ];
         let eager: Vec<CSpectra> = raws
             .iter()
