@@ -1,60 +1,15 @@
-"""Competition metric: MRR@25 on RDKit tautomer-canonical InChIKey14.
-Clean-room implementation of the published rule. key14() needs RDKit;
-everything else operates on key strings (RDKit-free, unit-testable)."""
-from __future__ import annotations
+"""Competition metric: MRR@25 on InChIKey14 (stereo-free).
 
-from functools import lru_cache
+Clean-room implementation of the published rule. Truth keys come from the
+data's inchikey14 column; the retrieval engine (Rust) returns ranked key
+lists, and these helpers score them. Kept in Python as the competition-spec
+layer (data plumbing + rule definition, not compute). No RDKit dependency.
+"""
+from __future__ import annotations
 
 import pandas as pd
 
 K = 25
-
-
-def rrf_fuse(scored, channels=("lib", "analog", "frag"), base=60.0):
-    """Reciprocal-rank fusion over per-channel rankings (robust across masks:
-    z-sum let dead channels outvote live ones on class2/class3)."""
-    fused = pd.Series(0.0, index=scored.index)
-    for ch in channels:
-        order = scored[ch].rank(ascending=False, method="min")
-        fused = fused + 1.0 / (base + order)
-    return fused
-
-
-def _enum():
-    from rdkit import Chem  # noqa
-    from rdkit.Chem.MolStandardize import rdMolStandardize
-    return rdMolStandardize.TautomerEnumerator()
-
-
-_ENUM = None
-
-
-def _get_enum():
-    global _ENUM
-    if _ENUM is None:
-        _ENUM = _enum()
-    return _ENUM
-
-
-@lru_cache(maxsize=2_000_000)
-def key14(smiles: str | None) -> str | None:
-    """Tautomer-canonical InChIKey connectivity block, or None if unparsable."""
-    if not smiles or not isinstance(smiles, str):
-        return None
-    from rdkit import Chem, RDLogger
-    RDLogger.DisableLog("rdApp.*")
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    try:
-        mol = _get_enum().Canonicalize(mol)
-    except Exception:
-        pass
-    try:
-        ik = Chem.MolToInchiKey(mol)
-    except Exception:
-        return None
-    return ik[:14] if ik else None
 
 
 def reciprocal_rank(truth_key: str | None, candidate_keys: list, k: int = K) -> float:

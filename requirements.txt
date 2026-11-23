@@ -1,6 +1,7 @@
 numpy>=1.26
 pandas>=2.2
 pyarrow>=15
-rdkit>=2024.3
 # NOTE: pytest (test step) and kaggle CLI (cache-miss download step) are
 # installed inside their own workflow steps, not here — compute jobs stay lean.
+# NOTE 2026-11-22 (single engine): RDKit removed — all chemistry/scoring lives
+# in rust-bitvec + rust-chem; Python is parquet/load/splits/output only.

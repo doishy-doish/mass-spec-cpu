@@ -15,11 +15,6 @@ on:
         default: "validate"
         type: choice
         options: [validate, predict]
-      engine:
-        description: "binary channel engine"
-        default: "python"
-        type: choice
-        options: [python, rust]
 permissions:
   contents: write
   actions: read
@@ -43,11 +38,9 @@ jobs:
       - run: pip install -r requirements.txt
       - run: mkdir -p data results
       - name: build rust engine
-        if: ${{ inputs.engine == 'rust' }}
         run: |
-          cd rust-bitvec
-          cargo build --release
-          echo '{"q":{"p":[1],"l":[2]},"refs":[{"key":"k#0","p":[1],"l":[3]}]}' | ./target/release/binvec
+          cd rust-bitvec && cargo build --release && cargo test --release && cd ..
+          cd rust-chem && cargo build --release && cargo test --release && cd ..
       - name: restore data cache
         id: datacache
         uses: actions/cache@v4
@@ -71,7 +64,7 @@ jobs:
           PYTHONPATH: src
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ matrix.shard }}" --shards "5" --jobs "4" --out results/${{ inputs.mask }}-${{ matrix.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ matrix.shard }}" --shards "5" --jobs "4" --out results/${{ inputs.mask }}-${{ matrix.shard }}.json
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json

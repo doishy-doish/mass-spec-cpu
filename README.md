@@ -1,18 +1,29 @@
 # mass-spec-cpu — CPU retrieval baseline for Enveda CASMI 2026 (Molecule ID from Mass Spectra)
 
-All-CPU pipeline (RDKit fingerprints, spectral similarity, mass-filtered pools, z-fused
-evidence channels) + leakage-safe three-mask validation. No GPU, no proprietary weights,
-no NC-licensed data. Free GitHub runners only.
+Single Rust engine (`rust-bitvec` `sengine`/`structs` modes + `rust-chem`):
+all cleaning, channels, fusion, ranking, and structure neutrals live in Rust.
+Python (`src/mscpu/run.py`, `predict.py`) is a thin launcher: parquet load,
+leakage-safe masks, pool shortlists, output assembly, submission CSV.
+No Python backup of any channel math exists (user order: one code, no backups).
 
 ## Layout
 
-- `src/mscpu/metric.py` — clean-room MRR@25 on InChIKey14 (RDKit only for keying).
-- `src/mscpu/validation.py` — class2 / class3 / cross-instrument splits grouped by key14.
-- `src/mscpu/spectra.py` — curation (floor, top-N, sqrt) + cosine + mass-shift analog cosine.
-- `src/mscpu/fingerprints.py` — RDKit key14 + Morgan-2048 + Tanimoto.
-- `src/mscpu/run.py` — pools (8.5ppm neutral mass) + 3 evidence channels + fused rank + MRR.
+- `rust-bitvec/src/main.rs` — THE engine: clean/quantize/encode(+weighted),
+  Morgan/Tanimoto (via `rust-chem`), cosine/modified_cosine, all five evidence
+  channels, funnel, z/rrf/rrfb/cascade/router fusion + ranking, structs.
+- `rust-chem/` — SMILES parser + Morgan ECFP r2-2048 + Tanimoto +
+  `connectivity_key14` surrogate (NOT an InChIKey; data grouping keeps the
+  parquet `inchikey14` column). Zero deps.
+- `src/mscpu/run.py` — thin validate launcher (masks, snake-draft, engine
+  spawn, heartbeats, MRR output). No compute.
+- `src/mscpu/predict.py` — thin inference launcher (narrow+wide pools,
+  per-molecule aggregation, submission.csv). No compute.
+- `src/mscpu/metric.py` — competition-spec helpers: MRR@25, submission
+  validation. No RDKit.
+- `src/mscpu/validation.py` — leakage-safe three-mask splits grouped by key14.
 - `scripts/scramble.mjs` — AES-256-GCM sealing for `results/*.json` (public repo, private numbers).
-- `.github/workflows/cpu.yml` — dispatch with mask + n; pytest, run, scramble, commit.
+- `.github/workflows/cpu.yml` (+ `cpu-fleet.yml`) — pytest + cargo test gates,
+  then run; results scrambled + committed. No `--engine` flag: one engine.
 
 ## Setup (operator)
 

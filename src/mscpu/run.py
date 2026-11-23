@@ -1,6 +1,9 @@
-"""run.py — CPU retrieval baseline + three-mask validation.
-Evidence channels (all CPU): library max-cosine, analog (mass-shift cosine ->
-Tanimoto to candidate), neutral-loss matches. Fusion: z-score sum (no training). LightGBM ranker: future work, labels available from masks.
+"""run.py — thin launcher for the single Rust retrieval engine (sengine).
+
+Python owns: parquet load, mask splits, pool shortlists (numpy bisect),
+snake-draft sharding, output assembly, heartbeats, submission schema.
+ALL compute (clean/channels/fusion/rank/neutrals) lives in rust-bitvec.
+There is no Python backup of any channel math (user order: one code).
 
 Usage:
   python -m mscpu.run --data data/train.parquet --mask class2 --n 200 --out results/class2.json
@@ -8,23 +11,29 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import bisect
 import concurrent.futures as CF
 import json
 import os
 import signal
 import subprocess
 import threading
-import time
+from bisect import bisect_left, bisect_right
 
 import numpy as np
 import pandas as pd
 
-from . import binary as B
-from . import fingerprints as fp
 from . import metric as M
-from . import spectra as S
 from . import validation as V
+
+VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw"]
+
+# BET-EVOLVE genome defaults (replication queue #3): neutral = legacy behavior
+# bit-identically (wl/wa/wf/rl/ra/rf = 1.0, casc_z = 3.0, rout_* = legacy gates).
+# The canary fits these on class2 n=50 (never class3); knobs ride --flags below
+# and are recorded in every output JSON for traceability (like qpeak/qloss).
+FUSION_DEFAULTS = {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0, "ra": 1.0,
+                   "rf": 1.0, "casc_z": 3.0, "rout_lib": 0.5,
+                   "rout_bin": 0.4, "rout_binw": 0.4}
 
 
 def load_meta(path: str) -> pd.DataFrame:
@@ -33,158 +42,9 @@ def load_meta(path: str) -> pd.DataFrame:
             "ms2_normalized_intensities", "ingest_lib"]
     t = pd.read_parquet(path, columns=[c for c in cols])
     t = t.rename(columns={"inchikey14": "key14", "normalized_smiles": "smiles",
-                          "ms2_mzs": "mzs", "ms2_normalized_intensities": "ints"})
+                          "ms2_mzs": "mzs", "ms2_normalized_intensities": "ints",
+                          "instrument_type": "instrument"})
     return t.reset_index(drop=True)
-
-
-def structure_table(meta: pd.DataFrame) -> pd.DataFrame:
-    """One row per key14: fingerprint, neutral mass (median adduct-derived)."""
-    recs = []
-    for key, g in meta.groupby("key14"):
-        smi = g["smiles"].iloc[0]
-        ests = [S.neutral_mass(p, a) for p, a in zip(g["precursor_mz"], g["adduct"])]
-        ests = [e for e in ests if e and 50 < e < 3000]
-        nm = float(np.median(ests)) if ests else None
-        recs.append({"key14": key, "smiles": smi, "neutral": nm,
-                     "fp": fp.morgan(smi), "n_spec": len(g)})
-    return pd.DataFrame(recs)
-
-
-def score_query(qpeaks, qprec, cands: pd.DataFrame, lib_clean: dict,
-                analog_pool: list, lib_bits_by_key: dict | None = None,
-                qbits: int = 0, bin_override: dict | None = None,
-                lib_wbits_by_key: dict | None = None,
-                qwbits: dict | None = None, qloss_pre: set | None = None,
-                nq: float | None = None, lib_norms: dict | None = None,
-                binw_override: dict | None = None) -> pd.DataFrame:
-    """FURNACE (bench-gated, one knob): two-pointer cosine with precomputed norms,
-    pool entries (key14, peaks, precursor[, norm]) — 4-tuples from run.py, 3-tuples
-    from predict.py (norm computed inline). qloss hoisted (one set per query);
-    per-candidate loss sets stay inline (library-size eager cache blew RAM — see M174)."""
-    if nq is None:
-        nq = float((qpeaks[:, 1] ** 2).sum()) if len(qpeaks) else 0.0
-    qloss = qloss_pre
-    if qloss is None:
-        qloss = set(round(float(qprec - mz), 2) for mz, _ in qpeaks[:32])
-    # analog matches once per query: top analog structures by mass-shift cosine
-    analog_hits = []
-    for entry in analog_pool:
-        if len(entry) == 4:
-            okey, opeaks, oprec, onorm = entry
-        else:
-            okey, opeaks, oprec = entry
-            onorm = None
-        ms = S.modified_cosine(qpeaks, opeaks, qprec - oprec, na=nq, nb=onorm)
-        if ms > 0.3:
-            ofp = FP_CACHE.get(okey)
-            if ofp is not None:
-                analog_hits.append((ofp, ms))
-    analog_hits.sort(key=lambda t: -t[1])
-    analog_hits = analog_hits[:10]
-    rows = []
-    for c in cands.itertuples():
-        ckey = c.key14
-        cl_list = lib_clean.get(ckey, [])
-        # library channel: max cosine vs structure's own spectra
-        lib = 0.0
-        norms = (lib_norms or {}).get(ckey) if lib_norms else None
-        for idx, (cl, prec) in enumerate(cl_list):
-            nn = norms[idx] if norms is not None and idx < len(norms) else None
-            s = S.cosine(qpeaks, cl, na=nq, nb=nn)
-            if s > lib:
-                lib = s
-        # analog channel: best mass-shift match x Tanimoto to candidate
-        analog = 0.0
-        cfp = c.fp
-        if cfp is not None:
-            for ofp, ms in analog_hits:
-                v = ms * fp.tanimoto_fp(ofp, cfp)
-                if v > analog:
-                    analog = v
-        # fragmentation proxy: shared neutral losses (precursor - fragment)
-        # NOTE: built inline per candidate — the eager per-library cache cost ~0.5GB (M174)
-        fl = [set(round(float(prec - mz), 2) for mz, _ in cl[:32]) if len(cl) else set()
-              for cl, prec in cl_list[:2]]
-        frag = 0.0
-        for floss in fl[:2]:
-            if floss:
-                v = len(qloss & floss) / max(1, len(qloss))
-                if v > frag:
-                    frag = v
-        # binary channel: Rust inference when the driver passes scores, else local Jaccard
-        bscore = 0.0
-        if bin_override is not None:
-            bscore = float(bin_override.get(ckey, 0.0))
-        elif qbits and lib_bits_by_key:
-            for lb in lib_bits_by_key.get(ckey, []):
-                j = B.jaccard(qbits, lb)
-                if j > bscore:
-                    bscore = j
-        # weighted-binary channel: Ruzicka Jaccard, intensity restored (BIN-WEIGHTS)
-        bwscore = 0.0
-        if binw_override is not None:
-            bwscore = float(binw_override.get(ckey, 0.0))
-        elif qwbits and lib_wbits_by_key:
-            for wb in lib_wbits_by_key.get(ckey, []):
-                j = B.wjaccard(qwbits, wb)
-                if j > bwscore:
-                    bwscore = j
-        rows.append({"key14": ckey, "lib": lib, "analog": analog, "frag": frag, "bin": bscore, "binw": bwscore})
-    return pd.DataFrame(rows)
-
-
-def rust_bin_scores(rust_bin, qbins, ref_bins) -> dict | None:
-    """Rust inference: one process call per query. ref_bins = [(tag, p, l)].
-    Returns tag->score, or None on any failure (caller falls back to Python)."""
-    try:
-        payload = {"q": {"p": qbins[0], "l": qbins[1]},
-                   "refs": [{"key": t, "p": p, "l": l} for t, p, l in ref_bins]}
-        pr = subprocess.run([rust_bin], input=json.dumps(payload), capture_output=True,
-                            text=True, timeout=600)
-        if pr.returncode != 0:
-            return None
-        data = json.loads(pr.stdout)
-        best: dict = {}
-        for tag, s in data.get("scores", []):
-            key = tag.rsplit("#", 1)[0]
-            if s > best.get(key, 0.0):
-                best[key] = float(s)
-        return best
-    except Exception:
-        return None
-
-
-class _RustWorker:
-    """Persistent binvec worker: preload once, one round trip per query.
-    Serves bin + binw; any failure -> exception -> caller falls back to python."""
-    def __init__(self, bin_path, lib_payload):
-        self.p = subprocess.Popen([bin_path, "worker"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, text=True, bufsize=1)
-        self.p.stdin.write(json.dumps({"lib": lib_payload}) + "\n")
-        self.p.stdin.flush()
-        ready = self.p.stdout.readline()
-        if "ready" not in ready:
-            raise RuntimeError("binvec worker not ready: " + ready[:200])
-    def query(self, q, cands):
-        self.p.stdin.write(json.dumps({"q": q, "cands": sorted(cands)}) + "\n")
-        self.p.stdin.flush()
-        out = json.loads(self.p.stdout.readline())
-        return ({k: float(v) for k, v in out["scores"]},
-                {k: float(v) for k, v in out["wscores"]})
-    def close(self):
-        try:
-            self.p.stdin.close()
-            self.p.wait(timeout=10)
-        except Exception:
-            try:
-                self.p.kill()
-            except Exception:
-                pass
-
-
-FP_CACHE: dict = {}
-
-_G = {}
 
 
 def _mem_state():
@@ -207,8 +67,7 @@ def _mem_state():
 
 
 def _sigterm_loud(signum, frame):
-    """Host asked us to die: scream our memory state, then go. Distinguishes
-    infra reclaim (this line present, GBs free) from pressure (absent/ramp-to-zero)."""
+    """Host asked us to die: scream our memory state, then go."""
     rss, avail = _mem_state()
     try:
         print("LOUD-SIGTERM host shutdown rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
@@ -222,149 +81,165 @@ def _mem_watch(stop, interval=20.0):
         print("LOUD-MEM rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
 
 
-class _LazyLayer(dict):
-    """dict interface, values built on demand from lib_clean. Bounded cache.
+class _Engine:
+    """Persistent sengine worker: one JSON line per query, ranked lists back."""
 
-    MEMORY FIX: full-corpus derived layers (bits/bins/wbits over ~2.5M spectra)
-    were GBs of dicts touched per-query only for candidate keys (~thousands).
-    Same B.encode* on same (cl, prec) => numeric-identical, RAM on demand.
-    score_query/predict/tests all use .get(ckey, default) — covered here.
-    Real dicts still work everywhere (predict/tests pass their own)."""
+    def __init__(self, bin_path, qpeak=0.05, qloss=0.01, fusion=None):
+        self.p = subprocess.Popen([bin_path, "sengine"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True, bufsize=1,
+                                  stderr=subprocess.DEVNULL)
+        params = {"qpeak": qpeak, "qloss": qloss}
+        params.update(FUSION_DEFAULTS)
+        params.update(fusion or {})
+        self.p.stdin.write(json.dumps({"params": params}) + "\n")
+        self.p.stdin.flush()
+        ready = self.p.stdout.readline()
+        if "ready" not in ready:
+            raise RuntimeError("sengine not ready: " + ready[:200])
 
-    def __init__(self, build, cap=400000):
-        dict.__init__(self)
-        self._build = build
-        self._cap = cap
+    def query(self, qmsg):
+        self.p.stdin.write(json.dumps(qmsg) + "\n")
+        self.p.stdin.flush()
+        return json.loads(self.p.stdout.readline())
 
-    def get(self, k, default=None):
+    def close(self):
         try:
-            return dict.__getitem__(self, k)
-        except KeyError:
-            pass
-        if len(self) >= self._cap:
-            self.clear()
-        v = self._build(k)
-        dict.__setitem__(self, k, v)
-        return v
+            self.p.stdin.close()
+            self.p.wait(timeout=10)
+        except Exception:
+            try:
+                self.p.kill()
+            except Exception:
+                pass
 
 
-def _build_bits(ckey):
-    return [B.encode(cl, prec) for cl, prec in _G["lib_clean"].get(ckey, [])]
+def structs_call(bin_path, ktable, kidx, precs, adducts, queries):
+    """One structs round trip: structure neutrals + query neutral masses."""
+    p = subprocess.run([bin_path, "structs"],
+                       input=json.dumps({"ktable": ktable, "kidx": kidx, "precs": precs,
+                                         "adducts": adducts, "queries": queries}),
+                       capture_output=True, text=True, timeout=1200)
+    if p.returncode != 0:
+        raise RuntimeError("structs failed: " + (p.stderr or "")[-500:])
+    return json.loads(p.stdout)
 
 
-def _build_bins(ckey):
-    return [B.encode_bins(cl, prec, _G["qpeak"], _G["qloss"]) for cl, prec in _G["lib_clean"].get(ckey, [])]
+def raw_list(v):
+    if v is None:
+        return []
+    if isinstance(v, np.ndarray):
+        return [float(x) for x in v.tolist()]
+    return [float(x) for x in v]
 
 
-def _build_wbits(ckey):
-    return [B.encode_weighted(cl, prec, _G["qpeak"], _G["qloss"]) for cl, prec in _G["lib_clean"].get(ckey, [])]
+def build_structs_payload(meta, queries):
+    """Pure builder for one structs round trip (no binary needed, testable)."""
+    lib_keys = meta["key14"].tolist()
+    ukeys = sorted(set(lib_keys))
+    kindex = {k: i for i, k in enumerate(ukeys)}
+    sq = [{"qi": int(qi), "prec": float(meta.at[qi, "precursor_mz"]),
+           "adduct": str(meta.at[qi, "adduct"])} for qi in queries]
+    return (ukeys, [kindex[k] for k in lib_keys],
+            [float(x) for x in meta["precursor_mz"].tolist()],
+            [str(x) for x in meta["adduct"].tolist()], sq)
+
+
+def build_engine_query(q, cands, pool_keys, lib_by_key, key2smi, meta, qi,
+                       qnm=None, key2neutral=None):
+    """Pure builder for one sengine query (no binary needed, testable).
+
+    qnm/key2neutral carry neutral masses for the v8-mass-lite channel
+    (Loop-3 replication, standalone). None-safe: missing -> Rust scores 0.0 ties.
+    """
+    k2n = key2neutral or {}
+    cands_msg = []
+    for _, r in cands.iterrows():
+        k = r["key14"]
+        specs = []
+        for j in lib_by_key.get(k, []):
+            rr = meta.loc[j]
+            specs.append({"mzs": raw_list(rr["mzs"]), "ints": raw_list(rr["ints"]),
+                          "prec": float(rr["precursor_mz"])})
+        cands_msg.append({"key": k, "smiles": key2smi.get(k, ""), "specs": specs,
+                          "neutral": k2n.get(k)})
+    pool_msg = []
+    for k in pool_keys:
+        j0 = lib_by_key.get(k, [None])[0]
+        if j0 is None:
+            continue
+        rr = meta.loc[j0]
+        pool_msg.append({"key": k, "smiles": key2smi.get(k, ""),
+                         "mzs": raw_list(rr["mzs"]), "ints": raw_list(rr["ints"]),
+                         "prec": float(rr["precursor_mz"])})
+    return {"q": {"mzs": raw_list(q["mzs"]), "ints": raw_list(q["ints"]),
+                  "prec": float(q["precursor_mz"])},
+            "cands": cands_msg, "pool": pool_msg, "qi": int(qi),
+            "qnm": qnm}
+
+
+_SE = {}
+_SE_META = None
+
+
+def _worker():
+    """One engine worker per process (forks never share the parent's pipes)."""
+    if _SE.get("worker") is None or _SE.get("worker_pid") != os.getpid():
+        _SE["worker"] = _Engine(_SE["rust_bin"], _SE["qpeak"], _SE["qloss"],
+                               _SE.get("fusion"))
+        _SE["worker_pid"] = os.getpid()
+    return _SE["worker"]
 
 
 def _run_query(task):
-    """One query end-to-end. Fork-worker safe: reads only _G + module globals.
-    Returns (qi, {variant: rr}, pool_len, ranked_z_or_None, logline), or None if skipped."""
+    """One query end-to-end. Reads only _SE + engine worker; never raises."""
     qpos, qi, total = task
-    V = _G["variants"]
-    q = _G["meta"].loc[qi]
-    qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
-    if not qnm:
+    V_ = _SE["variants"]
+    q = _SE["meta"].loc[qi]
+    qnm = _SE["qnm"].get(int(qi))
+    if qnm is None:
         return None
-    qmzs, qints = _G["qspec"][qi]
-    qpeaks = S.clean(qmzs, qints, q["precursor_mz"])
-    qbits = B.encode(qpeaks, q["precursor_mz"])
-    tol = qnm * _G["ppm"] * 1e-6
-    lo = np.searchsorted(_G["masses"], qnm - tol)
-    hi = np.searchsorted(_G["masses"], qnm + tol, side="right")
-    cands = _G["struct_m"].iloc[lo:hi]
+    tol = qnm * _SE["ppm"] * 1e-6
+    lo = np.searchsorted(_SE["masses"], qnm - tol)
+    hi = np.searchsorted(_SE["masses"], qnm + tol, side="right")
+    cands = _SE["struct_m"].iloc[lo:hi]
+    if not len(cands):
+        return None
     cand_keys = set(cands["key14"])
-    bin_override = None
-    binw_override = None
-    if _G["engine"] == "rust":
-        try:
-            p, pw, l, lw = B.encode_qlib(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
-            bin_override, binw_override = _G["rworker"].query(
-                {"p": p, "pw": pw, "l": l, "lw": lw}, cand_keys)
-        except Exception:
-            print("rust engine failed on q=" + str(qi) + ", falling back to python", flush=True)
-    if bin_override is None:
-        qbins = B.encode_bins(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
-    else:
-        qbins = 0
-    if binw_override is None:
-        qwbits = B.encode_weighted(qpeaks, q["precursor_mz"], _G["qpeak"], _G["qloss"])
-    else:
-        qwbits = None
-    nq = float((qpeaks[:, 1] ** 2).sum()) if len(qpeaks) else 0.0
-    qloss = set(round(float(q["precursor_mz"] - mz), 2) for mz, _ in qpeaks[:32])
-    # analog pool: bisect on precomputed precursor-sorted library array
-    # (was: full dict scan + Python abs() per library key, per query)
-    precs = _G["lib_precs"]
-    pkeys = _G["lib_pkeys"]
-    plo = bisect.bisect_left(precs, q["precursor_mz"] - 50.0)
-    phi = bisect.bisect_right(precs, q["precursor_mz"] + 50.0, lo=plo)
-    nearby = []
+    # analog pool: precursor +-50 Da library window, excluding candidates,
+    # nearest-first (mirrors the old bisect + dist sort; engine funnels it)
+    precs = _SE["lib_precs"]
+    pkeys = _SE["lib_pkeys"]
+    prec_q = float(q["precursor_mz"])
+    plo = bisect_left(precs, prec_q - 50.0)
+    phi = bisect_right(precs, prec_q + 50.0, lo=plo)
+    near = []
     for idx in range(plo, phi):
-        key = pkeys[idx]
-        if key in cand_keys:
+        k = pkeys[idx]
+        if k in cand_keys:
             continue
-        cl, prec = _G["lib_clean"][key][0]
-        nearby.append((abs(prec - q["precursor_mz"]), key, cl, prec))
-    nearby.sort(key=lambda t: t[0])
-    # FUNNEL (I2-1): bin-prefilter 1500 -> top 300 by Jaccard before any cosine.
-    # Jaccard is C popcount; cosine is a Python peak loop. Saves ~1200 cosines/query.
-    if len(nearby) > 400 and qbits:
-        _lb = _G.get("lib_bits") or {}
-        scored_near = []
-        for dist, key, cl, prec in nearby:
-            bl = _lb.get(key)
-            b0 = bl[0] if bl else 0
-            try:
-                j = B.jaccard(qbits, b0)
-            except Exception:
-                j = 0.0
-            scored_near.append((j, dist, key, cl, prec))
-        scored_near.sort(key=lambda t: (-t[0], t[1]))
-        nearby = [(d, k, c, p) for _, d, k, c, p in scored_near[:300]]
-    analog_pool = [(k, p, pr, _G["lib_norms"][k][0]) for _, k, p, pr in nearby[:1500]]
-    scored = score_query(qpeaks, q["precursor_mz"], cands, _G["lib_clean"], analog_pool,
-                         _G["lib_bits"], qbits, bin_override, _G["lib_wbits"], qwbits,
-                         qloss, nq, _G["lib_norms"], binw_override)
-    for ch in ["lib", "analog", "frag"]:
-        m, s = scored[ch].mean(), scored[ch].std() + 1e-9
-        scored[ch + "z"] = (scored[ch] - m) / s
-    scored["z"] = scored[["libz", "analogz", "fragz"]].sum(axis=1)
-    scored["rrf"] = M.rrf_fuse(scored)
-    scored["rrfb"] = M.rrf_fuse(scored, channels=("lib", "analog", "frag", "bin"))
-    lzmax = float(scored["libz"].max()) if len(scored) else 0.0
-    scored["cascade"] = scored["libz"] if lzmax > 3.0 else scored["analogz"]
-    # ROUTER (I3-1): mask-conditional fusion. Fixed fusions lose somewhere
-    # (rrfb helps easy / hurts hard). Overlap regime -> cascade, novel -> analog.
-    # Signal: per-query max lib/bin/binw (easy ~0.9, hard ~chance). 10 lines, no deps.
-    lib_max = float(scored["lib"].max()) if len(scored) else 0.0
-    bin_max = float(scored["bin"].max()) if len(scored) else 0.0
+        near.append((abs(precs[idx] - prec_q), k))
+    near.sort(key=lambda t: t[0])
+    pool_keys = [k for _, k in near[:1500]]
+    qmsg = build_engine_query(q, cands, pool_keys, _SE["lib_by_key"],
+                              _SE["key2smi"], _SE["meta"], qi,
+                              qnm, _SE.get("key2neutral"))
     try:
-        binw_max = float(scored["binw"].max()) if len(scored) else 0.0
-    except Exception:
-        binw_max = 0.0
-    overlap = (lib_max > 0.5) or (bin_max > 0.4) or (binw_max > 0.4)
-    router_col = "cascade" if overlap else "analog"
+        out = _worker().query(qmsg)
+    except Exception as e:
+        print("sengine failed on q=" + str(qi) + " (" + str(e)[:120] + "), skipping", flush=True)
+        return None
     truth = q["key14"]
     row = {}
     ranked_z = None
-    for v in V:
-        if v == "router":
-            ranked = scored.sort_values(router_col, ascending=False)["key14"].tolist()[:25]
-            row[v] = M.reciprocal_rank(truth, ranked)
-            continue
-        col = {"lib": "lib", "analog": "analog", "frag": "frag"}.get(v, v)
-        ranked = scored.sort_values(col, ascending=False)["key14"].tolist()[:25]
+    for v in V_:
+        ranked = out["ranked"].get(v, [])
         row[v] = M.reciprocal_rank(truth, ranked)
         if v == "z":
             ranked_z = ranked
-    line = ("shard " + str(_G["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
+    line = ("shard " + str(_SE["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
-            + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V))
-    print(line, flush=True)  # HEARTBEAT (M180): workers print as they finish; parent used to print only at the very end
+            + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_))
+    print(line, flush=True)  # HEARTBEAT: workers print as they finish
     return (qi, row, len(cands), ranked_z, line)
 
 
@@ -375,21 +250,27 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ppm", type=float, default=8.5)
-    ap.add_argument("--engine", choices=["python", "rust"], default="python")
     ap.add_argument("--rust-bin", default="rust-bitvec/target/release/binvec")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--qpeak", type=float, default=0.05)
     ap.add_argument("--qloss", type=float, default=0.01)
+    ap.add_argument("--wl", type=float, default=1.0)
+    ap.add_argument("--wa", type=float, default=1.0)
+    ap.add_argument("--wf", type=float, default=1.0)
+    ap.add_argument("--rl", type=float, default=1.0)
+    ap.add_argument("--ra", type=float, default=1.0)
+    ap.add_argument("--rf", type=float, default=1.0)
+    ap.add_argument("--casc-z", type=float, default=3.0)
+    ap.add_argument("--rout-lib", type=float, default=0.5)
+    ap.add_argument("--rout-bin", type=float, default=0.4)
+    ap.add_argument("--rout-binw", type=float, default=0.4)
     ap.add_argument("--out", required=True)
     ap.add_argument("--out-suffix", default="",
                     help="inserted before the extension of --out, e.g. '-binwprobe'; "
                          "probes must use one so they never clobber fleet shard files")
     a = ap.parse_args()
-    if a.engine == "rust" and a.jobs != 1:
-        print("rust engine owns its worker: forcing jobs=1 (was " + str(a.jobs) + ")", flush=True)
-        a.jobs = 1
     signal.signal(signal.SIGTERM, _sigterm_loud)
     _stop = threading.Event()
     threading.Thread(target=_mem_watch, args=(_stop,), daemon=True).start()
@@ -403,9 +284,6 @@ def main() -> None:
         out_path = head + sep + tail2 if sep else tail2
 
     meta = load_meta(a.data)
-    struct = structure_table(meta)
-    global FP_CACHE
-    FP_CACHE = {r["key14"]: r["fp"] for _, r in struct.iterrows() if r["fp"] is not None}
     pool = V.query_pool(meta).index.tolist()
     counts = meta["key14"].value_counts()
     if a.mask == "class2":
@@ -414,40 +292,33 @@ def main() -> None:
         library, queries, _ = V.split_class3(meta, pool, a.n, a.seed)
     else:
         library, queries, _ = V.split_cross_instrument(meta, pool, a.n, a.seed)
-    lib_set = set(library)
-    lib_clean_by_key: dict = {}
-    for idx in library:
-        r = meta.loc[idx]
-        cl = S.clean(r["mzs"], r["ints"], r["precursor_mz"])
-        lib_clean_by_key.setdefault(r["key14"], []).append((cl, r["precursor_mz"]))
-    # derived layers (bits/bins/wbits) are LAZY (_LazyLayer, built per touched key):
-    # full-corpus dicts were GBs, per-query only candidate keys (~thousands) are read.
-    # FURNACE precomputes (library is static): spectrum norms,
-    # precursor-sorted key array for bisect pool lookup.
-    # (No loss-set cache: ~0.5GB eager, blew the 16GB runner — M174.)
-    lib_norms_by_key = {k: [float((cl[:, 1] ** 2).sum()) if len(cl) else 0.0 for cl, _ in v]
-                        for k, v in lib_clean_by_key.items()}
-    _prec_pairs = sorted((prec, k) for k, v in lib_clean_by_key.items() for cl, prec in v[:1])
-
-    # candidate pool: structures within ppm of query neutral mass (train structures only;
-    # competition adds COCONUT — pool grows ~2.6x, noted in contracts)
-    struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
+    # one structs round trip: neutrals for the pool + qnm per query
+    ukeys, kidx, precs, adducts, sq = build_structs_payload(meta, queries)
+    st = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, sq)
+    neutrals = st["neutrals"]
+    qnm = {int(qi): v for qi, v in st["qnm"] if v is not None}
+    struct_m = pd.DataFrame([{"key14": k, "neutral": neutrals[k]} for k in neutrals])
+    struct_m = struct_m.sort_values("neutral").reset_index(drop=True)
     masses = struct_m["neutral"].to_numpy()
 
-    # SNAKE-DRAFT (I4-1): balance 5 runners by ppm pool size, not stride.
-    # Stride caused 8.3 vs 15.3min spread (slowest shard = fleet wall).
-    # Cost proxy = candidate count via masses; snake 0,1,2,3,4,4,3,2,1,0...
+    lib_by_key: dict = {}
+    for idx in library:
+        lib_by_key.setdefault(meta.at[idx, "key14"], []).append(int(idx))
+    key2smi: dict = {}
+    for k, g in meta.groupby("key14"):
+        key2smi.setdefault(k, str(g["smiles"].iloc[0]))
+
+    # SNAKE-DRAFT: balance shards by ppm pool size (slowest shard = fleet wall)
     if a.shards > 1 and len(queries) > 1:
         qcosts = []
         for qi in queries:
-            r = meta.loc[qi]
-            qnm = S.neutral_mass(r["precursor_mz"], r["adduct"])
-            if not qnm:
+            qn = qnm.get(int(qi))
+            if qn is None:
                 qcosts.append(0)
                 continue
-            tol = qnm * a.ppm * 1e-6
-            lo = np.searchsorted(masses, qnm - tol)
-            hi = np.searchsorted(masses, qnm + tol, side="right")
+            tol = qn * a.ppm * 1e-6
+            lo = np.searchsorted(masses, qn - tol)
+            hi = np.searchsorted(masses, qn + tol, side="right")
             qcosts.append(int(hi - lo))
         order = sorted(range(len(queries)), key=lambda i: -qcosts[i])
         buckets: list = [[] for _ in range(a.shards)]
@@ -460,73 +331,80 @@ def main() -> None:
     else:
         queries = queries[a.shard::a.shards]
 
-    # MEMORY FIX: raw peak lists are duplicated into lib_clean (cleaned arrays);
-    # stash query spectra, then drop the object columns (GBs) before workers fork.
-    qspec = {qi: (meta.at[qi, "mzs"], meta.at[qi, "ints"]) for qi in queries}
-    meta = meta.drop(columns=["mzs", "ints"])
-    import gc as _gc
-    _gc.collect()
+    # analog-pool lookup array: precursor-sorted first-spectrum per library key
+    _prec_pairs = []
+    for k, js in lib_by_key.items():
+        j0 = js[0]
+        _prec_pairs.append((float(meta.at[j0, "precursor_mz"]), k))
+    _prec_pairs.sort(key=lambda t: t[0])
+    lib_precs = [p for p, _ in _prec_pairs]
+    lib_pkeys = [k for _, k in _prec_pairs]
 
-    VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router"]
+    key2neutral = dict(zip(struct_m["key14"].tolist(), struct_m["neutral"].tolist()))
+    fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
+              "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
+              "rout_bin": a.rout_bin, "rout_binw": a.rout_binw}
+    _SE.update(meta=meta, struct_m=struct_m, masses=masses, key2neutral=key2neutral,
+               fusion=fusion,
+               lib_by_key=lib_by_key,
+               lib_precs=lib_precs, lib_pkeys=lib_pkeys,
+               key2smi=key2smi, qnm=qnm, ppm=a.ppm,
+               shard=a.shard, variants=VARIANTS, rust_bin=a.rust_bin,
+               qpeak=a.qpeak, qloss=a.qloss)
+    _rss, _avail = _mem_state()
+    print("precompute done lib_keys=" + str(len(lib_by_key)) + " queries=" + str(len(queries))
+          + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),
+          flush=True)  # HEARTBEAT
+    tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
+    results = []
+    if a.jobs > 1 and len(tasks) > 1:
+        with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
+            for res in ex.map(_run_query, tasks):
+                if res is None:
+                    continue
+                results.append(res)
+    else:
+        for t in tasks:
+            res = _run_query(t)
+            if res is None:
+                continue
+            results.append(res)
+
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
-    _G.update(meta=meta, qspec=qspec, struct_m=struct_m, masses=masses, lib_clean=lib_clean_by_key,
-              lib_bits=_LazyLayer(_build_bits), lib_bins=_LazyLayer(_build_bins), lib_wbits=_LazyLayer(_build_wbits),
-              lib_norms=lib_norms_by_key,
-              lib_precs=[p for p, _ in _prec_pairs], lib_pkeys=[k for _, k in _prec_pairs],
-              variants=VARIANTS, engine=a.engine, rust_bin=a.rust_bin, ppm=a.ppm,
-              shard=a.shard, qpeak=a.qpeak, qloss=a.qloss)
-    _rss, _avail = _mem_state()
-    print("precompute done lib_keys=" + str(len(lib_clean_by_key)) + " queries=" + str(len(queries)) + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail), flush=True)  # HEARTBEAT (M180)
-    if a.engine == "rust":
-        lib_payload = {}
-        for k, v in lib_clean_by_key.items():
-            specs = []
-            for cl, prec in v:
-                p, pw, l, lw = B.encode_qlib(cl, prec, a.qpeak, a.qloss)
-                specs.append({"p": p, "pw": pw, "l": l, "lw": lw})
-            lib_payload[k] = specs
-        _G["rworker"] = _RustWorker(a.rust_bin, lib_payload)
-        del lib_payload
-        _gc.collect()
-        print("rust worker ready", flush=True)
-    tasks = [(i, qi, len(queries)) for i, qi in enumerate(queries)]
-    if a.jobs > 1 and len(tasks) > 1:
-        with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
-            results = list(ex.map(_run_query, tasks))
-    else:
-        results = [_run_query(t) for t in tasks]
-    for res in results:
-        if res is None:
-            continue
-        qi, row, plen, ranked, line = res
+    qidx: list = []
+    for qi, row, plen, ranked, line in results:
         pools.append(plen)
         for v in VARIANTS:
             rrs[v].append(row[v])
         if ranked is not None:
             preds[str(qi)] = ranked
+        qidx.append(int(qi))
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
-    out = {"mask": a.mask, "engine": a.engine, "shard": a.shard, "shards": a.shards, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
+    out = {"mask": a.mask, "engine": "rust", "shard": a.shard, "shards": a.shards, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
            "mrr_lib": _avg(rrs["lib"]), "mrr_analog": _avg(rrs["analog"]),
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
            "mrr_cascade": _avg(rrs["cascade"]),
            "mrr_bin": _avg(rrs["bin"]), "mrr_rrfb": _avg(rrs["rrfb"]),
-           "mrr_binw": _avg(rrs["binw"]), "mrr_router": _avg(rrs["router"]),
+           "mrr_binw": _avg(rrs["binw"]), "mrr_router": _avg(rrs["router"]), "mrr_stein": _avg(rrs["stein"]),
+            "mrr_mass": _avg(rrs["mass"]),
+            "mrr_zw": _avg(rrs["zw"]), "mrr_rrfw": _avg(rrs["rrfw"]),
+            "fusion": fusion,
            "qpeak": a.qpeak, "qloss": a.qloss,
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
            "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
-           "pools": pools, "qidx": [int(q) for q in queries]}
+           "pools": pools, "qidx": qidx}
     with open(out_path, "w") as f:
         json.dump(out, f)
     try:
-        if _G.get("rworker") is not None:
-            _G["rworker"].close()
+        if _SE.get("worker") is not None:
+            _SE["worker"].close()
     except Exception:
         pass
     try:

@@ -1,0 +1,8 @@
+[package]
+name = "chem"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "chem"
+path = "src/lib.rs"

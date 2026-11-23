@@ -11,15 +11,10 @@ on:
         description: "queries"
         default: "200"
       task:
-        description: "validate, predict, measure store, or IPC bench"
+        description: "validate or predict (single Rust engine)"
         default: "validate"
         type: choice
-        options: [validate, predict, measure, bench]
-      engine:
-        description: "binary channel engine"
-        default: "python"
-        type: choice
-        options: [python, rust]
+        options: [validate, predict]
       shard:
         description: "shard index"
         default: "0"
@@ -51,11 +46,9 @@ jobs:
       - run: pip install -r requirements.txt
       - run: mkdir -p data results
       - name: build rust engine
-        if: ${{ inputs.engine == 'rust' }}
         run: |
-          cd rust-bitvec
-          cargo build --release
-          echo '{"q":{"p":[1],"l":[2]},"refs":[{"key":"k#0","p":[1],"l":[3]}]}' | ./target/release/binvec
+          cd rust-bitvec && cargo build --release && cargo test --release && cd ..
+          cd rust-chem && cargo build --release && cargo test --release && cd ..
       - name: restore data cache
         id: datacache
         uses: actions/cache@v4
@@ -79,21 +72,10 @@ jobs:
           PYTHONPATH: src
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --engine "${{ inputs.engine }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
-      - name: run measure
-        if: ${{ inputs.task == 'measure' }}
-        run: |
-          pip install -q zstd
-          PYTHONPATH=src python scripts/measure_store.py --data data/train.parquet --out results/measure.json
-      - name: run bench
-        if: ${{ inputs.task == 'bench' }}
-        run: |
-          cd rust-bitvec && cargo build --release && cd ..
-          echo '{"q":{"p":[1],"l":[2]},"refs":[{"key":"k#0","p":[1],"l":[3]}]}' | ./rust-bitvec/target/release/binvec
-          PYTHONPATH=src python scripts/bench_ipc.py --out results/bench.json
       - name: scramble + commit
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}

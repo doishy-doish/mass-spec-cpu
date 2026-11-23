@@ -1,20 +1,20 @@
-"""predict.py — test-set inference for the kernels-only submission.
-Same evidence channels as run.py, but: library = ALL train spectra (no mask),
-queries = test.parquet grouped by molecule_id, per-molecule aggregation by sum
-of reciprocal rank across the molecule's spectra. Output results/predict.json
-{rows: [[molecule_id, "smi;..."]], n} — scrambled on the runner; the watchdog
-decrypts it into submission.csv (<=25 SMILES per molecule).
+"""predict.py — thin launcher for test-set inference (submission path).
+
+Same division as run.py: Python owns discovery/load/masks/CSV, the Rust
+sengine owns all scoring. Per molecule: narrow pool -> sengine -> top-25;
+wide-pool rescue for short lists; per-molecule aggregation by summed
+reciprocal rank. No Python backup of any channel math (user order: one code).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+from bisect import bisect_left, bisect_right
 
 import numpy as np
 import pandas as pd
 
-from . import spectra as S
 from . import metric as M
 from . import run as R
 
@@ -35,23 +35,13 @@ def aggregate(ranked_lists: list, k: int = 25) -> list:
     return sorted(score, key=lambda kk: -score[kk])[:k]
 
 
-def rank_spectrum(q, cands, lib_clean_by_key, fp_cache) -> list:
-    qpeaks = S.clean(q["ms2_mzs"], q["ms2_normalized_intensities"], q["precursor_mz"])
-    cand_keys = set(cands["key14"])
-    pool = []
-    for key, spec_list in lib_clean_by_key.items():
-        if key in cand_keys:
-            continue
-        for cl, prec in spec_list[:1]:
-            if abs(prec - q["precursor_mz"]) <= 50:
-                pool.append((key, cl, prec,
-                             abs(prec - q["precursor_mz"])))
-                break
-    pool.sort(key=lambda t: t[3])
-    pool = [(k_, p, pr) for k_, p, pr, _ in pool[:1500]]
-    scored = R.score_query(qpeaks, q["precursor_mz"], cands, lib_clean_by_key, pool)
-    scored["score"] = M.rrf_fuse(scored)
-    return scored.sort_values("score", ascending=False)["key14"].tolist()[:25]
+def rank_spectrum(q, cands, pool_keys, lib_by_key, key2smi, engine,
+                  qnm=None, key2neutral=None):
+    """One test spectrum -> top-25 keys by the engine's rrf fusion."""
+    out = engine.query(R.build_engine_query(q, cands, pool_keys, lib_by_key,
+                                            key2smi, R._SE_META, -1,
+                                            qnm, key2neutral))
+    return out["ranked"]["rrf"][:25]
 
 
 def discover_kaggle():
@@ -73,11 +63,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", default=None)
     ap.add_argument("--test", default=None)
+    ap.add_argument("--rust-bin", default="rust-bitvec/target/release/binvec")
+    ap.add_argument("--qpeak", type=float, default=0.05)
+    ap.add_argument("--qloss", type=float, default=0.01)
+    ap.add_argument("--ppm", type=float, default=8.5)
+    ap.add_argument("--wide", type=float, default=80.0)
     ap.add_argument("--out", default=None)
     ap.add_argument("--csv", default=None,
                     help="also/only write submission.csv (kernel mode)")
-    ap.add_argument("--ppm", type=float, default=8.5)
-    ap.add_argument("--wide", type=float, default=80.0)
     a = ap.parse_args()
     if not a.train or not a.test:
         dtrain, dtest = discover_kaggle()
@@ -92,18 +85,30 @@ def main() -> None:
             a.out = "results/predict.json"
 
     train = R.load_meta(a.train)
-    struct = R.structure_table(train)
-    R.FP_CACHE = {r["key14"]: r["fp"] for _, r in struct.iterrows()
-                  if r["fp"] is not None}
-    key2smi: dict = {}
-    for _, r in struct.iterrows():
-        key2smi.setdefault(r["key14"], r["smiles"])
-    lib_clean_by_key: dict = {}
-    for _, r in train.iterrows():
-        cl = S.clean(r["mzs"], r["ints"], r["precursor_mz"])
-        lib_clean_by_key.setdefault(r["key14"], []).append((cl, r["precursor_mz"]))
-    struct_m = struct.dropna(subset=["neutral"]).sort_values("neutral")
+    R._SE_META = train
+    ukeys = sorted(set(train["key14"].tolist()))
+    kindex = {k: i for i, k in enumerate(ukeys)}
+    st = R.structs_call(a.rust_bin, ukeys,
+                        [kindex[k] for k in train["key14"].tolist()],
+                        [float(x) for x in train["precursor_mz"].tolist()],
+                        [str(x) for x in train["adduct"].tolist()], [])
+    struct_m = pd.DataFrame([{"key14": k, "neutral": st["neutrals"][k]}
+                             for k in st["neutrals"]]).sort_values("neutral").reset_index(drop=True)
     masses = struct_m["neutral"].to_numpy()
+    lib_by_key: dict = {}
+    for idx in train.index:
+        lib_by_key.setdefault(train.at[idx, "key14"], []).append(int(idx))
+    _pairs = []
+    for k, js in lib_by_key.items():
+        _pairs.append((float(train.at[js[0], "precursor_mz"]), k))
+    _pairs.sort(key=lambda t: t[0])
+    lib_precs = [p for p, _ in _pairs]
+    lib_pkeys = [k for _, k in _pairs]
+    key2smi: dict = {}
+    for k, g in train.groupby("key14"):
+        key2smi.setdefault(k, str(g["smiles"].iloc[0]))
+    key2neutral = dict(zip(struct_m["key14"].tolist(), struct_m["neutral"].tolist()))
+    engine = R._Engine(a.rust_bin, a.qpeak, a.qloss)
 
     def pool(qnm: float, ppm: float):
         tol = qnm * ppm * 1e-6
@@ -111,20 +116,43 @@ def main() -> None:
         hi = np.searchsorted(masses, qnm + tol, side="right")
         return struct_m.iloc[lo:hi]
 
+    def pool50(prec_q: float, cand_keys: set):
+        lo = bisect_left(lib_precs, prec_q - 50.0)
+        hi = bisect_right(lib_precs, prec_q + 50.0, lo=lo)
+        near = []
+        for i in range(lo, hi):
+            k = lib_pkeys[i]
+            if k in cand_keys:
+                continue
+            near.append((abs(lib_precs[i] - prec_q), k))
+        near.sort(key=lambda t: t[0])
+        return [k for _, k in near[:1500]]
+
     test = pd.read_parquet(a.test)
+    test = test.rename(columns={"ms2_mzs": "mzs",
+                                "ms2_normalized_intensities": "ints"})
     rows = []
     for mid, g in test.groupby("molecule_id"):
+        # one structs round trip for the molecule's neutral masses
+        sq = [{"qi": int(i), "prec": float(r["precursor_mz"]), "adduct": str(r["adduct"])}
+              for i, r in enumerate(g.itertuples())]
+        st2 = R.structs_call(a.rust_bin, [], [], [], [], sq)
+        qnm_map = {int(qi): v for qi, v in st2["qnm"] if v is not None}
         narrow, wide_lists = [], []
-        for _, q in g.iterrows():
-            qnm = S.neutral_mass(q["precursor_mz"], q["adduct"])
+        for pos, (_, q) in enumerate(g.iterrows()):
+            qnm = qnm_map.get(pos)
             if not qnm:
                 continue
             cn = pool(qnm, a.ppm)
             if len(cn):
-                narrow.append(rank_spectrum(q, cn, lib_clean_by_key, R.FP_CACHE))
+                narrow.append(rank_spectrum(q, cn, pool50(float(q["precursor_mz"]),
+                                            set(cn["key14"])), lib_by_key, key2smi, engine,
+                                            qnm, key2neutral))
             cw = pool(qnm, a.wide)
             if len(cw):
-                wide_lists.append(rank_spectrum(q, cw, lib_clean_by_key, R.FP_CACHE))
+                wide_lists.append(rank_spectrum(q, cw, pool50(float(q["precursor_mz"]),
+                                               set(cw["key14"])), lib_by_key, key2smi, engine,
+                                               qnm, key2neutral))
         top = aggregate(narrow)
         if len(top) < 25:
             for k_ in aggregate(wide_lists):
@@ -140,7 +168,6 @@ def main() -> None:
             json.dump({"n": len(rows), "rows": rows}, f)
     print(json.dumps({"n": len(rows), "csv": bool(a.csv)}))
     if a.csv:
-        from . import metric as M
         errs = M.validate_submission(rows)
         print(json.dumps({"csv_violations": errs[:5], "n": len(rows)}))
         if errs:
