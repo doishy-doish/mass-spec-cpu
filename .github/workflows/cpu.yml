@@ -161,7 +161,10 @@ jobs:
           try:
               out = json.load(open(fp))
           except Exception as e:
-              if status_txt and "DONE" not in status_txt:
+              # M202: DONE-line match — "DONE" is a substring of "PRECOMPUTE-DONE",
+              # so a plain `in` check always sees DONE and mislabels mid-write kills.
+              _done = bool(status_txt) and any(l.startswith("DONE") for l in status_txt.splitlines())
+              if status_txt and not _done:
                   emit("INFRA", [f"unreadable JSON {fp}: {e}", "run never reached DONE — host died mid-write, retry"])
               emit("RED", [f"unreadable JSON {fp}: {e}"])
           # 1. engine + shape: the probe ran the Rust engine on real queries

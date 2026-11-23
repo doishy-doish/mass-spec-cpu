@@ -455,7 +455,7 @@ def main() -> None:
     qidx: list = []
     swaps: list = []
     for qi, row, plen, ranked, line, swap in results:
-        pools.append(plen)
+        pools.append(int(plen))  # M201: searchsorted yields int64 — json can't serialize it
         for v in VARIANTS:
             rrs[v].append(row[v])
         if ranked is not None:
