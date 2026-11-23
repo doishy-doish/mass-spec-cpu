@@ -91,7 +91,12 @@ def main() -> None:
                         [float(x) for x in T["prec"].tolist()],
                         [str(x) for x in T["adduct"].tolist()], [])
     skeys_all = np.array(ukeys)
-    sneu_all = np.array([float(st["neutrals"][k]) for k in ukeys], dtype=np.float64)
+    # M198: structs emits null for keys with no known-adduct spectra — NaN
+    # sorts last and matches no ppm window (honest exclusion, never KeyError).
+    def _neutral(k):
+        nk = st["neutrals"].get(k)
+        return float(nk) if (nk is not None and nk == nk) else np.nan
+    sneu_all = np.array([_neutral(k) for k in ukeys], dtype=np.float64)
     sord = np.argsort(sneu_all, kind="stable")
     skeys, masses = skeys_all[sord], sneu_all[sord]
     codes, inv = np.unique(T["key14"], return_inverse=True)

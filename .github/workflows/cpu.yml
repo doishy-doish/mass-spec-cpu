@@ -137,10 +137,9 @@ jobs:
                   print(f"(verdict file unwritable: {e})", flush=True)
               # INFRA exits 3 so the step table tells host-death apart from code-RED (exit 1).
               sys.exit({"GREEN": 0, "RED": 1, "INFRA": 3}[verdict])
-          cands = [path] + sorted(glob.glob(f"results/{mask}-{shard}*.json"))
-          # never mistake the sidecar (.status) or verdict file for output
-          cands = [c for c in cands if not c.endswith((".status", ".txt"))]
-          fp = next((c for c in cands if os.path.exists(c)), None)
+          # M199: exact dispatched path only — the glob fallback once graded a
+          # STALE committed probe file (engineswap) as this run's output.
+          fp = path if os.path.exists(path) else None
           status_txt = None
           try:
               if os.path.exists(status_path):
@@ -182,7 +181,9 @@ jobs:
           need(out.get("fusion") is not None, "fusion params missing — genome not recorded")
           need("mass_swap_rate" in out, "mass_swap_rate missing — mass channel signal discarded (old bug)")
           need(isinstance(out.get("mass_swap_rate"),(int,float)), "mass_swap_rate insane")
-          need(len(out.get("pools",[])) == n and (sum(out["pools"])/max(1,n)) > 0, "pools empty — candidate pool never built")
+          # M199: defensive — the probe must end in a verdict, never a traceback.
+          pools = out.get("pools") or []
+          need(len(pools) == n and (sum(pools)/max(1,n)) > 0, "pools empty — candidate pool never built")
           # 3. lane sanity, mask-conditional (catches blindness/pool breaks the old probes walked past)
           if mask == "class2":
               need(out.get("mrr_lib",0) > 0.5, f"class2 mrr_lib {out.get('mrr_lib')} <= 0.5 — easy-lane retrieval broken")

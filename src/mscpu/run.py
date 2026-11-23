@@ -208,8 +208,10 @@ def build_engine_query(Tlib: dict, qrec: dict, cand_keys, pool_keys,
         specs = [{"mzs": L["mzs"][j].tolist(), "ints": L["ints"][j].tolist(),
                   "prec": float(L["prec"][j])} for j in lib_by_key.get(ks, [])]
         nk = k2n.get(ks)
+        # M198: NaN neutrals (no known-adduct spectra) travel as null —
+        # serde_json rejects NaN, and the key matches no window anyway.
         cands_msg.append({"key": ks, "smiles": key2smi.get(ks, ""), "specs": specs,
-                          "neutral": (None if nk is None else float(nk))})
+                          "neutral": (None if (nk is None or nk != nk) else float(nk))})
     pool_msg = []
     for k in pool_keys:
         ks = str(k)
@@ -357,9 +359,14 @@ def main() -> None:
     st = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, sq)
     neutrals = st["neutrals"]
     qnm = {int(qi): v for qi, v in st["qnm"] if v is not None}
-    # struct arrays, stable-sorted by neutral (deterministic tie order)
+    # struct arrays, stable-sorted by neutral (deterministic tie order).
+    # M198: structs emits null for keys with no known-adduct spectra — NaN
+    # sorts last and matches no ppm window (honest exclusion, never KeyError).
+    def _neutral(k):
+        nk = neutrals.get(k)
+        return float(nk) if (nk is not None and nk == nk) else np.nan
     skeys_all = np.array(ukeys)
-    sneu_all = np.array([float(neutrals[k]) for k in ukeys], dtype=np.float64)
+    sneu_all = np.array([_neutral(k) for k in ukeys], dtype=np.float64)
     sord = np.argsort(sneu_all, kind="stable")
     skeys, masses = skeys_all[sord], sneu_all[sord]
 

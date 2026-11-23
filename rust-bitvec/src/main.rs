@@ -169,6 +169,10 @@ fn adduct_shift(a: &str) -> Option<f64> {
         "[M-H]-" => Some(-1.007276),
         "[M+Cl]-" => Some(34.968853),
         "[M-H2O+H]+" => Some(-17.003289),
+        // M198: test-set adducts missing from the table dropped whole keys.
+        // [M-2H2O+H]+ = 1.007276 - 2*18.010565; [M-H2O-H]- = -1.007276 - 18.010565.
+        "[M-2H2O+H]+" => Some(-35.013854),
+        "[M-H2O-H]-" => Some(-19.017841),
         "[M+CH2O2-H]-" => Some(43.990901),
         "[M]+" => Some(0.0),
         _ => None,
@@ -461,7 +465,9 @@ struct QNm {
 
 #[derive(Serialize)]
 struct StructsOut {
-    neutrals: HashMap<String, f64>,
+    // M198: every ktable key gets an entry (None = no known-adduct spectra).
+    // Omitting keys crashed the launcher with KeyError downstream.
+    neutrals: HashMap<String, Option<f64>>,
     qnm: Vec<(i64, Option<f64>)>,
 }
 
@@ -485,13 +491,9 @@ fn structs_main() {
             }
         }
     }
-    let mut neutrals = HashMap::new();
-    for (ki, v) in by_key {
-        if ki < inp.ktable.len() {
-            if let Some(m) = median(v) {
-                neutrals.insert(inp.ktable[ki].clone(), m);
-            }
-        }
+    let mut neutrals: HashMap<String, Option<f64>> = HashMap::new();
+    for ki in 0..inp.ktable.len() {
+        neutrals.insert(inp.ktable[ki].clone(), by_key.remove(&ki).and_then(median));
     }
     let qnm = inp
         .queries
@@ -1073,6 +1075,8 @@ mod engine_tests {
     fn adduct_table_matches_python() {
         assert!(approx(adduct_shift("[M+H]+").unwrap(), 1.007276));
         assert!(approx(adduct_shift("[M+Na]+").unwrap(), 22.989218));
+        assert!(approx(adduct_shift("[M-2H2O+H]+").unwrap(), -35.013854));
+        assert!(approx(adduct_shift("[M-H2O-H]-").unwrap(), -19.017841));
         assert!(approx(500.0 - adduct_shift("[M+H]+").unwrap(), 498.992724));
         assert!(adduct_shift("[NOPE]").is_none());
     }
