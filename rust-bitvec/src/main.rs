@@ -514,6 +514,9 @@ fn structs_main() {
 fn def1() -> f64 {
     1.0
 }
+fn def0() -> f64 {
+    0.0
+}
 fn def_cascz() -> f64 {
     3.0
 }
@@ -553,6 +556,12 @@ struct EngineParams {
     rout_bin: f64,
     #[serde(default = "def_rbin")]
     rout_binw: f64,
+    /// I6: v8 rank-1-by-mass replace on every ranked list (0 = off, 1 = on).
+    #[serde(default = "def0")]
+    mass_replace: f64,
+    /// I6: funnel recall probe — echo first-K pool keys (0 = off).
+    #[serde(default = "def0")]
+    recall_topk: f64,
 }
 
 impl EngineParams {
@@ -570,6 +579,8 @@ impl EngineParams {
             rout_lib: ROUTER_LIB,
             rout_bin: ROUTER_BIN,
             rout_binw: ROUTER_BINW,
+            mass_replace: 0.0,
+            recall_topk: 0.0,
         }
     }
 }
@@ -616,6 +627,10 @@ struct EngineReply {
     pools: usize,
     /// v8 rank-1-by-mass: lib-leader |ppm-CENTER|>5.0 && lib<0.9 would swap. Info only.
     mass_swap: bool,
+    /// I6 funnel recall probe: first-K pool keys in funnel output order.
+    /// None unless recall_topk > 0. Python scores truth retention offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefilter_topk: Option<Vec<String>>,
     /// per-query stage timings ms (measure-first: worker stderr is DEVNULLed
     /// by the launcher, so timings ride home in the reply and land in logs
     /// via the Python heartbeat line). 8 stages: parse,qprep,cands,pool,
@@ -840,6 +855,47 @@ fn mass_swap_flag(lib: &[f64], _mass: &[f64], qnm: Option<f64>, neutrals: &[Opti
     }
 }
 
+/// v8 rank-1-by-mass replace, engine follow-up (I6): per ranked list, if the
+/// rank-1 key's |ppm-CENTER| exceeds LEAD_OFF, move the list's min-|ppm| key
+/// to front. Deterministic (first-seen wins ties); a no-op without qnm/ppms
+/// or when the leader is already best. Truth-absent lanes are unaffected.
+fn apply_mass_replace(ranked: &mut HashMap<String, Vec<String>>, ppm_of: &HashMap<String, f64>) {
+    for list in ranked.values_mut() {
+        if list.is_empty() {
+            continue;
+        }
+        let lead_d = match ppm_of.get(&list[0]) {
+            Some(p) => (*p - MASS_CENTER).abs(),
+            None => continue,
+        };
+        if lead_d <= MASS_LEAD_OFF {
+            continue;
+        }
+        let mut best: Option<(usize, f64)> = None;
+        for (i, k) in list.iter().enumerate() {
+            if let Some(p) = ppm_of.get(k) {
+                let d = (*p - MASS_CENTER).abs();
+                match best {
+                    Some((_, bd)) if bd <= d => {}
+                    _ => best = Some((i, d)),
+                }
+            }
+        }
+        if let Some((bi, bd)) = best {
+            if bd < lead_d {
+                let k = list.remove(bi);
+                list.insert(0, k);
+            }
+        }
+    }
+}
+
+/// funnel recall probe (I6): first-K keys of the funnel-ordered pool.
+/// Pure slice — the engine echoes these so Python can score truth retention.
+fn funnel_topk(ordered_keys: &[String], k: usize) -> Vec<String> {
+    ordered_keys.iter().take(k).cloned().collect()
+}
+
 fn sengine(params: EngineParams) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -935,6 +991,13 @@ fn sengine(params: EngineParams) {
         if pool_idx.len() > POOL_CAP {
             pool_idx.truncate(POOL_CAP);
         }
+        // I6 funnel recall probe: echo first-K pool keys in funnel order.
+        let prefilter_topk: Option<Vec<String>> = if params.recall_topk > 0.0 {
+            let ordered: Vec<String> = pool_idx.iter().map(|&i| pool[i].0.clone()).collect();
+            Some(funnel_topk(&ordered, params.recall_topk as usize))
+        } else {
+            None
+        };
         // analog hits: first-spectrum mass-shift matches, ms > thresh, top 10
         let t_funnel = t0.elapsed();
         let mut hits: Vec<([u64; 32], f64)> = Vec::new();
@@ -1018,7 +1081,21 @@ fn sengine(params: EngineParams) {
         cols.insert("mass".to_string(), vmass);
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
         let t_chan = t0.elapsed();
-        let ranked = fuse_rank(&keys, &cols, &params);
+        let mut ranked = fuse_rank(&keys, &cols, &params);
+        // I6 mass-replace (engine follow-up): v8 rank-1-by-mass per ranked list.
+        if params.mass_replace > 0.5 {
+            if let Some(q) = qnm {
+                if q > 0.0 {
+                    let ppm_of: HashMap<String, f64> = cands
+                        .iter()
+                        .filter_map(|c| c.neutral.map(|n| (c.key.clone(), (n - q) / q * 1e6)))
+                        .collect();
+                    if !ppm_of.is_empty() {
+                        apply_mass_replace(&mut ranked, &ppm_of);
+                    }
+                }
+            }
+        }
         let neutrals: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
         let mass_swap = mass_swap_flag(
             cols.get("lib").map(|v| v.as_slice()).unwrap_or(&[]),
@@ -1034,6 +1111,7 @@ fn sengine(params: EngineParams) {
                 ranked,
                 pools: pool_idx.len(),
                 mass_swap,
+                prefilter_topk,
                 // 8 stages, all known before serialization (ser+io stay on the
                 // stderr line only). Order: parse,qprep,cands,pool,funnel,
                 // analog,chan,fuse.
@@ -1351,6 +1429,35 @@ mod engine_tests {
     }
 
     #[test]
+    fn mass_replace_moves_bad_leader() {
+        // I6: rank-1 |ppm-CENTER| = |20-(-1.5)| > 5 -> min-|ppm| key fronts.
+        let mut ranked: HashMap<String, Vec<String>> = HashMap::new();
+        ranked.insert("z".to_string(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let ppm: HashMap<String, f64> =
+            [("a".to_string(), 20.0), ("b".to_string(), 1.0), ("c".to_string(), 2.0)]
+                .into_iter()
+                .collect();
+        apply_mass_replace(&mut ranked, &ppm);
+        assert_eq!(ranked["z"], vec!["b".to_string(), "a".to_string(), "c".to_string()]);
+        // leader already best -> untouched.
+        let mut ranked2: HashMap<String, Vec<String>> = HashMap::new();
+        ranked2.insert("z".to_string(), vec!["b".to_string(), "a".to_string()]);
+        apply_mass_replace(&mut ranked2, &ppm);
+        assert_eq!(ranked2["z"], vec!["b".to_string(), "a".to_string()]);
+        // no ppms -> no-op, never panics.
+        let mut ranked3: HashMap<String, Vec<String>> = HashMap::new();
+        ranked3.insert("z".to_string(), vec!["a".to_string()]);
+        apply_mass_replace(&mut ranked3, &HashMap::new());
+        assert_eq!(ranked3["z"], vec!["a".to_string()]);
+    }
+
+    fn funnel_topk_slices_in_order() {
+        let keys: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(funnel_topk(&keys, 2), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(funnel_topk(&keys, 0), Vec::<String>::new());
+        assert_eq!(funnel_topk(&keys, 99).len(), 3);
+    }
+
     fn analog_empty_pool_is_zero() {
         // TRULY far pool (100 Da away): neither direct nor shifted matches.
         // (An earlier revision of this test used prec 251 for `far` and
