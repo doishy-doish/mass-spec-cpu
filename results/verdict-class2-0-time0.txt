@@ -1,0 +1,2 @@
+GREEN
+results/class2-0-time0.json engine=rust n=10 mrr=0.5725 lib=0.7000 analog=0.0872 stein=0.6000 mass=0.0111 zw=0.5725 swap=0.100 pure=0.5000
