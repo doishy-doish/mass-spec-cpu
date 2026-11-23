@@ -12,9 +12,12 @@
 //! presented as one; data grouping keeps using the parquet `inchikey14`
 //! column. The surrogate exists for novel structures with no data key.
 //!
-//! Algorithm mirror: `src/mscpu/chem.py` is the Python reference. Both use
-//! FNV-1a-32 over the same invariant strings, so Python-int bit sets and
-//! these `[u64; 32]` words agree bit-for-bit on the same SMILES.
+//! Algorithm mirror: the JS reference is the Gate-0 stub (r2_stub.js:
+//! formulaCounts/gateFrac/ent, run in-worker) plus this crate's own unit
+//! tests. Both use FNV-1a-32 over the same invariant strings, so stub bit
+//! sets and these `[u64; 32]` words agree bit-for-bit on the same SMILES.
+//! (There is intentionally no src/mscpu/chem.py — the single-engine guard
+//! forbids Python compute backups; see tests/test_single_engine.py.)
 
 pub const NBITS: usize = 2048;
 pub const NWORDS: usize = 32;

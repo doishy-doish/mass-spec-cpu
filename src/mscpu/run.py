@@ -196,11 +196,15 @@ def _mem_watch(stop, interval=20.0):
 class _Engine:
     """Persistent sengine worker: preload once, then one JSON line per query."""
 
-    def __init__(self, bin_path, qpeak=0.05, qloss=0.01, fusion=None):
+    def __init__(self, bin_path, qpeak=0.05, qloss=0.01, fusion=None, store=None):
         self.p = subprocess.Popen([bin_path, "sengine"], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True, bufsize=1,
                                   stderr=subprocess.DEVNULL)
         params = {"qpeak": qpeak, "qloss": qloss}
+        if store is not None:
+            # E1: engine-owned store — the engine resolves library + query
+            # spectra from slim itself; no preload chunks cross the pipe.
+            params["store"] = str(store)
         params.update(FUSION_DEFAULTS)
         params.update(fusion or {})
         self.p.stdin.write(json.dumps({"params": params}) + "\n")
@@ -408,6 +412,20 @@ def build_engine_query(qrec: dict, cand_keys, pool_keys,
             "qnm": (None if qnm is None else float(qnm))}
 
 
+def build_engine_query_erun(qi: int, cand_keys, pool_keys, qnm=None) -> dict:
+    """Pure builder for one E1 sengine query: row-ref + keys, zero spectra.
+
+    The engine resolves the query spectrum (slim row qi) and every cand/pool
+    key's spectra from its own store (params.store). Bit-identical scoring
+    input to build_engine_query for the same rows — the floats never cross
+    the pipe, so there is nothing to drift. No binary, testable.
+    """
+    return {"qrow": int(qi),
+            "cand_keys": [str(k) for k in cand_keys],
+            "pool_keys": [str(k) for k in pool_keys], "qi": int(qi),
+            "qnm": (None if qnm is None else float(qnm))}
+
+
 def build_engine_mol_query(qrecs: list, cand_keys, pool_keys,
                            qis: list, qnms: list) -> dict:
     """Pure builder for one molecule-batch sengine query (microsec lane).
@@ -516,10 +534,15 @@ def score_one(sel, engine):
     """
     qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel
     V_ = _SE["variants"]
-    qrec = {"mzs": _SE["qmzs"][qi], "ints": _SE["qints"][qi], "prec": prec_q,
-            "ce": (_SE.get("qce") or {}).get(qi)}
-    qmsg = build_engine_query(qrec, cand_keys, pool_keys, qi,
-                              _SE["qnm"].get(qi))
+    if _SE.get("erun"):
+        # E1: row-ref + keys only — the engine owns the spectra.
+        qmsg = build_engine_query_erun(qi, cand_keys, pool_keys,
+                                       _SE["qnm"].get(qi))
+    else:
+        qrec = {"mzs": _SE["qmzs"][qi], "ints": _SE["qints"][qi], "prec": prec_q,
+                "ce": (_SE.get("qce") or {}).get(qi)}
+        qmsg = build_engine_query(qrec, cand_keys, pool_keys, qi,
+                                  _SE["qnm"].get(qi))
     try:
         out = engine.query(qmsg)
     except Exception as e:
@@ -591,6 +614,10 @@ def main() -> None:
                     help="preconverted slim store (scripts/build_slim.py). "
                          "Used automatically when its manifest.json exists; "
                          "otherwise the parquet path runs (fallback).")
+    ap.add_argument("--erun", type=int, default=0,
+                    help="1 = E1 engine-owned store: the engine resolves spectra "
+                         "from slim itself (params.store); zero preload chunks, "
+                         "zero per-query spectra JSON. Off = protocol v2.")
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, _sigterm_loud)
     _stop = threading.Event()
@@ -825,8 +852,17 @@ def main() -> None:
     # protocol v2: engine preloads the touched library subset once, then
     # key-only per-query messages. Streamed chunk-by-chunk (M207).
     print("preload build union=" + str(len(union)) + " lib_keys=" + str(len(lib_by_key)), flush=True)
-    engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion)
-    if S is not None:
+    _SE["erun"] = bool(a.erun and S is not None)
+    engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion,
+                     store=(a.slim_dir if _SE["erun"] else None))
+    if _SE["erun"]:
+        # E1: engine resolves spectra from its own store — zero preload
+        # chunks, zero per-query spectra JSON. Selection stays Python-side
+        # (keys only per query); the swap gate is parity +-0.00 on the bench.
+        nchunks = 0
+        print("erun: engine-owned store=" + a.slim_dir + " preload_chunks=0 "
+              + "union=" + str(len(union)), flush=True)
+    elif S is not None:
         nchunks = stream_preload(engine,
                                  build_preload_chunks_slim(sub, S, key2smi,
                                                            key2neutral))

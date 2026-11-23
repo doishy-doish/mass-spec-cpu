@@ -39,6 +39,8 @@ use std::io::{BufRead, Write};
 
 #[allow(dead_code)]
 mod boundary;
+#[allow(dead_code)]
+mod slim;
 
 // spectrum binary channel (unchanged math, validated bit-exact vs Python)
 const QNBITS: u64 = 4096;
@@ -574,6 +576,12 @@ struct EngineParams {
     /// 0 = off (bit-identical lists), 1 = on.
     #[serde(default = "def0")]
     lossgate: f64,
+    /// E1: engine-owned store. Slim dir path; when set, the engine loads it
+    /// at startup and resolves library + query spectra from it on demand —
+    /// no preload chunks, no per-query spectra JSON. Python sends keys +
+    /// row refs only. None = protocol v2 (preload chunks) as before.
+    #[serde(default)]
+    store: Option<String>,
 }
 
 impl EngineParams {
@@ -638,6 +646,11 @@ struct EngineIn {
     qi: Option<i64>,
     #[serde(default)]
     qnm: Option<f64>,
+    /// E1: query as a slim store row index. The engine resolves
+    /// (mzs, ints, prec, ce) from its own store — zero query-spectra JSON.
+    /// None = full `q` RawSpec as before.
+    #[serde(default)]
+    qrow: Option<usize>,
     #[serde(default)]
     preload: Option<PreloadChunk>,
     #[serde(default)]
@@ -705,6 +718,72 @@ fn ensure_prepared(e: &mut TableEntry, qpeak: f64, qloss: f64) {
     }
     if e.fp.is_none() {
         e.fp = Some(morgan_bits_2048(&e.smiles));
+    }
+}
+
+/// E1: key -> slim row indices + key position (ints only; spectra resolve
+/// lazily per touched key, M209 pattern — untouched keys cost indices only).
+fn build_key_maps(
+    s: &slim::SlimStore,
+) -> (HashMap<String, Vec<usize>>, HashMap<String, usize>) {
+    let mut rows: HashMap<String, Vec<usize>> = HashMap::with_capacity(s.keys.len());
+    let mut pos: HashMap<String, usize> = HashMap::with_capacity(s.keys.len());
+    for (i, k) in s.keys.iter().enumerate() {
+        pos.insert(k.clone(), i);
+        rows.insert(k.clone(), Vec::new());
+    }
+    for (r, ki) in s.key_idx.iter().enumerate() {
+        if let Some(v) = s.keys.get(*ki as usize).and_then(|k| rows.get_mut(k)) {
+            v.push(r);
+        }
+    }
+    (rows, pos)
+}
+
+/// E1: build one TableEntry straight from the slim store (same floats the
+/// preload path would have carried — bit-identical input to
+/// ensure_prepared, so scoring is unchanged).
+fn entry_from_slim(
+    s: &slim::SlimStore,
+    pos: &HashMap<String, usize>,
+    rows: &[usize],
+    key: &str,
+) -> TableEntry {
+    let mut raw = Vec::with_capacity(rows.len());
+    for &r in rows {
+        let (m, ii) = slim::row_spec(s, r);
+        raw.push(RawSpec {
+            mzs: m.to_vec(),
+            ints: ii.to_vec(),
+            prec: s.prec[r],
+            ce: slim::row_ce(s, r),
+        });
+    }
+    TableEntry {
+        raw,
+        specs: None,
+        smiles: s.smiles.get(key).cloned().unwrap_or_default(),
+        fp: None,
+        neutral: pos.get(key).and_then(|&p| s.neutrals[p]),
+        formula: None,
+    }
+}
+
+/// E1: resolve one key, filling the table from slim on first touch.
+/// Unknown keys (absent from the store) stay absent — same skip semantics
+/// as the preload path (M217), so coverage behavior is unchanged.
+fn ensure_key(
+    table: &mut HashMap<String, TableEntry>,
+    store: Option<&slim::SlimStore>,
+    rows: &HashMap<String, Vec<usize>>,
+    pos: &HashMap<String, usize>,
+    key: &str,
+) {
+    if table.contains_key(key) {
+        return;
+    }
+    if let (Some(st), Some(rr)) = (store, rows.get(key)) {
+        table.insert(key.to_string(), entry_from_slim(st, pos, rr, key));
     }
 }
 
@@ -1186,6 +1265,25 @@ fn sengine(params: EngineParams) {
     // Per-query messages carry keys only; entries prepare on first use,
     // so untouched keys cost parse+store only (M209).
     let mut table: HashMap<String, TableEntry> = HashMap::new();
+    // E1: engine-owned store. When params.store is set, library + query
+    // spectra resolve from slim on demand — preload chunks are unnecessary
+    // (Python sends none) and per-query spectra JSON drops to zero.
+    let mut slim_store: Option<slim::SlimStore> = None;
+    let mut slim_rows: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut slim_pos: HashMap<String, usize> = HashMap::new();
+    if let Some(dir) = params.store.clone() {
+        let st = slim::load_slim(std::path::Path::new(&dir));
+        let (rows, pos) = build_key_maps(&st);
+        eprintln!(
+            "sengine: slim store loaded rows={} keys={} ({})",
+            st.n,
+            st.keys.len(),
+            dir
+        );
+        slim_rows = rows;
+        slim_pos = pos;
+        slim_store = Some(st);
+    }
     for line in lines {
         let line = line.expect("sengine: read");
         if line.trim().is_empty() {
@@ -1223,6 +1321,7 @@ fn sengine(params: EngineParams) {
             let cand_keys = m.cand_keys.unwrap_or_default();
             let mut cands: Vec<CandData> = Vec::with_capacity(cand_keys.len());
             for k in &cand_keys {
+                ensure_key(&mut table, slim_store.as_ref(), &slim_rows, &slim_pos, k);
                 if let Some(e) = table.get_mut(k) {
                     ensure_prepared(e, params.qpeak, params.qloss);
                     cands.push(CandData {
@@ -1240,6 +1339,7 @@ fn sengine(params: EngineParams) {
             // spectrum distance is computed against each qc below.
             let mut pool_first: Vec<(String, CSpectra, [u64; 32])> = Vec::with_capacity(pool_keys.len());
             for k in &pool_keys {
+                ensure_key(&mut table, slim_store.as_ref(), &slim_rows, &slim_pos, k);
                 if let Some(e) = table.get_mut(k) {
                     ensure_prepared(e, params.qpeak, params.qloss);
                     if let Some(s) = e.specs.as_ref().and_then(|v| v.first()) {
@@ -1460,7 +1560,24 @@ fn sengine(params: EngineParams) {
             writeln!(err, "sengine mol nspec={} cands={} pool={} ipc={} t_tot={:.1}", qs.len(), keys.len(), pool_union, ipc_bytes, ms(t_ser)).unwrap();
             continue;
         }
-        let q = m.q.expect("sengine: query without q");
+        // E1: qrow resolves the query spectrum from the engine-owned store
+        // (no query-spectra JSON); q (full RawSpec) stays as the fallback.
+        // qrow without params.store is a protocol error — fail loud.
+        let q: RawSpec = match m.qrow {
+            Some(r) => {
+                let st = slim_store
+                    .as_ref()
+                    .expect("sengine: qrow without params.store");
+                let (qm, qii) = slim::row_spec(st, r);
+                RawSpec {
+                    mzs: qm.to_vec(),
+                    ints: qii.to_vec(),
+                    prec: st.prec[r],
+                    ce: slim::row_ce(st, r),
+                }
+            }
+            None => m.q.expect("sengine: query without q"),
+        };
         let t_parse = t0.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss, q.ce);
@@ -1473,6 +1590,7 @@ fn sengine(params: EngineParams) {
         let cand_keys = m.cand_keys.unwrap_or_default();
         let mut cands: Vec<CandData> = Vec::with_capacity(cand_keys.len());
         for k in &cand_keys {
+            ensure_key(&mut table, slim_store.as_ref(), &slim_rows, &slim_pos, k);
             if let Some(e) = table.get_mut(k) {
                 ensure_prepared(e, params.qpeak, params.qloss);
                 cands.push(CandData {
@@ -1491,6 +1609,7 @@ fn sengine(params: EngineParams) {
         let pool_keys = m.pool_keys.unwrap_or_default();
         let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_keys.len());
         for k in &pool_keys {
+            ensure_key(&mut table, slim_store.as_ref(), &slim_rows, &slim_pos, k);
             if let Some(e) = table.get_mut(k) {
                 ensure_prepared(e, params.qpeak, params.qloss);
                 if let Some(s) = e.specs.as_ref().and_then(|v| v.first()) {
@@ -1738,7 +1857,29 @@ fn main() {
         sengine(pin.params);
         return;
     }
-    eprintln!("usage: binvec <structs|sengine>");
+    if let Some(pos) = args.iter().position(|a| a == "slimcheck") {
+        // Equivalence probe for the slim port (test-then-swap): load the
+        // store with the Rust loader and print the fingerprint + row bits.
+        // `tests/test_slim_rust.py` compares every field against slim.py.
+        let mut store: Option<String> = None;
+        let mut row: Option<usize> = None;
+        let mut it = args.iter().skip(pos + 1);
+        while let Some(a) = it.next() {
+            if a == "--store" {
+                store = it.next().cloned();
+            } else if a == "--row" {
+                row = it.next().and_then(|v| v.parse().ok());
+            }
+        }
+        let store = store.expect("slimcheck: missing --store DIR");
+        let s = slim::load_slim(std::path::Path::new(&store));
+        match row {
+            Some(i) => println!("{}", slim::row_json(&s, i)),
+            None => println!("{}", slim::slimcheck_json(&s)),
+        }
+        return;
+    }
+    eprintln!("usage: binvec <structs|sengine|slimcheck --store DIR [--row I]>");
     std::process::exit(2);
 }
 

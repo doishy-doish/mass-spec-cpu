@@ -218,3 +218,16 @@ def test_load_table_stub_parquet(tmp_path):
     assert T["instrument"].tolist() == ["timsTOF", "Orbitrap"]
     assert T["ce"] == [20.0, None]  # single CE passes, merged ramp -> None
     assert [a.tolist() for a in T["mzs"]] == [[100.0, 200.0], [150.0]]
+
+
+def test_engine_query_erun_schema():
+    """E1: row-ref + keys, zero spectra — engine resolves from its store."""
+    m = R.build_engine_query_erun(7, ["k1"], ["k2"], 200.0)
+    assert set(m) == {"qrow", "cand_keys", "pool_keys", "qi", "qnm"}
+    assert m["qrow"] == 7 and m["qi"] == 7 and m["qnm"] == 200.0
+    assert m["cand_keys"] == ["k1"] and m["pool_keys"] == ["k2"]
+    assert "mzs" not in m and "ints" not in m and "q" not in m
+    json.dumps(m)
+    m2 = R.build_engine_query_erun(0, [], [], None)
+    assert m2["qrow"] == 0 and m2["qnm"] is None
+    json.dumps(m2)

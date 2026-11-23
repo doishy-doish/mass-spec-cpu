@@ -7,3 +7,5 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chem = { path = "../rust-chem" }
+zstd = "0.13"
+sha2 = "0.10"
