@@ -143,12 +143,12 @@ jobs:
           n = out.get("n", 0)
           need(isinstance(n, int) and n >= min(10, nreq), f"n too small ({n} < min(10,{nreq})) — queries never ran")
           rrs = out.get("rrs", {})
-          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw"},
+          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw","pure"},
                f"variants incomplete ({sorted(rrs.keys())}) — a channel never returned")
           for v, arr in rrs.items():
               need(len(arr) == n, f"rrs[{v}] len {len(arr)} != n {n}")
           # 2. score fields present + sane (catches silent NaN/zero collapse)
-          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw"]
+          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw","mrr_pure"]
           for k in mkeys:
               v = out.get(k)
               need(isinstance(v,(int,float)) and v==v and 0.0 <= v <= 1.0, f"{k} insane ({v!r})")
@@ -182,7 +182,7 @@ jobs:
           if red:
               print("GOOD-PROBE RED:");
               [print(" - " + r) for r in red]; sys.exit(1)
-          print(f"GOOD-PROBE GREEN: {fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f}")
+          print(f"GOOD-PROBE GREEN: {fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f}")
           PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
