@@ -69,7 +69,8 @@ class _StubEngine:
 
     def query(self, qmsg):
         assert set(qmsg) == {"q", "cands", "pool", "qi", "qnm"}
-        return {"ranked": self.ranked, "pools": len(qmsg["pool"])}
+        return {"ranked": self.ranked, "pools": len(qmsg["pool"]),
+                "mass_swap": True}
 
 
 def test_run_query_assembles_rr_with_stub_engine():
@@ -85,10 +86,11 @@ def test_run_query_assembles_rr_with_stub_engine():
                  ppm=8.5, shard=0, variants=R.VARIANTS, rust_bin="x",
                  qpeak=0.05, qloss=0.01,
                  worker=_StubEngine(ranked), worker_pid=os.getpid())
-    qi, row, plen, ranked_z, line = R._run_query((0, 0, 1))
+    qi, row, plen, ranked_z, line, swap = R._run_query((0, 0, 1))
     assert qi == 0 and plen == 1 and ranked_z == ["k1", "k2"]
     assert row["lib"] == 1.0 and row["router"] == 0.5
     assert "q=0 pool=1" in line
+    assert swap is True
 
 
 def test_load_meta_renames_instrument():
