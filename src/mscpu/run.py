@@ -34,7 +34,7 @@ VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw
 FUSION_DEFAULTS = {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0, "ra": 1.0,
                    "rf": 1.0, "casc_z": 3.0, "rout_lib": 0.5,
                    "rout_bin": 0.4, "rout_binw": 0.4,
-                   "mass_replace": 0.0, "recall_topk": 0.0}
+                   "mass_replace": 0.0, "recall_topk": 0.0, "funnel_off": 0.0}
 
 
 TRAIN_COLS = ["inchikey14", "normalized_smiles", "precursor_mz",
@@ -433,6 +433,8 @@ def main() -> None:
                     help="1 = v8 rank-1-by-mass replace at assemble (engine follow-up; helper stub-green)")
     ap.add_argument("--recall-topk", type=float, default=0.0,
                     help="0 = off; else engine echoes first-K funnel pool keys for recall scoring")
+    ap.add_argument("--funnel-off", type=int, default=0,
+                    help="1 = disable Jaccard prefilter (I6 A/B: donor-retention question)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -556,7 +558,8 @@ def main() -> None:
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw,
               "mass_replace": 1.0 if a.mass_replace else 0.0,
-              "recall_topk": float(a.recall_topk or 0.0)}
+              "recall_topk": float(a.recall_topk or 0.0),
+              "funnel_off": 1.0 if a.funnel_off else 0.0}
     # M211: select FIRST from small arrays, preload ONLY the union of keys
     # queries touch, slim T BEFORE spawning the engine. Two full in-memory
     # copies (parent tables + engine raw table) exceed the 16GB runner —
