@@ -215,7 +215,7 @@ struct CSpectra {
     prec: f64,
     norm: f64,
     sw: Vec<f64>,
-    snorm: Vec<f64>,
+    snorm: f64,
     bits: [u64; 64],
     wb: Vec<(u16, f32)>,
     /// Neutral-loss set, precomputed once per spectrum (the frag channel used
