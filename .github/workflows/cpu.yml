@@ -11,13 +11,13 @@ on:
         description: "queries"
         default: "200"
       task:
-        description: "validate or predict (single Rust engine)"
+        description: "validate, predict, or gates (checks-only: build+test, no data, no run)"
         default: "validate"
         type: choice
-        options: [validate, predict]
-      shard:
-        description: "shard index"
-        default: "0"
+        options: [validate, predict, gates]
+        shard:
+          description: "shard index"
+          default: "0"
       shards:
         description: "shard count"
         default: "1"
@@ -80,13 +80,14 @@ jobs:
           cd rust-bitvec && cargo build --release && cargo test --release
           cd ../rust-chem && cargo build --release && cargo test --release
       - name: restore data cache
+        if: ${{ inputs.task != 'gates' }}
         id: datacache
         uses: actions/cache@v4
         with:
           path: data
           key: casmi26-data-v1
       - name: download competition data
-        if: steps.datacache.outputs.cache-hit != 'true'
+        if: ${{ inputs.task != 'gates' && steps.datacache.outputs.cache-hit != 'true' }}
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
@@ -187,6 +188,7 @@ jobs:
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
       - name: scramble + commit
+        if: ${{ inputs.task != 'gates' }}
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
         run: |
