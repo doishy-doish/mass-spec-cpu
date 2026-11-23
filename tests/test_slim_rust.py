@@ -70,7 +70,7 @@ def test_rust_loader_matches_python(tmp_path):
     from mscpu import slim as SL
 
     d = B.build_arrays(synth_ce_table())
-    neutrals = np.array([90.0, float("nan"), 50.0, 33.0])
+    neutrals = np.array([90.0, float("nan"), 50.0])
     B.write_slim(d, neutrals, str(tmp_path))
     S = SL.load_slim(str(tmp_path))
 
