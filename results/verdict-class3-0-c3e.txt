@@ -1,0 +1,2 @@
+GREEN
+results/class3-0-c3e.json engine=rust n=463 mrr=0.0000 lib=0.0000 analog=0.0000 stein=0.0000 mass=0.0000 zw=0.0000 swap=0.156 pure=0.0000
