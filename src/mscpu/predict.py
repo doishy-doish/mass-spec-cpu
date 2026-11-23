@@ -115,8 +115,9 @@ def main() -> None:
     # protocol v2: preload the prepared train table once, then key-only
     # queries. Slim the parent afterwards (engine owns train spectra now).
     engine = R._Engine(a.rust_bin, a.qpeak, a.qloss)
-    engine.preload(R.build_preload_chunks(lib_by_key, T, key2smi, key2neutral))
-    engine.preload_done()
+    # M207: stream chunk-by-chunk (never hold the whole library as JSON).
+    R.stream_preload(engine,
+                     R.build_preload_chunks(lib_by_key, T, key2smi, key2neutral))
     del lib_by_key
     T = {"prec": T["prec"]}
 

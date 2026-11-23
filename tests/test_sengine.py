@@ -45,14 +45,38 @@ def test_structs_payload_schema():
 def test_preload_chunks_schema():
     T = _table()
     lib_by_key = {"k1": [0, 1], "k2": [2]}
-    chunks = R.build_preload_chunks(lib_by_key, T, {"k1": "CCO", "k2": "CCC"},
-                                    {"k1": 200.0, "k2": None}, per=1)
+    chunks = list(R.build_preload_chunks(lib_by_key, T, {"k1": "CCO", "k2": "CCC"},
+                                       {"k1": 200.0, "k2": None}, per=1))
     assert len(chunks) == 2
     c0 = json.loads(chunks[0])["preload"]
     assert c0["keys"] == ["k1"] and c0["smiles"] == ["CCO"]
     assert c0["neutrals"] == [200.0] and len(c0["specs"][0]) == 2
     c1 = json.loads(chunks[1])["preload"]
     assert c1["neutrals"] == [None]  # M198: null, never NaN (serde rejects NaN)
+
+
+def test_stream_preload_sends_every_chunk_once():
+    """M207: chunks stream (build one, send one) — bytes identical to list."""
+    import inspect
+    T = _table()
+    lib_by_key = {"k1": [0, 1], "k2": [2]}
+    gen = R.build_preload_chunks(lib_by_key, T, {"k1": "CCO", "k2": "CCC"},
+                                 {"k1": 200.0, "k2": None}, per=1)
+    assert inspect.isgenerator(gen)  # the materialization must not come back
+    seen = []
+
+    class _Sink:
+        def preload(self, lines):
+            seen.extend(lines)
+
+        def preload_done(self):
+            seen.append("DONE")
+
+    n = R.stream_preload(_Sink(), gen)
+    assert n == 2 and seen[-1] == "DONE" and len(seen) == 3
+    c0 = json.loads(seen[0])["preload"]
+    assert c0["keys"] == ["k1"] and len(c0["specs"][0]) == 2
+    assert json.loads(seen[1])["preload"]["neutrals"] == [None]
 
 
 def test_engine_query_schema():

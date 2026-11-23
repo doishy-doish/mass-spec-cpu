@@ -204,14 +204,16 @@ def build_structs_payload(T: dict, queries) -> tuple:
 
 
 def build_preload_chunks(lib_by_key: dict, Tlib: dict, key2smi: dict,
-                          key2neutral: dict, per: int = 500) -> list:
+                          key2neutral: dict, per: int = 500):
     """Library table -> pre-serialized JSON chunk lines (protocol v2).
 
-    tolist/J dumps happen ONCE per run here, not per query: per-query
-    messages carry keys only. Sorted key order for determinism.
+    tolist/J dumps still happen ONCE per run here, not per query:
+    per-query messages carry keys only. Sorted key order for determinism.
+
+    GENERATOR (M207): yields one chunk line at a time — build one, send
+    one, drop it. Never materialize the full library in the parent.
     """
     keys = sorted(lib_by_key)
-    out = []
     for i in range(0, len(keys), per):
         ks = keys[i:i + per]
         specs = []
@@ -226,11 +228,25 @@ def build_preload_chunks(lib_by_key: dict, Tlib: dict, key2smi: dict,
         for k in ks:
             v = (key2neutral or {}).get(k)
             nk.append(None if (v is None or v != v) else float(v))
-        out.append(json.dumps({"preload": {
+        yield json.dumps({"preload": {
             "keys": ks,
             "smiles": [str(key2smi.get(k, "")) for k in ks],
-            "neutrals": nk, "specs": specs}}))
-    return out
+            "neutrals": nk, "specs": specs}})
+
+
+def stream_preload(engine, chunks) -> int:
+    """Send preload chunks as they are built (M207); preload_done at end.
+
+    The engine is spawned BEFORE the build so lines stream straight into
+    it; the parent never holds more than one chunk (~500 keys) beyond the
+    tables. Returns the chunk count (for the heartbeat line).
+    """
+    n = 0
+    for ln in chunks:
+        engine.preload([ln])
+        n += 1
+    engine.preload_done()
+    return n
 
 
 def build_engine_query(qrec: dict, cand_keys, pool_keys,
@@ -454,12 +470,15 @@ def main() -> None:
     # protocol v2: engine preloads the prepared library table once (parent,
     # before any fork — one engine, one copy). Per-query messages are keys.
     print("preload build lib_keys=" + str(len(lib_by_key)), flush=True)
-    chunks = build_preload_chunks(lib_by_key, T, key2smi, key2neutral)
     engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion)
-    engine.preload(chunks)
-    engine.preload_done()
+    # M207: stream chunk-by-chunk (build one, send one, drop it). The old
+    # code materialized all ~552 chunks (~7GB JSON + transient floats) on
+    # top of the 8GB tables and died at 15.3GB before the slim below.
+    nchunks = stream_preload(engine,
+                             build_preload_chunks(lib_by_key, T, key2smi,
+                                                  key2neutral))
     _rss, _avail = _mem_state()
-    print("preload done chunks=" + str(len(chunks))
+    print("preload done chunks=" + str(nchunks)
           + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),
           flush=True)  # HEARTBEAT
     # slim the parent: the engine owns library spectra now; the parent keeps
