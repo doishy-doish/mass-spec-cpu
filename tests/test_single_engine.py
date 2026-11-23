@@ -91,7 +91,8 @@ def test_fusion_defaults_neutral():
     assert R.FUSION_DEFAULTS == {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0,
                                  "ra": 1.0, "rf": 1.0, "casc_z": 3.0,
                                  "rout_lib": 0.5, "rout_bin": 0.4,
-                                 "rout_binw": 0.4}
+                                 "rout_binw": 0.4,
+                                 "mass_replace": 0.0, "recall_topk": 0.0}
 
 
 def test_good_probe_plumbing():
