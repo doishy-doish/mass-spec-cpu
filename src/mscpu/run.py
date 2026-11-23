@@ -25,7 +25,7 @@ import pandas as pd
 from . import metric as M
 from . import validation as V
 
-VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw"]
+VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure"]
 
 # BET-EVOLVE genome defaults (replication queue #3): neutral = legacy behavior
 # bit-identically (wl/wa/wf/rl/ra/rf = 1.0, casc_z = 3.0, rout_* = legacy gates).
@@ -396,6 +396,7 @@ def main() -> None:
            "mrr_binw": _avg(rrs["binw"]), "mrr_router": _avg(rrs["router"]), "mrr_stein": _avg(rrs["stein"]),
             "mrr_mass": _avg(rrs["mass"]),
             "mrr_zw": _avg(rrs["zw"]), "mrr_rrfw": _avg(rrs["rrfw"]),
+            "mrr_pure": _avg(rrs["pure"]),
             "fusion": fusion,
            "qpeak": a.qpeak, "qloss": a.qloss,
            "mass_swap_rate": _avg(swaps),
