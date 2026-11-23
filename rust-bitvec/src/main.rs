@@ -1146,7 +1146,7 @@ fn fuse_molecule_rrf(
         let ranks: Vec<Vec<f64>> = per_spec
             .iter()
             .map(|cols| {
-                let c: &[f64] = cols.get(*v).map(Vec::as_slice).unwrap_or(&nan);
+                let c: &[f64] = cols.get(v).map(Vec::as_slice).unwrap_or(&nan);
                 rank_min_desc(c)
             })
             .collect();
