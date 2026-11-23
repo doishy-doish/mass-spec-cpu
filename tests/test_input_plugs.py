@@ -66,3 +66,11 @@ def test_recall_and_topk():
     ranked = [["a", "b", "c"], ["x", "y"]]
     assert IP.recall_at_k(ranked, ["b", "z"], 2) == 0.5
     assert IP.top_k(["a", "b", "c"], 2) == ["a", "b"]
+
+
+def test_rank_replace_list_mirrors_engine():
+    ppm = {"a": 20.0, "b": 1.0, "c": 2.0}
+    assert IP.rank_replace_list(["a", "b", "c"], ppm) == ["b", "a", "c"]
+    assert IP.rank_replace_list(["b", "a"], ppm) == ["b", "a"]  # leader best
+    assert IP.rank_replace_list(["a"], {}) == ["a"]  # no ppms
+    assert IP.rank_replace_list([], ppm) == []
