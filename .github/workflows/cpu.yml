@@ -15,9 +15,9 @@ on:
         default: "validate"
         type: choice
         options: [validate, predict, gates]
-        shard:
-          description: "shard index"
-          default: "0"
+      shard:
+        description: "shard index"
+        default: "0"
       shards:
         description: "shard count"
         default: "1"
