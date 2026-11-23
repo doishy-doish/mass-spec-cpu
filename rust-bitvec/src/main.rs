@@ -63,9 +63,11 @@ const ROUTER_BIN: f64 = 0.4;
 const ROUTER_BINW: f64 = 0.4;
 const CASCADE_Z: f64 = 3.0;
 const TOP_K_OUT: usize = 25;
-/// Preloaded library table (protocol v2): one prepared copy per key, built
-/// once from preload chunks. Pool takes position 0. Replaces the old
-/// bounded per-query prep cache (removed — preload dedups by construction).
+/// Preloaded library table (protocol v2): raw spectra + smiles per key,
+/// prepared on first use and cached (M209). prepare() and morgan are pure
+/// functions of these inputs, so lazy values equal eager ones bit-for-bit.
+/// Pool takes position 0. Replaces the old eager preload (prepared all 275k
+/// keys, 7.3min, before query 1 — most keys are never touched).
 const VARIANTS: [&str; 15] = [
     "lib", "analog", "frag", "bin", "binw", "stein", "mass", "z", "rrf", "rrfb", "cascade", "router",
     "zw", "rrfw", "pure",
@@ -633,14 +635,35 @@ struct CandData {
     neutral: Option<f64>,
 }
 
-/// Preloaded library table (protocol v2): one prepared copy per key,
-/// shared by every query. Pool uses specs[0]; candidates use all specs —
-/// the same spectra the launcher used to send per query.
+/// Preloaded library table entry (protocol v2): raw spectra + smiles stored
+/// at preload; prepared CSpectra + fingerprint computed on first use and
+/// cached (M209). Pool uses specs[0]; candidates use all specs.
 struct TableEntry {
-    specs: Vec<CSpectra>,
-    fp: [u64; 32],
-    has_fp: bool,
+    raw: Vec<RawSpec>,
+    specs: Option<Vec<CSpectra>>,
+    smiles: String,
+    fp: Option<[u64; 32]>,
     neutral: Option<f64>,
+}
+
+/// M209: prepare-on-first-use. prepare() is a pure function of (raw spectra,
+/// qpeak, qloss) and morgan_bits_2048 a pure function of smiles, so cached
+/// values equal the old eager-preload values bit-for-bit — only the WHEN
+/// changes. Raw is dropped after preparing to bound engine memory:
+/// raw(untouched keys) + prepared(touched keys).
+fn ensure_prepared(e: &mut TableEntry, qpeak: f64, qloss: f64) {
+    if e.specs.is_none() {
+        let specs: Vec<CSpectra> = e
+            .raw
+            .iter()
+            .map(|s| prepare(&s.mzs, &s.ints, s.prec, qpeak, qloss))
+            .collect();
+        e.specs = Some(specs);
+        e.raw = Vec::new();
+    }
+    if e.fp.is_none() {
+        e.fp = Some(morgan_bits_2048(&e.smiles));
+    }
 }
 
 fn fuse_rank(
@@ -825,8 +848,8 @@ fn sengine(params: EngineParams) {
     let e = std::io::stderr();
     let mut err = e.lock();
     // Preloaded library table (protocol v2): one engine, one copy.
-    // Per-query messages carry keys only, so the transfer+parse+prepare of
-    // the same library spectra on every query happens exactly once.
+    // Per-query messages carry keys only; entries prepare on first use,
+    // so untouched keys cost parse+store only (M209).
     let mut table: HashMap<String, TableEntry> = HashMap::new();
     for line in lines {
         let line = line.expect("sengine: read");
@@ -845,13 +868,8 @@ fn sengine(params: EngineParams) {
                 .zip(ch.neutrals.into_iter())
                 .zip(ch.specs.into_iter())
             {
-                let specs: Vec<CSpectra> = ss
-                    .iter()
-                    .map(|s| prepare(&s.mzs, &s.ints, s.prec, params.qpeak, params.qloss))
-                    .collect();
-                let has_fp = !sm.is_empty();
-                let fp = morgan_bits_2048(&sm);
-                table.insert(k, TableEntry { specs, fp, has_fp, neutral: n });
+                // M209: store raw; prepare on first use (see ensure_prepared).
+                table.insert(k, TableEntry { raw: ss, specs: None, smiles: sm, fp: None, neutral: n });
             }
             continue;
         }
@@ -873,11 +891,12 @@ fn sengine(params: EngineParams) {
         let cand_keys = m.cand_keys.unwrap_or_default();
         let mut cands: Vec<CandData> = Vec::with_capacity(cand_keys.len());
         for k in &cand_keys {
-            if let Some(e) = table.get(k) {
+            if let Some(e) = table.get_mut(k) {
+                ensure_prepared(e, params.qpeak, params.qloss);
                 cands.push(CandData {
                     key: k.clone(),
-                    specs: e.specs.clone(),
-                    fp: if e.has_fp { Some(e.fp) } else { None },
+                    specs: e.specs.clone().unwrap_or_default(),
+                    fp: if e.smiles.is_empty() { None } else { e.fp },
                     neutral: e.neutral,
                 });
             }
@@ -889,10 +908,11 @@ fn sengine(params: EngineParams) {
         let pool_keys = m.pool_keys.unwrap_or_default();
         let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_keys.len());
         for k in &pool_keys {
-            if let Some(e) = table.get(k) {
-                if let Some(s) = e.specs.first() {
+            if let Some(e) = table.get_mut(k) {
+                ensure_prepared(e, params.qpeak, params.qloss);
+                if let Some(s) = e.specs.as_ref().and_then(|v| v.first()) {
                     let d = (s.prec - qc.prec).abs();
-                    pool.push((k.clone(), s.clone(), d, e.fp));
+                    pool.push((k.clone(), s.clone(), d, e.fp.unwrap_or([0u64; 32])));
                 }
             }
         }
@@ -1214,6 +1234,51 @@ mod engine_tests {
         let fw = EngineParams::neutral(0.05, 0.01);
         let ranked = fuse_rank(&keys, &cols, &fw);
         assert_eq!(ranked["pure"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn lazy_prep_matches_eager_and_caches() {
+        // M209: prepare-on-first-use == eager values bit-for-bit; raw dropped,
+        // second call a no-op; empty-smiles fp is zeros (pool skips it).
+        let raws = vec![
+            RawSpec { mzs: vec![100.0, 200.0], ints: vec![1.0, 0.5], prec: 201.0 },
+            RawSpec { mzs: vec![150.0], ints: vec![1.0], prec: 251.0 },
+        ];
+        let eager: Vec<CSpectra> = raws
+            .iter()
+            .map(|s| prepare(&s.mzs, &s.ints, s.prec, 0.05, 0.01))
+            .collect();
+        let mut e = TableEntry {
+            raw: raws, specs: None, smiles: "CCO".to_string(), fp: None,
+            neutral: Some(200.0),
+        };
+        ensure_prepared(&mut e, 0.05, 0.01);
+        assert!(e.raw.is_empty(), "raw dropped after prepare");
+        let got = e.specs.clone().unwrap();
+        assert_eq!(got.len(), eager.len());
+        for (a, b) in got.iter().zip(eager.iter()) {
+            assert_eq!(a.mz, b.mz);
+            assert_eq!(a.w, b.w);
+            assert_eq!(a.prec, b.prec);
+            assert_eq!(a.norm, b.norm);
+            assert_eq!(a.sw, b.sw);
+            assert_eq!(a.snorm, b.snorm);
+            assert_eq!(a.bits, b.bits);
+            assert_eq!(a.wb, b.wb);
+            assert_eq!(a.floss, b.floss);
+        }
+        assert_eq!(e.fp, Some(morgan_bits_2048("CCO")));
+        let fp_before = e.fp;
+        ensure_prepared(&mut e, 0.05, 0.01);
+        assert_eq!(e.fp, fp_before, "second call is a no-op");
+        assert_eq!(e.specs.clone().unwrap().len(), eager.len());
+        let mut e2 = TableEntry {
+            raw: vec![], specs: None, smiles: String::new(), fp: None,
+            neutral: None,
+        };
+        ensure_prepared(&mut e2, 0.05, 0.01);
+        assert_eq!(e2.fp, Some([0u64; 32]));
+        assert!(e2.specs.unwrap().is_empty());
     }
 
     #[test]
