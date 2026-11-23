@@ -276,3 +276,35 @@ def recall_at_k(ranked_lists, truths, k: int) -> float:
 def top_k(pool_scored, k: int):
     """First-K keys of a scored pool list. Pure slice, stable order."""
     return list(pool_scored)[: max(0, int(k))]
+
+
+def rank_replace_list(ranked_list, ppm_of, center=V8_CENTER, lead_off=V8_REPLACE):
+    """Python mirror of the engine's apply_mass_replace, for one ranked list.
+
+    Same contract (I6): rank-1 |ppm-center| > lead_off -> min-|ppm| key to
+    front; first-seen wins ties; missing ppms / good leader -> unchanged.
+    """
+    lst = [str(k) for k in ranked_list]
+    if not lst:
+        return lst
+
+    def dev(k):
+        try:
+            return abs(float(ppm_of[k]) - float(center))
+        except Exception:
+            return None
+
+    lead = dev(lst[0])
+    if lead is None or lead <= float(lead_off):
+        return lst
+    best_i, best_d = None, None
+    for i, k in enumerate(lst):
+        d = dev(k)
+        if d is None:
+            continue
+        if best_d is None or d < best_d:
+            best_i, best_d = i, d
+    if best_i is not None and best_d < lead:
+        k = lst.pop(best_i)
+        lst.insert(0, k)
+    return lst
