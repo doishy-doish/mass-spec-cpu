@@ -80,16 +80,17 @@ def pool_rerank_by_instrument(pool_keys, key2inst: dict, q_inst: str):
 # ---------------------------------------------------------------------------
 
 # Neighbor reinterpretations, self first. Protonated / deprotonated lanes
-# stay separate (charge flip is never a "neighbor").
+# stay separate (charge flip is never a "neighbor"). Keys are lowercase;
+# values are canonical data-case (train data uses [M+H]+ / [M-H]-).
 ADDUCT_NEIGHBORS = {
-    "[m+h]+": ["[m+h]+", "[m+na]+", "[m+k]+", "[m+h-h2o]+", "[m+nh4]+"],
-    "[m+na]+": ["[m+na]+", "[m+h]+", "[m+k]+"],
-    "[m+k]+": ["[m+k]+", "[m+na]+", "[m+h]+"],
-    "[m+nh4]+": ["[m+nh4]+", "[m+h]+", "[m+na]+"],
-    "[m+h-h2o]+": ["[m+h-h2o]+", "[m+h]+"],
-    "[m-h]-": ["[m-h]-", "[m+cl]-", "[m+hcoo]-", "[m+ch3coo]-"],
-    "[m+cl]-": ["[m+cl]-", "[m-h]-"],
-    "[m+hcoo]-": ["[m+hcoo]-", "[m-h]-"],
+    "[m+h]+": ["[M+H]+", "[M+Na]+", "[M+K]+", "[M+H-H2O]+", "[M+NH4]+"],
+    "[m+na]+": ["[M+Na]+", "[M+H]+", "[M+K]+"],
+    "[m+k]+": ["[M+K]+", "[M+Na]+", "[M+H]+"],
+    "[m+nh4]+": ["[M+NH4]+", "[M+H]+", "[M+Na]+"],
+    "[m+h-h2o]+": ["[M+H-H2O]+", "[M+H]+"],
+    "[m-h]-": ["[M-H]-", "[M+Cl]-", "[M+HCOO]-", "[M+CH3COO]-"],
+    "[m+cl]-": ["[M+Cl]-", "[M-H]-"],
+    "[m+hcoo]-": ["[M+HCOO]-", "[M-H]-"],
 }
 
 # Neutral-mass deltas for the retry lane (Da). Applied as prec shift so the
@@ -107,19 +108,21 @@ ADDUCT_DELTA = {
 
 
 def adduct_neighbors(adduct: str):
-    """Neighbor adducts for retry, self first. Unknown -> [self]."""
+    """Neighbor adducts for retry, self first. Unknown -> [self].
+
+    Lookup is case-insensitive (M219: train data is [M+H]+ uppercase,
+    table keys are lowercase). Returned values are canonical data-case.
+    """
     a = str(adduct or "")
-    if a in ADDUCT_NEIGHBORS:
-        return list(ADDUCT_NEIGHBORS[a])
-    return [a]
+    return list(ADDUCT_NEIGHBORS.get(a.lower(), [a]))
 
 
 def retry_precisions(prec: float, from_ad: str, to_ad: str):
     """Shift a precursor mz from one adduct frame to another (Da shift)."""
     if to_ad == from_ad:
         return float(prec)
-    d_to = ADDUCT_DELTA.get(to_ad, 0.0)
-    d_from = ADDUCT_DELTA.get(from_ad, 0.0)
+    d_to = ADDUCT_DELTA.get(str(to_ad).lower(), 0.0)
+    d_from = ADDUCT_DELTA.get(str(from_ad).lower(), 0.0)
     return float(prec) + (d_to - d_from)
 
 
