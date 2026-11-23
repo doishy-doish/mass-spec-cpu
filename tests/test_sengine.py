@@ -145,6 +145,21 @@ def test_engine_query_carries_ce():
     assert m2["q"]["ce"] is None  # missing CE degrades, never crashes
 
 
+def test_engine_mol_query_schema_and_union():
+    T = _table()
+    qrecs = [_qrec(T, 0), _qrec(T, 1)]
+    m = R.build_engine_mol_query(qrecs, ["k1"], ["k2"], [0, 1], [200.0, None])
+    assert set(m) == {"qs", "cand_keys", "pool_keys", "qis", "qnms"}
+    assert len(m["qs"]) == 2 and m["qis"] == [0, 1]
+    assert m["qnms"] == [200.0, None]
+    json.dumps(m)
+    sel = [(0, 0, 2, ["k1"], ["k2"], 201.0, 1.0),
+           (1, 1, 2, ["k1", "k2"], ["k2"], 201.5, 1.0)]
+    ck, pk = R.mol_union_keys(sel)
+    assert ck == ["k1", "k2"] and pk == ["k2"]
+    assert R.mol_union_keys([None]) == ([], [])
+
+
 class _StubEngine:
     def __init__(self, ranked):
         self.ranked = ranked

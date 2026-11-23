@@ -375,6 +375,44 @@ def build_engine_query(qrec: dict, cand_keys, pool_keys,
             "qnm": (None if qnm is None else float(qnm))}
 
 
+def build_engine_mol_query(qrecs: list, cand_keys, pool_keys,
+                           qis: list, qnms: list) -> dict:
+    """Pure builder for one molecule-batch sengine query (microsec lane).
+
+    S spectra of one molecule, one round trip. Shared cand/pool keys (union
+    over the molecule's spectra). S=1 must equal build_engine_query rank-wise
+    (single RRF term is monotonic in rank). No binary, testable.
+    """
+    qs = []
+    for r in qrecs:
+        qm = [float(x) for x in np.ascontiguousarray(r["mzs"], dtype=np.float64).tolist()]
+        qi_ = [float(x) for x in np.ascontiguousarray(r["ints"], dtype=np.float64).tolist()]
+        ce = r.get("ce")
+        try:
+            ce = None if ce is None else float(ce)
+            if ce != ce:
+                ce = None
+        except (TypeError, ValueError):
+            ce = None
+        qs.append({"mzs": qm, "ints": qi_, "prec": float(r["prec"]), "ce": ce})
+    return {"qs": qs,
+            "cand_keys": [str(k) for k in cand_keys],
+            "pool_keys": [str(k) for k in pool_keys],
+            "qis": [int(x) for x in qis],
+            "qnms": [(None if v is None else float(v)) for v in qnms]}
+
+
+def mol_union_keys(selected: list) -> tuple:
+    """Union cand/pool keys over a molecule's selected spectra (pure)."""
+    cand, pool = set(), set()
+    for sel in selected:
+        if sel is None:
+            continue
+        cand.update(sel[3])
+        pool.update(sel[4])
+    return (sorted(cand), sorted(pool))
+
+
 def select_task(task):
     """One query's key selection (engine-free; runs in forked workers).
 

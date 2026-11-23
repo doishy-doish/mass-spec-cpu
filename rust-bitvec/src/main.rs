@@ -625,6 +625,12 @@ struct EngineIn {
     #[serde(default)]
     q: Option<RawSpec>,
     #[serde(default)]
+    qs: Option<Vec<RawSpec>>,
+    #[serde(default)]
+    qnms: Option<Vec<Option<f64>>>,
+    #[serde(default)]
+    qis: Option<Vec<i64>>,
+    #[serde(default)]
     cand_keys: Option<Vec<String>>,
     #[serde(default)]
     pool_keys: Option<Vec<String>>,
@@ -1118,6 +1124,57 @@ fn funnel_topk(ordered_keys: &[String], k: usize) -> Vec<String> {
     ordered_keys.iter().take(k).cloned().collect()
 }
 
+/// Molecule-batch fuse (microsec lane): S per-spectrum score columns over the
+/// same candidate order -> one fused ranked list per variant via RRF across
+/// spectra. No learning, no weights: rank_s -> 1/(60+rank_s), NaN ranks skip.
+/// All-NaN across spectra stays NaN (order_desc puts it last). S=1 equals the
+/// single-query rank exactly (one RRF term, monotonic in rank).
+fn fuse_molecule_rrf(
+    per_spec: &[HashMap<String, Vec<f64>>],
+    keys: &[String],
+) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    if per_spec.is_empty() || keys.is_empty() {
+        for v in VARIANTS {
+            out.insert(v.to_string(), Vec::new());
+        }
+        return out;
+    }
+    let n = keys.len();
+    let nan = vec![f64::NAN; n];
+    for v in VARIANTS {
+        let ranks: Vec<Vec<f64>> = per_spec
+            .iter()
+            .map(|cols| {
+                let c: &[f64] = cols.get(*v).map(Vec::as_slice).unwrap_or(&nan);
+                rank_min_desc(c)
+            })
+            .collect();
+        let mut fused = vec![f64::NAN; n];
+        for i in 0..n {
+            let mut s = 0.0;
+            let mut hit = false;
+            for r in &ranks {
+                let rv = r[i];
+                if !rv.is_nan() {
+                    s += 1.0 / (RRF_BASE + rv);
+                    hit = true;
+                }
+            }
+            if hit {
+                fused[i] = s;
+            }
+        }
+        let kv: Vec<String> = order_desc(&fused)
+            .into_iter()
+            .take(TOP_K_OUT)
+            .map(|i| keys[i].clone())
+            .collect();
+        out.insert(v.to_string(), kv);
+    }
+    out
+}
+
 fn sengine(params: EngineParams) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -1154,6 +1211,253 @@ fn sengine(params: EngineParams) {
         if m.preload_done.unwrap_or(false) {
             writeln!(h, "{}", serde_json::to_string(&Ready { ready: true }).unwrap()).unwrap();
             h.flush().unwrap();
+            continue;
+        }
+        // Molecule-batch path: S spectra, one round trip, cands/pool prepped
+        // once, per-spectrum channels fused by RRF. S=1 equals single path.
+        if let Some(qs) = m.qs {
+            let t_parse = t0.elapsed();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            let qnms: Vec<Option<f64>> = m.qnms.unwrap_or_default();
+            let qis: Vec<i64> = m.qis.unwrap_or_default();
+            let cand_keys = m.cand_keys.unwrap_or_default();
+            let mut cands: Vec<CandData> = Vec::with_capacity(cand_keys.len());
+            for k in &cand_keys {
+                if let Some(e) = table.get_mut(k) {
+                    ensure_prepared(e, params.qpeak, params.qloss);
+                    cands.push(CandData {
+                        key: k.clone(),
+                        specs: e.specs.clone().unwrap_or_default(),
+                        fp: if e.smiles.is_empty() { None } else { e.fp },
+                        neutral: e.neutral,
+                        formula: e.formula.clone(),
+                    });
+                }
+            }
+            let t_qprep = t0.elapsed();
+            let pool_keys = m.pool_keys.unwrap_or_default();
+            // Pool entries carry all first-spectra (prec from specs[0]); per-
+            // spectrum distance is computed against each qc below.
+            let mut pool_first: Vec<(String, CSpectra, [u64; 32])> = Vec::with_capacity(pool_keys.len());
+            for k in &pool_keys {
+                if let Some(e) = table.get_mut(k) {
+                    ensure_prepared(e, params.qpeak, params.qloss);
+                    if let Some(s) = e.specs.as_ref().and_then(|v| v.first()) {
+                        pool_first.push((k.clone(), s.clone(), e.fp.unwrap_or([0u64; 32])));
+                    }
+                }
+            }
+            let t_cands = t0.elapsed();
+            // Per-spectrum: qc + funnel + hits + channels (same math as single).
+            let mut per_spec: Vec<HashMap<String, Vec<f64>>> = Vec::with_capacity(qs.len());
+            let mut pool_union: usize = 0;
+            let mut mass_swap_any = false;
+            let mut neutrals: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
+            let _ = &mut neutrals;
+            for (si, q) in qs.iter().enumerate() {
+                let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss, q.ce);
+                let qloss = loss_set(&qc.mz, qc.prec);
+                let qn = qloss.len().max(1) as f64;
+                let qnm: Option<f64> = qnms.get(si).copied().flatten();
+                let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_first.len());
+                for (k, s, fp) in &pool_first {
+                    pool.push((k.clone(), s.clone(), (s.prec - qc.prec).abs(), *fp));
+                }
+                let mut pool_idx: Vec<usize> = (0..pool.len()).collect();
+                if pool.len() > FUNNEL_MIN && params.funnel_off < 0.5 && qc.bits.iter().any(|&w| w != 0) {
+                    let mut scored: Vec<(f64, f64, usize)> = pool
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, s, dist, _))| (jaccard(&qc.bits, &s.bits), *dist, i))
+                        .collect();
+                    scored.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap())
+                    });
+                    pool_idx = scored.into_iter().take(FUNNEL_K).map(|(_, _, i)| i).collect();
+                }
+                if pool_idx.len() > POOL_CAP {
+                    pool_idx.truncate(POOL_CAP);
+                }
+                pool_union = pool_union.max(pool_idx.len());
+                let mut hits: Vec<([u64; 32], f64)> = Vec::new();
+                for &i in &pool_idx {
+                    let (_, s, _, fp) = &pool[i];
+                    if fp == &[0u64; 32] {
+                        continue;
+                    }
+                    let msv = modified_row(&qc, s, TOL);
+                    if msv > MS_THRESH {
+                        hits.push((*fp, msv));
+                    }
+                }
+                hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                hits.truncate(TOP_N_ANALOG);
+                let mut vlib = Vec::with_capacity(cands.len());
+                let mut vanalog = Vec::with_capacity(cands.len());
+                let mut vfrag = Vec::with_capacity(cands.len());
+                let mut vbin = Vec::with_capacity(cands.len());
+                let mut vbinw = Vec::with_capacity(cands.len());
+                let mut vstein = Vec::with_capacity(cands.len());
+                let mut vmass = Vec::with_capacity(cands.len());
+                let mut vlibce = Vec::with_capacity(cands.len());
+                let mut vent = Vec::with_capacity(cands.len());
+                let mut vgate = Vec::with_capacity(cands.len());
+                for c in &cands {
+                    let mut lib = 0.0;
+                    let mut stein = 0.0;
+                    let mut ent = 0.0;
+                    for s in &c.specs {
+                        let v = cosine_row(&qc, s, TOL);
+                        if v > lib {
+                            lib = v;
+                        }
+                    }
+                    let mut libce = lib;
+                    if let Some(qce) = qc.ce {
+                        let qb = ce_band(qce);
+                        let mut found = false;
+                        let mut best = 0.0;
+                        for s in &c.specs {
+                            if s.ce.map(ce_band) == Some(qb) {
+                                found = true;
+                                let v = cosine_row(&qc, s, TOL);
+                                if v > best {
+                                    best = v;
+                                }
+                            }
+                        }
+                        if found {
+                            libce = best;
+                        }
+                    }
+                    let mut analog = 0.0;
+                    if let Some(cfp) = c.fp {
+                        for (ofp, msv) in &hits {
+                            let v = msv * chem_tanimoto(&cfp, ofp);
+                            if v > analog {
+                                analog = v;
+                            }
+                        }
+                    }
+                    let mut frag = 0.0;
+                    for s in c.specs.iter().take(2) {
+                        let v = overlap_count(&qloss, &s.floss) as f64 / qn;
+                        if v > frag {
+                            frag = v;
+                        }
+                    }
+                    let (mut bscore, mut bwscore) = (0.0, 0.0);
+                    for s in &c.specs {
+                        let j = jaccard(&qc.bits, &s.bits);
+                        if j > bscore {
+                            bscore = j;
+                        }
+                        let wj = wjaccard(&qc.wb, &s.wb);
+                        if wj > bwscore {
+                            bwscore = wj;
+                        }
+                        let st = stein_row(&qc, s, TOL);
+                        if st > stein {
+                            stein = st;
+                        }
+                        let en = ent_row(&qc.mz, &qc.w, &s.mz, &s.w, TOL);
+                        if en > ent {
+                            ent = en;
+                        }
+                    }
+                    vlib.push(lib);
+                    vanalog.push(analog);
+                    vfrag.push(frag);
+                    vbin.push(bscore);
+                    vbinw.push(bwscore);
+                    vstein.push(stein);
+                    vmass.push(mass_score(qnm, c.neutral));
+                    vlibce.push(libce);
+                    vent.push(ent);
+                    vgate.push(gate_frac(&qc.mz, qc.prec, c.formula.as_ref()));
+                }
+                let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(VARIANTS.len() * 2);
+                cols.insert("lib".to_string(), vlib);
+                cols.insert("analog".to_string(), vanalog);
+                cols.insert("frag".to_string(), vfrag);
+                cols.insert("bin".to_string(), vbin);
+                cols.insert("binw".to_string(), vbinw);
+                cols.insert("stein".to_string(), vstein);
+                cols.insert("mass".to_string(), vmass);
+                cols.insert("libce".to_string(), vlibce);
+                cols.insert("ent".to_string(), vent);
+                cols.insert("gate".to_string(), vgate);
+                // mass-replace + lossgate + swap are molecule-level (applied
+                // after fuse); per-spectrum swap contributes OR.
+                let neutrals_s: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
+                if mass_swap_flag(
+                    cols.get("lib").map(|v| v.as_slice()).unwrap_or(&[]),
+                    cols.get("mass").map(|v| v.as_slice()).unwrap_or(&[]),
+                    qnm,
+                    &neutrals_s,
+                ) {
+                    mass_swap_any = true;
+                }
+                per_spec.push(cols);
+                let _ = qis.get(si);
+            }
+            let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
+            let mut ranked = fuse_molecule_rrf(&per_spec, &keys);
+            if params.mass_replace > 0.5 {
+                // molecule qnm = median of available per-spectrum qnms.
+                let mut qvs: Vec<f64> = qnms.iter().filter_map(|v| *v).filter(|v| *v > 0.0).collect();
+                qvs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                if !qvs.is_empty() {
+                    let qmed = qvs[qvs.len() / 2];
+                    let ppm_of: HashMap<String, f64> = cands
+                        .iter()
+                        .filter_map(|c| c.neutral.map(|n| (c.key.clone(), (n - qmed) / qmed * 1e6)))
+                        .collect();
+                    if !ppm_of.is_empty() {
+                        apply_mass_replace(&mut ranked, &ppm_of);
+                    }
+                }
+            }
+            if params.lossgate > 0.5 {
+                // gate = mean across spectra (pass-first); vacuous-pass preserved.
+                let n = keys.len();
+                let mut gmean = vec![1.0; n];
+                for i in 0..n {
+                    let mut s = 0.0;
+                    let mut k = 0;
+                    for cols in &per_spec {
+                        if let Some(g) = cols.get("gate").and_then(|v| v.get(i)).copied() {
+                            s += g;
+                            k += 1;
+                        }
+                    }
+                    if k > 0 {
+                        gmean[i] = s / k as f64;
+                    }
+                }
+                let gate_of: HashMap<String, f64> =
+                    keys.iter().enumerate().map(|(i, kk)| (kk.clone(), gmean[i])).collect();
+                for list in ranked.values_mut() {
+                    partition_by_gate(list, &gate_of);
+                }
+            }
+            let t_fuse = t0.elapsed();
+            writeln!(
+                h,
+                "{}",
+                serde_json::to_string(&EngineReply {
+                    ranked,
+                    pools: pool_union,
+                    mass_swap: mass_swap_any,
+                    prefilter_topk: None,
+                    timing: vec![ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), 0.0, 0.0, 0.0, 0.0, ms(t_fuse - t_cands)],
+                })
+                .unwrap()
+            )
+            .unwrap();
+            h.flush().unwrap();
+            let t_ser = t0.elapsed();
+            writeln!(err, "sengine mol nspec={} cands={} pool={} ipc={} t_tot={:.1}", qs.len(), keys.len(), pool_union, ipc_bytes, ms(t_ser)).unwrap();
             continue;
         }
         let q = m.q.expect("sengine: query without q");
@@ -1819,5 +2123,44 @@ mod engine_tests {
         let near = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
         assert_eq!(modified_row(&q, &near, TOL), 1.0);
         assert_eq!(cosine_row(&q, &near, TOL), 0.0);
+    }
+
+    #[test]
+    fn molecule_rrf_single_equals_rank_and_fuses() {
+        // S=1: RRF over one spectrum is monotonic in rank -> same order as
+        // order_desc on the raw scores (NaN last in both).
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut cols = HashMap::new();
+        cols.insert("lib".to_string(), vec![0.9, 0.5, 0.0]);
+        cols.insert("analog".to_string(), vec![0.2, 0.8, 0.1]);
+        cols.insert("frag".to_string(), vec![0.3, 0.3, 0.9]);
+        cols.insert("bin".to_string(), vec![0.0, 0.0, 0.0]);
+        cols.insert("binw".to_string(), vec![0.0, 0.0, 0.0]);
+        cols.insert("stein".to_string(), vec![0.0, 0.0, 0.0]);
+        cols.insert("mass".to_string(), vec![1.0, 0.5, 0.0]);
+        cols.insert("libce".to_string(), vec![0.9, 0.5, 0.0]);
+        cols.insert("ent".to_string(), vec![0.9, 0.5, 0.0]);
+        cols.insert("gate".to_string(), vec![1.0, 1.0, 1.0]);
+        let fused = fuse_molecule_rrf(&[cols], &keys);
+        // lib single: a(0.9) b(0.5) c(0.0) -> a,b,c.
+        assert_eq!(fused["lib"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // S=2 agreeing spectra keep the winner: both rank a first.
+        let mut c2 = HashMap::new();
+        for v in VARIANTS {
+            c2.insert(v.to_string(), vec![0.9, 0.1, 0.0]);
+        }
+        let mut c3 = HashMap::new();
+        for v in VARIANTS {
+            c3.insert(v.to_string(), vec![0.8, 0.2, 0.0]);
+        }
+        let fused2 = fuse_molecule_rrf(&[c2, c3], &keys);
+        assert_eq!(fused2["lib"][0], "a");
+        // All-NaN stays empty-order (NaN last, stable).
+        let mut cn = HashMap::new();
+        for v in VARIANTS {
+            cn.insert(v.to_string(), vec![f64::NAN; 3]);
+        }
+        let fusedn = fuse_molecule_rrf(&[cn], &keys);
+        assert_eq!(fusedn["lib"].len(), 3);
     }
 }
