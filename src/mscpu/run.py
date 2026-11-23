@@ -234,6 +234,43 @@ def build_preload_chunks(lib_by_key: dict, Tlib: dict, key2smi: dict,
             "neutrals": nk, "specs": specs}})
 
 
+def subset_lib(lib_by_key: dict, keys) -> dict:
+    """Library rows for exactly these keys (M211).
+
+    Keys absent from lib_by_key stay absent — the engine skips unknown keys,
+    so a subset preload scores identically to a full one (tested).
+    """
+    return {k: lib_by_key[k] for k in keys if k in lib_by_key}
+
+
+def union_selected_keys(selected) -> list:
+    """Union of cand+pool keys over selected queries, sorted (M211).
+
+    Selection is deterministic, so preloading exactly this set is identical
+    to preloading everything: every key a query can touch is in the union.
+    sel layout: (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel).
+    """
+    u = set()
+    for sel in selected:
+        if sel is None:
+            continue
+        u.update(sel[3])
+        u.update(sel[4])
+    return sorted(u)
+
+
+def _proc_rss(pid):
+    """RSS of one child process in MB, or None (Linux runners only)."""
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
 def stream_preload(engine, chunks) -> int:
     """Send preload chunks as they are built (M207); preload_done at end.
 
@@ -467,22 +504,10 @@ def main() -> None:
     fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw}
-    # protocol v2: engine preloads the prepared library table once (parent,
-    # before any fork — one engine, one copy). Per-query messages are keys.
-    print("preload build lib_keys=" + str(len(lib_by_key)), flush=True)
-    engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion)
-    # M207: stream chunk-by-chunk (build one, send one, drop it). The old
-    # code materialized all ~552 chunks (~7GB JSON + transient floats) on
-    # top of the 8GB tables and died at 15.3GB before the slim below.
-    nchunks = stream_preload(engine,
-                             build_preload_chunks(lib_by_key, T, key2smi,
-                                                  key2neutral))
-    _rss, _avail = _mem_state()
-    print("preload done chunks=" + str(nchunks)
-          + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),
-          flush=True)  # HEARTBEAT
-    # slim the parent: the engine owns library spectra now; the parent keeps
-    # query spectra + small lookup arrays only (CoW-fork stays light).
+    # M211: select FIRST from small arrays, preload ONLY the union of keys
+    # queries touch, slim T BEFORE spawning the engine. Two full in-memory
+    # copies (parent tables + engine raw table) exceed the 16GB runner —
+    # peak must be one full copy (transient load), steady small + small.
     qset = set(int(qi) for qi in queries)
     _SE.update(skeys=np.array([str(k) for k in skeys.tolist()]),
                masses=masses, qnm=qnm, ppm=a.ppm,
@@ -492,7 +517,35 @@ def main() -> None:
                qprec={qi: float(T["prec"][qi]) for qi in qset},
                qkey={qi: str(T["key14"][qi]) for qi in qset},
                shard=a.shard, variants=VARIANTS)
+    # two-phase selection first: workers pick keys (engine-free pure numpy).
+    tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
+    if a.jobs > 1 and len(tasks) > 1:
+        with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
+            selected = list(ex.map(select_task, tasks))
+    else:
+        selected = [select_task(t) for t in tasks]
+    union = union_selected_keys(selected)
+    sub = subset_lib(lib_by_key, union)
+    # protocol v2: engine preloads the touched library subset once, then
+    # key-only per-query messages. Streamed chunk-by-chunk (M207).
+    print("preload build union=" + str(len(union)) + " lib_keys=" + str(len(lib_by_key)), flush=True)
+    engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion)
+    nchunks = stream_preload(engine,
+                             build_preload_chunks(sub, T, key2smi,
+                                                  key2neutral))
+    _rss, _avail = _mem_state()
+    _erss = _proc_rss(engine.p.pid)
+    print("preload done chunks=" + str(nchunks)
+          + " rss_mb=" + str(_rss) + " engine_mb=" + str(_erss)
+          + " memavail_mb=" + str(_avail),
+          flush=True)  # HEARTBEAT
+    # slim the parent: the engine owns the touched spectra now; the parent
+    # keeps query spectra + small lookup arrays only.
+    del sub
+    del union
     del lib_by_key
+    del key2smi
+    del key2neutral
     del T
     _rss, _avail = _mem_state()
     print("precompute done queries=" + str(len(queries))
@@ -503,14 +556,6 @@ def main() -> None:
             sf.write("PRECOMPUTE-DONE queries=" + str(len(queries)) + "\n")
     except Exception:
         pass
-    # two-phase: workers select keys (engine-free pure numpy), parent scores
-    # through the single preloaded engine. No per-query spectra cross a pipe.
-    tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
-    if a.jobs > 1 and len(tasks) > 1:
-        with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
-            selected = list(ex.map(select_task, tasks))
-    else:
-        selected = [select_task(t) for t in tasks]
     results = []
     for sel in selected:
         if sel is None:

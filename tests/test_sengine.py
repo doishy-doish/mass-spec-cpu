@@ -79,6 +79,38 @@ def test_stream_preload_sends_every_chunk_once():
     assert json.loads(seen[1])["preload"]["neutrals"] == [None]
 
 
+def test_union_selected_keys_sorted_deduped():
+    """M211: union over selected queries is sorted + deduped, Nones skipped."""
+    sel = [(0, 0, 2, ["k2", "k1"], ["k3", "k1"], 201.0, 5.0), None,
+           (1, 2, 2, ["k1"], [], 251.0, 6.0)]
+    assert R.union_selected_keys(sel) == ["k1", "k2", "k3"]
+    assert R.union_selected_keys([]) == []
+    assert R.union_selected_keys([None]) == []
+
+
+def test_subset_lib_keeps_missing_missing():
+    """M211: subset preload scores identically — unknown keys stay unknown."""
+    lib = {"k1": [0, 1], "k2": [2]}
+    sub = R.subset_lib(lib, ["k2", "k9"])
+    assert sub == {"k2": [2]}
+    T = _table()
+    seen = []
+
+    class _Sink:
+        def preload(self, lines):
+            seen.extend(lines)
+
+        def preload_done(self):
+            seen.append("DONE")
+
+    n = R.stream_preload(_Sink(), R.build_preload_chunks(
+        sub, T, {"k2": "CCC"}, {"k2": None}, per=500))
+    assert n == 1 and seen[-1] == "DONE"
+    c0 = json.loads(seen[0])["preload"]
+    assert c0["keys"] == ["k2"] and len(c0["specs"][0]) == 1
+    assert c0["neutrals"] == [None]
+
+
 def test_engine_query_schema():
     m = R.build_engine_query(_qrec(_table(), 0), ["k1"], ["k2"], 0)
     assert set(m) == {"q", "cand_keys", "pool_keys", "qi", "qnm"}
