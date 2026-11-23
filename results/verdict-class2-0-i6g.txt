@@ -1,0 +1,2 @@
+GREEN
+results/class2-0-i6g.json engine=rust n=50 mrr=0.7223 lib=0.8667 analog=0.1719 stein=0.7567 mass=0.1017 zw=0.7223 swap=0.040 pure=0.7482
