@@ -1,0 +1,2 @@
+GREEN
+results/class3-0-mol10.json engine=rust n=48 mrr=0.0000 lib=0.0000 analog=0.0000 stein=0.0000 mass=0.0000 zw=0.0000 swap=0.146 pure=0.0000 libce=0.0000 ent=0.0000 gate=0.0000
