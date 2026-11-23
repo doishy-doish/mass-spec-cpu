@@ -33,7 +33,8 @@ VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw
 # and are recorded in every output JSON for traceability (like qpeak/qloss).
 FUSION_DEFAULTS = {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0, "ra": 1.0,
                    "rf": 1.0, "casc_z": 3.0, "rout_lib": 0.5,
-                   "rout_bin": 0.4, "rout_binw": 0.4}
+                   "rout_bin": 0.4, "rout_binw": 0.4,
+                   "mass_replace": 0.0, "recall_topk": 0.0}
 
 
 TRAIN_COLS = ["inchikey14", "normalized_smiles", "precursor_mz",
@@ -382,6 +383,13 @@ def score_one(sel, engine):
         return None
     truth = str(_SE["qkey"][qi])
     row, ranked_z, swap = assemble_row(out, truth, qi, V_)
+    # I6 funnel recall probe: truth in echoed prefilter top-K? (None = probe off)
+    try:
+        _ptk = out.get("prefilter_topk")
+        if isinstance(_ptk, list) and _ptk:
+            _SE.setdefault("recall_hits", []).append(1.0 if truth in [str(k) for k in _ptk] else 0.0)
+    except Exception:
+        pass
     line = ("shard " + str(_SE["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
             + str(len(cand_keys)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_)
@@ -423,6 +431,8 @@ def main() -> None:
                     help="1 = second structs pass for queries with no neutral mass (neighbor adducts)")
     ap.add_argument("--mass-replace", type=int, default=0,
                     help="1 = v8 rank-1-by-mass replace at assemble (engine follow-up; helper stub-green)")
+    ap.add_argument("--recall-topk", type=float, default=0.0,
+                    help="0 = off; else engine echoes first-K funnel pool keys for recall scoring")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -544,7 +554,9 @@ def main() -> None:
     key2neutral = {str(k): float(v) for k, v in zip(skeys.tolist(), masses.tolist())}
     fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
-              "rout_bin": a.rout_bin, "rout_binw": a.rout_binw}
+              "rout_bin": a.rout_bin, "rout_binw": a.rout_binw,
+              "mass_replace": 1.0 if a.mass_replace else 0.0,
+              "recall_topk": float(a.recall_topk or 0.0)}
     # M211: select FIRST from small arrays, preload ONLY the union of keys
     # queries touch, slim T BEFORE spawning the engine. Two full in-memory
     # copies (parent tables + engine raw table) exceed the 16GB runner —
@@ -661,6 +673,8 @@ def main() -> None:
             "mrr_zw": _avg(rrs["zw"]), "mrr_rrfw": _avg(rrs["rrfw"]),
             "mrr_pure": _avg(rrs["pure"]),
             "fusion": fusion,
+           "recall_topk_k": float(a.recall_topk or 0.0),
+           "recall_at_k": _avg(_SE.get("recall_hits") or []),
            "qpeak": a.qpeak, "qloss": a.qloss,
            "mass_swap_rate": _avg(swaps),
            "truth_in_union": _tin, "keys_in_lib": _hit,
