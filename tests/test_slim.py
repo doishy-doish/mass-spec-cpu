@@ -89,7 +89,8 @@ def synth_table_ce():
         "instrument_type": ["timsTOF", "Orbitrap", "timsTOF", "timsTOF"],
         "ms2_mzs": [[0.1 + 0.2, 500.25, 1e300], [1.5], [], [5e-320, 999.999]],
         "ms2_normalized_intensities": [[1.0, 0.5, 0.25], [1.0], [], [0.3, 1.0]],
-        "collision_energy_ev": [20, [20, 40, 60], 40.0, None],
+        # list-typed like the real column: singletons, merged ramps, nulls
+        "collision_energy_ev": [[20], [20, 40, 60], [40.0], None],
     })
 
 
