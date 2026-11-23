@@ -435,12 +435,12 @@ fn structs_main() {
         .expect("structs: read stdin");
     let inp: StructsIn = serde_json::from_str(&buf).expect("structs: parse");
     let mut by_key: HashMap<usize, Vec<f64>> = HashMap::new();
-    for ((&ki, &prec), ad) in inp
+    for (&ki, (&prec, ad)) in inp
         .kidx
         .iter()
         .zip(inp.precs.iter().zip(inp.adducts.iter()))
     {
-        if let Some(sh) = adduct_shift(ad) {
+        if let Some(sh) = adduct_shift(ad.as_str()) {
             let e = prec - sh;
             if e > 50.0 && e < 3000.0 {
                 by_key.entry(ki).or_default().push(e);
@@ -589,6 +589,7 @@ struct CandData {
     key: String,
     specs: Vec<CSpectra>,
     fp: Option<[u64; 32]>,
+    neutral: Option<f64>,
 }
 
 fn fuse_rank(
@@ -729,7 +730,7 @@ fn fuse_rank(
 }
 
 /// v8 rank-1-by-mass (info only): lib-leader |ppm-CENTER|>LEAD_OFF && lib<TAU.
-fn mass_swap_flag(lib: &[f64], mass: &[f64], qnm: Option<f64>, neutrals: &[Option<f64>]) -> bool {
+fn mass_swap_flag(lib: &[f64], _mass: &[f64], qnm: Option<f64>, neutrals: &[Option<f64>]) -> bool {
     if qnm.is_none() {
         return false;
     }
@@ -793,6 +794,7 @@ fn sengine(params: EngineParams) {
                 key: c.key.clone(),
                 specs,
                 fp: if c.smiles.is_empty() { None } else { Some(*fp) },
+                neutral: c.neutral,
             });
         }
         // pool (input order = distance order from the launcher; keep it)

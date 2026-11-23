@@ -103,6 +103,86 @@ jobs:
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+      - name: probe assertions (GOOD PROBE — fails loud, never ships blind)
+        if: ${{ inputs.task == 'validate' }}
+        env:
+          MASK: ${{ inputs.mask }}
+          SHARD: ${{ inputs.shard }}
+          SUFFIX: ${{ inputs.suffix }}
+          NREQ: ${{ inputs.n }}
+          WL: ${{ inputs.wl }}
+          WA: ${{ inputs.wa }}
+          WF: ${{ inputs.wf }}
+          RL: ${{ inputs.rl }}
+          RA: ${{ inputs.ra }}
+          RF: ${{ inputs.rf }}
+          CASCZ: ${{ inputs.casc-z }}
+          ROUTLIB: ${{ inputs.rout-lib }}
+        run: |
+          python - <<'PY'
+          import json, os, sys, glob
+          mask = os.environ["MASK"]; shard = os.environ["SHARD"]; suffix = os.environ.get("SUFFIX","")
+          nreq = int(os.environ.get("NREQ","0") or 0)
+          path = f"results/{mask}-{shard}{suffix}.json"
+          cands = [path] + sorted(glob.glob(f"results/{mask}-{shard}*.json"))
+          fp = next((c for c in cands if os.path.exists(c)), None)
+          red = []
+          def need(cond, msg):
+              if not cond: red.append(msg)
+          if fp is None:
+              print(f"GOOD-PROBE RED: no output file (looked for {path} + {cands}) — probe missed everything it was sent to check");
+              sys.exit(1)
+          print(f"GOOD-PROBE checking {fp}");
+          try:
+              out = json.load(open(fp))
+          except Exception as e:
+              print(f"GOOD-PROBE RED: unreadable JSON {fp}: {e}"); sys.exit(1)
+          # 1. engine + shape: the probe ran the Rust engine on real queries
+          need(out.get("engine") == "rust", f"engine != rust ({out.get('engine')!r}) — wrong binary path or fallback")
+          n = out.get("n", 0)
+          need(isinstance(n, int) and n >= min(10, nreq), f"n too small ({n} < min(10,{nreq})) — queries never ran")
+          rrs = out.get("rrs", {})
+          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw"},
+               f"variants incomplete ({sorted(rrs.keys())}) — a channel never returned")
+          for v, arr in rrs.items():
+              need(len(arr) == n, f"rrs[{v}] len {len(arr)} != n {n}")
+          # 2. score fields present + sane (catches silent NaN/zero collapse)
+          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw"]
+          for k in mkeys:
+              v = out.get(k)
+              need(isinstance(v,(int,float)) and v==v and 0.0 <= v <= 1.0, f"{k} insane ({v!r})")
+          need(out.get("fusion") is not None, "fusion params missing — genome not recorded")
+          need("mass_swap_rate" in out, "mass_swap_rate missing — mass channel signal discarded (old bug)")
+          need(isinstance(out.get("mass_swap_rate"),(int,float)), "mass_swap_rate insane")
+          need(len(out.get("pools",[])) == n and (sum(out["pools"])/max(1,n)) > 0, "pools empty — candidate pool never built")
+          # 3. lane sanity, mask-conditional (catches blindness/pool breaks the old probes walked past)
+          if mask == "class2":
+              need(out.get("mrr_lib",0) > 0.5, f"class2 mrr_lib {out.get('mrr_lib')} <= 0.5 — easy-lane retrieval broken")
+              need(out.get("mrr_analog",0) > 0.1, f"class2 mrr_analog {out.get('mrr_analog')} <= 0.1 — analog pool broken")
+          elif mask == "class3":
+              need(out.get("mrr_analog",0) > 0.1, f"class3 mrr_analog {out.get('mrr_analog')} <= 0.1 — novel-lane retrieval broken")
+              need(out.get("mrr_lib",1) < 0.2, f"class3 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
+          # 4. genome actually applied (the thing -genomeA/L were sent to check and never did)
+          try:
+              wl,wa,wf,rl,ra,rf = float(os.environ["WL"]),float(os.environ["WA"]),float(os.environ["WF"]),float(os.environ["RL"]),float(os.environ["RA"]),float(os.environ["RF"])
+              cz, rlib = float(os.environ["CASCZ"]), float(os.environ["ROUTLIB"])
+          except Exception:
+              wl=wa=wf=rl=ra=rf=1.0; cz=3.0; rlib=0.5
+          f = out.get("fusion",{})
+          for k, want in [("wl",wl),("wa",wa),("wf",wf),("rl",rl),("ra",ra),("rf",rf),("casc_z",cz),("rout_lib",rlib)]:
+              need(abs(float(f.get(k, float("nan"))) - want) < 1e-9, f"fusion.{k} {f.get(k)!r} != dispatched {want} — genome never reached engine")
+          neutral = (wl==1.0 and wa==1.0 and wf==1.0 and rl==1.0 and ra==1.0 and rf==1.0 and cz==3.0)
+          if neutral:
+              need(abs(out["mrr_zw"]-out["mrr"]) < 1e-9, f"neutral genome moved zw ({out['mrr_zw']} vs z {out['mrr']}) — bit-identity broken")
+              need(abs(out["mrr_rrfw"]-out["mrr_rrf"]) < 1e-9, f"neutral genome moved rrfw ({out['mrr_rrfw']} vs rrf {out['mrr_rrf']})")
+          else:
+              moved = (rrs.get("zw") != rrs.get("z")) or (rrs.get("rrfw") != rrs.get("rrf"))
+              need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
+          if red:
+              print("GOOD-PROBE RED:");
+              [print(" - " + r) for r in red]; sys.exit(1)
+          print(f"GOOD-PROBE GREEN: {fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f}")
+          PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json

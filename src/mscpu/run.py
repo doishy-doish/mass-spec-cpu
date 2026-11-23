@@ -232,7 +232,7 @@ def _run_query(task):
     row = {}
     ranked_z = None
     for v in V_:
-        ranked = out["ranked"].get(v, [])
+        ranked = out.get("ranked", {}).get(v, [])
         row[v] = M.reciprocal_rank(truth, ranked)
         if v == "z":
             ranked_z = ranked
@@ -240,7 +240,9 @@ def _run_query(task):
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
             + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_))
     print(line, flush=True)  # HEARTBEAT: workers print as they finish
-    return (qi, row, len(cands), ranked_z, line)
+    # GOOD-PROBE: surface the v8 rank-1-by-mass swap signal (was discarded —
+    # old probes could never see the mass channel they were sent to check).
+    return (qi, row, len(cands), ranked_z, line, bool(out.get("mass_swap", False)))
 
 
 def main() -> None:
@@ -374,13 +376,15 @@ def main() -> None:
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
     qidx: list = []
-    for qi, row, plen, ranked, line in results:
+    swaps: list = []
+    for qi, row, plen, ranked, line, swap in results:
         pools.append(plen)
         for v in VARIANTS:
             rrs[v].append(row[v])
         if ranked is not None:
             preds[str(qi)] = ranked
         qidx.append(int(qi))
+        swaps.append(1.0 if swap else 0.0)
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
@@ -394,12 +398,13 @@ def main() -> None:
             "mrr_zw": _avg(rrs["zw"]), "mrr_rrfw": _avg(rrs["rrfw"]),
             "fusion": fusion,
            "qpeak": a.qpeak, "qloss": a.qloss,
+           "mass_swap_rate": _avg(swaps),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
            "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
-           "pools": pools, "qidx": qidx}
+           "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps]}
     with open(out_path, "w") as f:
         json.dump(out, f)
     try:

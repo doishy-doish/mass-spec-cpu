@@ -92,3 +92,17 @@ def test_fusion_defaults_neutral():
                                  "ra": 1.0, "rf": 1.0, "casc_z": 3.0,
                                  "rout_lib": 0.5, "rout_bin": 0.4,
                                  "rout_binw": 0.4}
+
+
+def test_good_probe_plumbing():
+    # GOOD-PROBE regression: the mass-swap signal must reach the output JSON,
+    # or probes silently measure nothing (the bug the user called out).
+    import pathlib
+    root = _repo_root()
+    run_src = pathlib.Path(root, "src/mscpu/run.py").read_text()
+    assert "mass_swap_rate" in run_src, "run.py must record mass_swap_rate in output JSON"
+    assert 'out.get("mass_swap", False)' in run_src, "run.py must read sengine mass_swap flag"
+    yml = pathlib.Path(root, ".github/workflows/cpu.yml").read_text()
+    assert "probe assertions (GOOD PROBE" in yml, "cpu.yml must gate on GOOD-PROBE assertions"
+    assert "mass_swap_rate" in yml, "GOOD-PROBE must check mass_swap_rate"
+    assert "non-neutral genome left zw==z" in yml, "GOOD-PROBE must check genome actually moved"
