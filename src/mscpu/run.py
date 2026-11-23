@@ -616,6 +616,8 @@ def main() -> None:
             "fusion": fusion,
            "qpeak": a.qpeak, "qloss": a.qloss,
            "mass_swap_rate": _avg(swaps),
+           "truth_in_union": _tin, "keys_in_lib": _hit,
+           "keys_total": _ncand + _npool, "n_truths": len(_truths),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
