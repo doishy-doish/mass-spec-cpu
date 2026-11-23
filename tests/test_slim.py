@@ -102,10 +102,10 @@ def test_build_arrays_ce_keymeta():
     assert d["ce"][2] == 40.0
     assert d["ce"][3] != d["ce"][3]
     # per-key first-occurrence instrument + first row
-    assert d["key_inst"].tolist() == [0, 1, 0]  # timsTOF=0, Orbitrap=1
+    # (instruments sorted: Orbitrap=0, timsTOF=1)
+    assert d["instruments"] == ["Orbitrap", "timsTOF"]
+    assert d["key_inst"].tolist() == [1, 0, 1]
     assert d["key_first"].tolist() == [0, 1, 3]
-    assert d["instruments"] == ["Orbitrap", "timsTOF"] or \
-        d["instruments"] == ["timsTOF", "Orbitrap"]
 
 
 def test_ce_matches_run():
