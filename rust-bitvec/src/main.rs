@@ -1144,12 +1144,19 @@ mod engine_tests {
 
     #[test]
     fn analog_empty_pool_is_zero() {
-        // no pool hits -> analog must be exactly 0 for every candidate.
-        // guards the old JS-mirror failure where a sign-flipped mass shift
-        // produced false hits (expected [0,0,0]).
+        // TRULY far pool (100 Da away): neither direct nor shifted matches.
+        // (An earlier revision of this test used prec 251 for `far` and
+        // expected modified==0 — wrong: 251 is 50 Da away, i.e. INSIDE the
+        // analog pool, and shifting it by (201-251)=-50 aligns it exactly,
+        // so modified==1.0 is the CORRECT analog signal, not a false hit.
+        // The runner caught the bad expectation; this is the corrected one.)
         let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01);
-        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01);
+        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 301.0, 0.05, 0.01);
         assert_eq!(modified_row(&q, &far, TOL), 0.0);
         assert_eq!(cosine_row(&q, &far, TOL), 0.0);
+        // in-pool shifted matches DO hit — that is the analog signal itself.
+        let near = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01);
+        assert_eq!(modified_row(&q, &near, TOL), 1.0);
+        assert_eq!(cosine_row(&q, &near, TOL), 0.0);
     }
 }

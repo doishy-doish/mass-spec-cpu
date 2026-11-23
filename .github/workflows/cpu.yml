@@ -77,8 +77,8 @@ jobs:
       - run: mkdir -p data results
       - name: build rust engine
         run: |
-          cd rust-bitvec && cargo build --release && cargo test --release && cd ..
-          cd rust-chem && cargo build --release && cargo test --release && cd ..
+          cd rust-bitvec && cargo build --release && cargo test --release
+          cd ../rust-chem && cargo build --release && cargo test --release
       - name: restore data cache
         id: datacache
         uses: actions/cache@v4
