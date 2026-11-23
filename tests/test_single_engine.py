@@ -103,6 +103,7 @@ def test_good_probe_plumbing():
     assert "mass_swap_rate" in run_src, "run.py must record mass_swap_rate in output JSON"
     assert 'out.get("mass_swap", False)' in run_src, "run.py must read sengine mass_swap flag"
     yml = pathlib.Path(root, ".github/workflows/cpu.yml").read_text()
-    assert "probe assertions (GOOD PROBE" in yml, "cpu.yml must gate on GOOD-PROBE assertions"
+    assert "SMART-PROBE" in yml, "cpu.yml must gate on SMART-PROBE assertions"
+    assert "always()" in yml, "SMART-PROBE must run even when run mask is cancelled (INFRA gap)"
     assert "mass_swap_rate" in yml, "GOOD-PROBE must check mass_swap_rate"
     assert "non-neutral genome left zw==z" in yml, "GOOD-PROBE must check genome actually moved"
