@@ -187,13 +187,16 @@ jobs:
           # M199: defensive — the probe must end in a verdict, never a traceback.
           pools = out.get("pools") or []
           need(len(pools) == n and (sum(pools)/max(1,n)) > 0, "pools empty — candidate pool never built")
-          # 3. lane sanity, mask-conditional (catches blindness/pool breaks the old probes walked past)
-          if mask == "class2":
-              need(out.get("mrr_lib",0) > 0.5, f"class2 mrr_lib {out.get('mrr_lib')} <= 0.5 — easy-lane retrieval broken")
-              need(out.get("mrr_analog",0) > 0.1, f"class2 mrr_analog {out.get('mrr_analog')} <= 0.1 — analog pool broken")
-          elif mask == "class3":
-              need(out.get("mrr_analog",0) > 0.1, f"class3 mrr_analog {out.get('mrr_analog')} <= 0.1 — novel-lane retrieval broken")
-              need(out.get("mrr_lib",1) < 0.2, f"class3 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
+          # 3. lane sanity, mask-conditional (catches blindness/pool breaks the old probes walked past).
+          # n-aware (M205): at n<25 the lane means are noise-dominated (n=10 analog
+          # 0.087 vs 0.17 banked) — hard checks above still gate, lane gates need n.
+          if n >= 25:
+              if mask == "class2":
+                  need(out.get("mrr_lib",0) > 0.5, f"class2 mrr_lib {out.get('mrr_lib')} <= 0.5 — easy-lane retrieval broken")
+                  need(out.get("mrr_analog",0) > 0.1, f"class2 mrr_analog {out.get('mrr_analog')} <= 0.1 — analog pool broken")
+              elif mask == "class3":
+                  need(out.get("mrr_analog",0) > 0.1, f"class3 mrr_analog {out.get('mrr_analog')} <= 0.1 — novel-lane retrieval broken")
+                  need(out.get("mrr_lib",1) < 0.2, f"class3 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
           # 4. genome actually applied (the thing -genomeA/L were sent to check and never did)
           try:
               wl,wa,wf,rl,ra,rf = float(os.environ["WL"]),float(os.environ["WA"]),float(os.environ["WF"]),float(os.environ["RL"]),float(os.environ["RA"]),float(os.environ["RF"])

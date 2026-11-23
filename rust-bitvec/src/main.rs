@@ -618,6 +618,11 @@ struct EngineReply {
     pools: usize,
     /// v8 rank-1-by-mass: lib-leader |ppm-CENTER|>5.0 && lib<0.9 would swap. Info only.
     mass_swap: bool,
+    /// per-query stage timings ms (measure-first: worker stderr is DEVNULLed
+    /// by the launcher, so timings ride home in the reply and land in logs
+    /// via the Python heartbeat line). 8 stages: parse,qprep,cands,pool,
+    /// funnel,analog,chan,fuse. Observation only — never touches scoring.
+    timing: Vec<f64>,
 }
 
 #[derive(Serialize)]
@@ -1006,6 +1011,19 @@ fn sengine(params: EngineParams) {
                 ranked,
                 pools: pool_idx.len(),
                 mass_swap,
+                // 8 stages, all known before serialization (ser+io stay on the
+                // stderr line only). Order: parse,qprep,cands,pool,funnel,
+                // analog,chan,fuse.
+                timing: vec![
+                    ms(t_parse),
+                    ms(t_qprep - t_parse),
+                    ms(t_cands - t_qprep),
+                    ms(t_pool - t_cands),
+                    ms(t_funnel - t_pool),
+                    ms(t_analog - t_funnel),
+                    ms(t_chan - t_analog),
+                    ms(t_fuse - t_chan),
+                ],
             })
             .unwrap()
         )

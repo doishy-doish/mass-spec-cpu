@@ -292,7 +292,8 @@ def _run_query(task):
             ranked_z = ranked
     line = ("shard " + str(_SE["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
-            + str(hi - lo) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_))
+            + str(hi - lo) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_)
+            + " tm=" + ",".join("%.0f" % t for t in (out.get("timing") or [])))
     print(line, flush=True)  # HEARTBEAT: workers print as they finish
     # GOOD-PROBE: surface the v8 rank-1-by-mass swap signal (was discarded —
     # old probes could never see the mass channel they were sent to check).
