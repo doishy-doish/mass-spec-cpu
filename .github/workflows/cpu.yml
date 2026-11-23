@@ -95,7 +95,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: restore cargo cache (lossless: compiled deps only, no math)
+      - name: "restore cargo cache (lossless, compiled deps only, no math)"
         uses: actions/cache@v4
         with:
           path: |
