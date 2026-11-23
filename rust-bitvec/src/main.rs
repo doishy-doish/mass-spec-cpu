@@ -562,6 +562,9 @@ struct EngineParams {
     /// I6: funnel recall probe — echo first-K pool keys (0 = off).
     #[serde(default = "def0")]
     recall_topk: f64,
+    /// I6: funnel A/B — disable the Jaccard prefilter (0 = funnel on, 1 = off).
+    #[serde(default = "def0")]
+    funnel_off: f64,
 }
 
 impl EngineParams {
@@ -581,6 +584,7 @@ impl EngineParams {
             rout_binw: ROUTER_BINW,
             mass_replace: 0.0,
             recall_topk: 0.0,
+            funnel_off: 0.0,
         }
     }
 }
@@ -972,10 +976,11 @@ fn sengine(params: EngineParams) {
                 }
             }
         }
-        // funnel: jaccard over first-spectrum bits when the pool is big
+        // funnel: jaccard over first-spectrum bits when the pool is big.
+        // funnel_off = 1 disables it (I6 A/B: donor-retention question).
         let t_pool = t0.elapsed();
         let mut pool_idx: Vec<usize> = (0..pool.len()).collect();
-        if pool.len() > FUNNEL_MIN && qc.bits.iter().any(|&w| w != 0) {
+        if pool.len() > FUNNEL_MIN && params.funnel_off < 0.5 && qc.bits.iter().any(|&w| w != 0) {
             let mut scored: Vec<(f64, f64, usize)> = pool
                 .iter()
                 .enumerate()
