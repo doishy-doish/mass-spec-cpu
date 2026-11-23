@@ -20,7 +20,6 @@ import threading
 from bisect import bisect_left, bisect_right
 
 import numpy as np
-import pandas as pd
 
 from . import metric as M
 from . import validation as V
@@ -36,15 +35,40 @@ FUSION_DEFAULTS = {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0, "ra": 1.0,
                    "rout_bin": 0.4, "rout_binw": 0.4}
 
 
-def load_meta(path: str) -> pd.DataFrame:
-    cols = ["inchikey14", "normalized_smiles", "molecular_formula", "precursor_mz",
-            "adduct", "instrument_type", "ionization_mode", "ms2_mzs",
-            "ms2_normalized_intensities", "ingest_lib"]
-    t = pd.read_parquet(path, columns=[c for c in cols])
-    t = t.rename(columns={"inchikey14": "key14", "normalized_smiles": "smiles",
-                          "ms2_mzs": "mzs", "ms2_normalized_intensities": "ints",
-                          "instrument_type": "instrument"})
-    return t.reset_index(drop=True)
+TRAIN_COLS = ["inchikey14", "normalized_smiles", "precursor_mz",
+              "adduct", "instrument_type", "ms2_mzs", "ms2_normalized_intensities"]
+
+
+def load_table(path: str, train: bool = True) -> dict:
+    """Parquet -> table dict of numpy arrays (no pandas anywhere in this path).
+
+    Row order == parquet order, so mask splits stay identical. String columns
+    are coerced with str() (None-safe); ragged peak lists become float64 arrays
+    (None row -> empty, same as the old raw_list behavior).
+    """
+    import pyarrow.parquet as pq
+    cols = TRAIN_COLS if train else ["molecule_id", "precursor_mz", "adduct",
+                                     "ms2_mzs", "ms2_normalized_intensities"]
+    t = pq.read_table(path, columns=cols)
+    n = t.num_rows
+    T = {}
+    if train:
+        T["key14"] = np.array([str(x) for x in t.column("inchikey14").to_pylist()])
+        T["smiles"] = [str(x) for x in t.column("normalized_smiles").to_pylist()]
+        T["instrument"] = np.array([str(x) for x in t.column("instrument_type").to_pylist()])
+    else:
+        T["mid"] = np.array([str(x) for x in t.column("molecule_id").to_pylist()])
+    T["prec"] = np.array([float(x) for x in t.column("precursor_mz").to_pylist()],
+                          dtype=np.float64)
+    T["adduct"] = np.array([str(x) for x in t.column("adduct").to_pylist()])
+    T["mzs"] = [np.empty(0, dtype=np.float64) if v is None
+                else np.ascontiguousarray(v, dtype=np.float64)
+                for v in t.column("ms2_mzs").to_pylist()]
+    T["ints"] = [np.empty(0, dtype=np.float64) if v is None
+                 else np.ascontiguousarray(v, dtype=np.float64)
+                 for v in t.column("ms2_normalized_intensities").to_pylist()]
+    assert len(T["prec"]) == n
+    return T
 
 
 def _mem_state():
@@ -124,61 +148,56 @@ def structs_call(bin_path, ktable, kidx, precs, adducts, queries):
     return json.loads(p.stdout)
 
 
-def raw_list(v):
-    if v is None:
-        return []
-    if isinstance(v, np.ndarray):
-        return [float(x) for x in v.tolist()]
-    return [float(x) for x in v]
-
-
-def build_structs_payload(meta, queries):
+def build_structs_payload(T: dict, queries) -> tuple:
     """Pure builder for one structs round trip (no binary needed, testable)."""
-    lib_keys = meta["key14"].tolist()
+    lib_keys = [str(k) for k in T["key14"].tolist()]
     ukeys = sorted(set(lib_keys))
     kindex = {k: i for i, k in enumerate(ukeys)}
-    sq = [{"qi": int(qi), "prec": float(meta.at[qi, "precursor_mz"]),
-           "adduct": str(meta.at[qi, "adduct"])} for qi in queries]
+    sq = [{"qi": int(qi), "prec": float(T["prec"][int(qi)]),
+           "adduct": str(T["adduct"][int(qi)])} for qi in queries]
     return (ukeys, [kindex[k] for k in lib_keys],
-            [float(x) for x in meta["precursor_mz"].tolist()],
-            [str(x) for x in meta["adduct"].tolist()], sq)
+            [float(x) for x in T["prec"].tolist()],
+            [str(x) for x in T["adduct"].tolist()], sq)
 
 
-def build_engine_query(q, cands, pool_keys, lib_by_key, key2smi, meta, qi,
-                       qnm=None, key2neutral=None):
+def build_engine_query(Tlib: dict, qrec: dict, cand_keys, pool_keys,
+                       lib_by_key: dict, key2smi: dict, key2neutral: dict,
+                       qi: int, qnm=None) -> dict:
     """Pure builder for one sengine query (no binary needed, testable).
 
+    Tlib carries candidate/pool spectra; qrec carries the query's own
+    {mzs, ints, prec} (same table in the run path, test table in predict path).
     qnm/key2neutral carry neutral masses for the v8-mass-lite channel
     (Loop-3 replication, standalone). None-safe: missing -> Rust scores 0.0 ties.
     """
     k2n = key2neutral or {}
+    L = Tlib
     cands_msg = []
-    for _, r in cands.iterrows():
-        k = r["key14"]
-        specs = []
-        for j in lib_by_key.get(k, []):
-            rr = meta.loc[j]
-            specs.append({"mzs": raw_list(rr["mzs"]), "ints": raw_list(rr["ints"]),
-                          "prec": float(rr["precursor_mz"])})
-        cands_msg.append({"key": k, "smiles": key2smi.get(k, ""), "specs": specs,
-                          "neutral": k2n.get(k)})
+    for k in cand_keys:
+        ks = str(k)
+        specs = [{"mzs": L["mzs"][j].tolist(), "ints": L["ints"][j].tolist(),
+                  "prec": float(L["prec"][j])} for j in lib_by_key.get(ks, [])]
+        nk = k2n.get(ks)
+        cands_msg.append({"key": ks, "smiles": key2smi.get(ks, ""), "specs": specs,
+                          "neutral": (None if nk is None else float(nk))})
     pool_msg = []
     for k in pool_keys:
-        j0 = lib_by_key.get(k, [None])[0]
-        if j0 is None:
+        ks = str(k)
+        js = lib_by_key.get(ks)
+        if not js:
             continue
-        rr = meta.loc[j0]
-        pool_msg.append({"key": k, "smiles": key2smi.get(k, ""),
-                         "mzs": raw_list(rr["mzs"]), "ints": raw_list(rr["ints"]),
-                         "prec": float(rr["precursor_mz"])})
-    return {"q": {"mzs": raw_list(q["mzs"]), "ints": raw_list(q["ints"]),
-                  "prec": float(q["precursor_mz"])},
+        j0 = js[0]
+        pool_msg.append({"key": ks, "smiles": key2smi.get(ks, ""),
+                         "mzs": L["mzs"][j0].tolist(), "ints": L["ints"][j0].tolist(),
+                         "prec": float(L["prec"][j0])})
+    qm = [float(x) for x in np.ascontiguousarray(qrec["mzs"], dtype=np.float64).tolist()]
+    qi_ = [float(x) for x in np.ascontiguousarray(qrec["ints"], dtype=np.float64).tolist()]
+    return {"q": {"mzs": qm, "ints": qi_, "prec": float(qrec["prec"])},
             "cands": cands_msg, "pool": pool_msg, "qi": int(qi),
-            "qnm": qnm}
+            "qnm": (None if qnm is None else float(qnm))}
 
 
 _SE = {}
-_SE_META = None
 
 
 def _worker():
@@ -194,41 +213,42 @@ def _run_query(task):
     """One query end-to-end. Reads only _SE + engine worker; never raises."""
     qpos, qi, total = task
     V_ = _SE["variants"]
-    q = _SE["meta"].loc[qi]
-    qnm = _SE["qnm"].get(int(qi))
+    T = _SE["table"]
+    qi = int(qi)
+    qnm = _SE["qnm"].get(qi)
     if qnm is None:
         return None
     tol = qnm * _SE["ppm"] * 1e-6
     lo = np.searchsorted(_SE["masses"], qnm - tol)
     hi = np.searchsorted(_SE["masses"], qnm + tol, side="right")
-    cands = _SE["struct_m"].iloc[lo:hi]
-    if not len(cands):
+    if hi <= lo:
         return None
-    cand_keys = set(cands["key14"])
+    cand_keys = [str(k) for k in _SE["skeys"][lo:hi].tolist()]
+    cand_set = set(cand_keys)
     # analog pool: precursor +-50 Da library window, excluding candidates,
     # nearest-first (mirrors the old bisect + dist sort; engine funnels it)
     precs = _SE["lib_precs"]
     pkeys = _SE["lib_pkeys"]
-    prec_q = float(q["precursor_mz"])
+    prec_q = float(T["prec"][qi])
     plo = bisect_left(precs, prec_q - 50.0)
     phi = bisect_right(precs, prec_q + 50.0, lo=plo)
     near = []
     for idx in range(plo, phi):
         k = pkeys[idx]
-        if k in cand_keys:
+        if k in cand_set:
             continue
         near.append((abs(precs[idx] - prec_q), k))
     near.sort(key=lambda t: t[0])
     pool_keys = [k for _, k in near[:1500]]
-    qmsg = build_engine_query(q, cands, pool_keys, _SE["lib_by_key"],
-                              _SE["key2smi"], _SE["meta"], qi,
-                              qnm, _SE.get("key2neutral"))
+    qrec = {"mzs": T["mzs"][qi], "ints": T["ints"][qi], "prec": prec_q}
+    qmsg = build_engine_query(T, qrec, cand_keys, pool_keys, _SE["lib_by_key"],
+                              _SE["key2smi"], _SE.get("key2neutral"), qi, qnm)
     try:
         out = _worker().query(qmsg)
     except Exception as e:
         print("sengine failed on q=" + str(qi) + " (" + str(e)[:120] + "), skipping", flush=True)
         return None
-    truth = q["key14"]
+    truth = str(T["key14"][qi])
     row = {}
     ranked_z = None
     for v in V_:
@@ -238,11 +258,11 @@ def _run_query(task):
             ranked_z = ranked
     line = ("shard " + str(_SE["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
-            + str(len(cands)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_))
+            + str(hi - lo) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_))
     print(line, flush=True)  # HEARTBEAT: workers print as they finish
     # GOOD-PROBE: surface the v8 rank-1-by-mass swap signal (was discarded —
     # old probes could never see the mass channel they were sent to check).
-    return (qi, row, len(cands), ranked_z, line, bool(out.get("mass_swap", False)))
+    return (qi, row, hi - lo, ranked_z, line, bool(out.get("mass_swap", False)))
 
 
 def main() -> None:
@@ -285,30 +305,38 @@ def main() -> None:
         tail2 = stem + a.out_suffix + dot + ext if dot else tail + a.out_suffix
         out_path = head + sep + tail2 if sep else tail2
 
-    meta = load_meta(a.data)
-    pool = V.query_pool(meta).index.tolist()
-    counts = meta["key14"].value_counts()
+    T = load_table(a.data, train=True)
+    pool = V.query_pool(T).tolist()
     if a.mask == "class2":
-        library, queries, _ = V.split_class2(meta, pool, counts, a.n, a.seed)
+        library, queries, _ = V.split_class2(T, pool, a.n, a.seed)
     elif a.mask == "class3":
-        library, queries, _ = V.split_class3(meta, pool, a.n, a.seed)
+        library, queries, _ = V.split_class3(T, pool, a.n, a.seed)
     else:
-        library, queries, _ = V.split_cross_instrument(meta, pool, a.n, a.seed)
+        library, queries, _ = V.split_cross_instrument(T, pool, a.n, a.seed)
     # one structs round trip: neutrals for the pool + qnm per query
-    ukeys, kidx, precs, adducts, sq = build_structs_payload(meta, queries)
+    ukeys, kidx, precs, adducts, sq = build_structs_payload(T, queries)
     st = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, sq)
     neutrals = st["neutrals"]
     qnm = {int(qi): v for qi, v in st["qnm"] if v is not None}
-    struct_m = pd.DataFrame([{"key14": k, "neutral": neutrals[k]} for k in neutrals])
-    struct_m = struct_m.sort_values("neutral").reset_index(drop=True)
-    masses = struct_m["neutral"].to_numpy()
+    # struct arrays, stable-sorted by neutral (deterministic tie order)
+    skeys_all = np.array(ukeys)
+    sneu_all = np.array([float(neutrals[k]) for k in ukeys], dtype=np.float64)
+    sord = np.argsort(sneu_all, kind="stable")
+    skeys, masses = skeys_all[sord], sneu_all[sord]
 
-    lib_by_key: dict = {}
-    for idx in library:
-        lib_by_key.setdefault(meta.at[idx, "key14"], []).append(int(idx))
-    key2smi: dict = {}
-    for k, g in meta.groupby("key14"):
-        key2smi.setdefault(k, str(g["smiles"].iloc[0]))
+    # lib_by_key, fully vectorized (no per-row .at loop over ~2.5M rows)
+    codes, inv = np.unique(T["key14"], return_inverse=True)
+    lib_arr = np.asarray(library, dtype=np.int64)
+    lib_by_key = {}
+    if len(lib_arr):
+        srt = np.argsort(inv[lib_arr], kind="stable")
+        sk = inv[lib_arr][srt]
+        bounds = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1], True])
+        for b, e in zip(bounds[:-1], bounds[1:]):
+            lib_by_key[str(codes[sk[b]])] = lib_arr[srt[b:e]].tolist()
+    # key2smi: first occurrence per key (matches groupby().iloc[0])
+    _, fidx = np.unique(inv, return_index=True)
+    key2smi = {str(codes[inv[i]]): str(T["smiles"][int(i)]) for i in fidx}
 
     # SNAKE-DRAFT: balance shards by ppm pool size (slowest shard = fleet wall)
     if a.shards > 1 and len(queries) > 1:
@@ -334,19 +362,17 @@ def main() -> None:
         queries = queries[a.shard::a.shards]
 
     # analog-pool lookup array: precursor-sorted first-spectrum per library key
-    _prec_pairs = []
-    for k, js in lib_by_key.items():
-        j0 = js[0]
-        _prec_pairs.append((float(meta.at[j0, "precursor_mz"]), k))
+    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items()]
     _prec_pairs.sort(key=lambda t: t[0])
     lib_precs = [p for p, _ in _prec_pairs]
     lib_pkeys = [k for _, k in _prec_pairs]
 
-    key2neutral = dict(zip(struct_m["key14"].tolist(), struct_m["neutral"].tolist()))
+    key2neutral = {str(k): float(v) for k, v in zip(skeys.tolist(), masses.tolist())}
     fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw}
-    _SE.update(meta=meta, struct_m=struct_m, masses=masses, key2neutral=key2neutral,
+    _SE.update(table=T, skeys=np.array([str(k) for k in skeys.tolist()]),
+               masses=masses, key2neutral=key2neutral,
                fusion=fusion,
                lib_by_key=lib_by_key,
                lib_precs=lib_precs, lib_pkeys=lib_pkeys,

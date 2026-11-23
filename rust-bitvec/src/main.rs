@@ -37,6 +37,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
+#[allow(dead_code)]
+mod boundary;
+
 // spectrum binary channel (unchanged math, validated bit-exact vs Python)
 const QNBITS: u64 = 4096;
 const KNUTH: u64 = 2654435761;
@@ -60,7 +63,14 @@ const ROUTER_BIN: f64 = 0.4;
 const ROUTER_BINW: f64 = 0.4;
 const CASCADE_Z: f64 = 3.0;
 const TOP_K_OUT: usize = 25;
-const VARIANTS: [&str; 15] = [
+/// Cross-query prepared-spectra cache: same library spectra repeat across
+/// queries (pools overlap heavily), but each query used to re-prepare every
+/// candidate + pool spectrum from scratch. Key (key, pos) is a sound
+/// identity: per-key spec order is deterministic within a run (stable index
+/// build), and the pool takes position 0. Bounded: spectra are ~2KB, so the
+/// cap is ~100MB per worker; on overflow the cache clears (correct, just
+/// recompute churn — tuning owed per the MASS-DEATHS lesson).
+const PREP_CACHE_CAP: usize = 50_000;const VARIANTS: [&str; 15] = [
     "lib", "analog", "frag", "bin", "binw", "stein", "mass", "z", "rrf", "rrfb", "cascade", "router",
     "zw", "rrfw", "pure",
 ];
@@ -197,16 +207,20 @@ fn qbin(mz: f64, q: f64) -> u64 {
     ((mz / q).round() as i64 as u64) & 0xFFFF_FFFF
 }
 
-/// Cleaned spectrum + every derived layer. Built once per spectrum per query.
+/// Cleaned spectrum + every derived layer.
+#[derive(Clone)]
 struct CSpectra {
     mz: Vec<f64>,
     w: Vec<f64>,
     prec: f64,
     norm: f64,
     sw: Vec<f64>,
-    snorm: f64,
+    snorm: Vec<f64>,
     bits: [u64; 64],
     wb: Vec<(u16, f32)>,
+    /// Neutral-loss set, precomputed once per spectrum (the frag channel used
+    /// to rebuild it per candidate spec per query — same inputs, same output).
+    floss: Vec<f64>,
 }
 
 fn prepare(mzs: &[f64], ints: &[f64], prec: f64, qpeak: f64, qloss: f64) -> CSpectra {
@@ -236,7 +250,8 @@ fn prepare(mzs: &[f64], ints: &[f64], prec: f64, qpeak: f64, qloss: f64) -> CSpe
         bits[i / 64] |= 1u64 << (i % 64);
     }
     let wb = build_w(&pb, &pw, &lb, &lw);
-    CSpectra { mz, w, prec, norm, sw, snorm, bits, wb }
+    let floss = loss_set(&mz, prec);
+    CSpectra { mz, w, prec, norm, sw, snorm, bits, wb, floss }
 }
 
 fn match_dot(amz: &[f64], ai: &[f64], bmz: &[f64], bi: &[f64], delta: f64, tol: f64) -> f64 {
@@ -387,10 +402,33 @@ fn rank_min_desc(vals: &[f64]) -> Vec<f64> {
     out
 }
 
+/// Strict "a ranks before b" (NaN last, ties false so equal scores keep
+/// candidate order). Exactly the comparator inside order_desc, factored out.
+fn less_desc(a: f64, b: f64) -> bool {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => false,
+        (true, false) => false,
+        (false, true) => true,
+        (false, false) => a > b,
+    }
+}
+
 /// Stable order by score desc, NaN last, ties keep candidate order
 /// (documents the pandas-quicksort tie difference; gate absorbs).
 fn order_desc(vals: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..vals.len()).collect();
+    if vals.len() <= 32 {
+        // insertion sort: at tiny n it beats the general sort's setup cost,
+        // and with a strict comparator it is stable — same order, bit for bit.
+        for i in 1..idx.len() {
+            let mut j = i;
+            while j > 0 && less_desc(vals[idx[j]], vals[idx[j - 1]]) {
+                idx.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        return idx;
+    }
     idx.sort_by(|&a, &b| {
         let (va, vb) = (vals[a], vals[b]);
         match (va.is_nan(), vb.is_nan()) {
@@ -598,28 +636,28 @@ fn fuse_rank(
     fw: &EngineParams,
 ) -> HashMap<String, Vec<String>> {
     let n = keys.len();
-    let get = |c: &str| -> Vec<f64> {
-        cols.get(c)
-            .map(|v| v.clone())
-            .unwrap_or_else(|| vec![f64::NAN; n])
-    };
-    let lib = get("lib");
-    let analog = get("analog");
-    let frag = get("frag");
-    let bin = get("bin");
-    let binw = get("binw");
-    let stein = get("stein"); // standalone (Loop-2 replication): ranked, NOT fused yet
-    let mass = get("mass"); // standalone (Loop-3 v8-mass-lite): ranked, NOT fused yet
+    // borrow channels in place (was: one Vec clone per channel here, plus
+    // another per rrf/rrfb/rrfw call below). Missing channel == all-NaN,
+    // exactly like the old fallback.
+    let nan = vec![f64::NAN; n];
+    let col = |c: &str| -> &[f64] { cols.get(c).map(Vec::as_slice).unwrap_or(&nan) };
+    let lib = col("lib");
+    let analog = col("analog");
+    let frag = col("frag");
+    let bin = col("bin");
+    let binw = col("binw");
+    let stein = col("stein"); // standalone (Loop-2 replication): ranked, NOT fused yet
+    let mass = col("mass"); // standalone (Loop-3 v8-mass-lite): ranked, NOT fused yet
     let z_of = |xs: &[f64]| -> Vec<f64> {
         let mean = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
         let s = sample_std(xs, mean) + 1e-9;
         xs.iter().map(|&x| (x - mean) / s).collect()
     };
-    let libz = z_of(&lib);
-    let analogz = z_of(&analog);
-    let fragz = z_of(&frag);
-    let steinz = z_of(&stein);
-    let massz = z_of(&mass);
+    let libz = z_of(lib);
+    let analogz = z_of(analog);
+    let fragz = z_of(frag);
+    let steinz = z_of(stein);
+    let massz = z_of(mass);
     // pure (pure-algo canary v0): equal-weight z of stein + frag + mass.
     // All three already exist as standalone channels; this only fuses them.
     // Predicted class2 N=10: lands between frag and stein (~0.7-0.8); measures
@@ -663,17 +701,24 @@ fn fuse_rank(
             s
         })
         .collect();
-    let rrf_of = |channels: &[Vec<f64>]| -> Vec<f64> {
-        let ranks: Vec<Vec<f64>> = channels.iter().map(|c| rank_min_desc(c)).collect();
+    // ranks computed ONCE per channel and shared by rrf/rrfb/rrfw (the old
+    // code re-ranked lib/analog/frag three times each — same inputs, so the
+    // shared ranks are bit-identical, at ~1/3 the rank cost).
+    let rlib = rank_min_desc(lib);
+    let rana = rank_min_desc(analog);
+    let rfrag = rank_min_desc(frag);
+    let rbin = rank_min_desc(bin);
+    let rrf_of = |ranks: &[&[f64]], ws: &[f64]| -> Vec<f64> {
         (0..n)
             .map(|i| {
                 ranks
                     .iter()
-                    .map(|r| {
+                    .zip(ws.iter())
+                    .map(|(r, w)| {
                         if r[i].is_nan() {
                             f64::NAN
                         } else {
-                            1.0 / (RRF_BASE + r[i])
+                            w / (RRF_BASE + r[i])
                         }
                     })
                     .filter(|x| !x.is_nan())
@@ -681,32 +726,10 @@ fn fuse_rank(
             })
             .collect()
     };
-    let rrf = rrf_of(&[lib.clone(), analog.clone(), frag.clone()]);
-    let rrfb = rrf_of(&[lib.clone(), analog.clone(), frag.clone(), bin.clone()]);
+    let rrf = rrf_of(&[&rlib, &rana, &rfrag], &[1.0, 1.0, 1.0]);
+    let rrfb = rrf_of(&[&rlib, &rana, &rfrag, &rbin], &[1.0, 1.0, 1.0, 1.0]);
     // rrfw: weighted RRF (genome rl/ra/rf; neutral 1.0 == rrf bit-identically)
-    let rrfw = {
-        let ranks: Vec<Vec<f64>> = [lib.clone(), analog.clone(), frag.clone()]
-            .iter()
-            .map(|c| rank_min_desc(c))
-            .collect();
-        let ws = [fw.rl, fw.ra, fw.rf];
-        (0..n)
-            .map(|i| {
-                ranks
-                    .iter()
-                    .enumerate()
-                    .map(|(k, r)| {
-                        if r[i].is_nan() {
-                            f64::NAN
-                        } else {
-                            ws[k] / (RRF_BASE + r[i])
-                        }
-                    })
-                    .filter(|x| !x.is_nan())
-                    .sum()
-            })
-            .collect()
-    };
+    let rrfw = rrf_of(&[&rlib, &rana, &rfrag], &[fw.rl, fw.ra, fw.rf]);
     let max_skipnan = |xs: &[f64]| -> f64 {
         xs.iter()
             .filter(|&&x| !x.is_nan())
@@ -721,27 +744,29 @@ fn fuse_rank(
     let overlap = max_skipnan(&lib) > fw.rout_lib
         || max_skipnan(&bin) > fw.rout_bin
         || max_skipnan(&binw) > fw.rout_binw;
-    let router = if overlap { cascade.clone() } else { analog.clone() };
+    let router = if overlap { cascade.clone() } else { analog.to_vec() };
     let mut out = HashMap::new();
-    let named: Vec<(&str, Vec<f64>)> = vec![
+    // borrows, not clones: every output here is read-only from here on
+    // (was: a Vec clone per channel, including a redundant mass.clone()).
+    let named: Vec<(&str, &[f64])> = vec![
         ("lib", lib),
         ("analog", analog),
         ("frag", frag),
         ("bin", bin),
         ("binw", binw),
         ("stein", stein),
-        ("mass", mass.clone()),
-        ("z", z),
-        ("rrf", rrf),
-        ("rrfb", rrfb),
-        ("cascade", cascade),
-        ("router", router),
-        ("zw", zw),
-        ("rrfw", rrfw),
-        ("pure", pure),
+        ("mass", mass),
+        ("z", &z),
+        ("rrf", &rrf),
+        ("rrfb", &rrfb),
+        ("cascade", &cascade),
+        ("router", &router),
+        ("zw", &zw),
+        ("rrfw", &rrfw),
+        ("pure", &pure),
     ];
     for (name, vals) in named {
-        let kv: Vec<String> = order_desc(&vals)
+        let kv: Vec<String> = order_desc(vals)
             .into_iter()
             .take(TOP_K_OUT)
             .map(|i| keys[i].clone())
@@ -792,6 +817,9 @@ fn sengine(params: EngineParams) {
     // Correctness: fp depends only on smiles, which is fixed per key.
     // If a key ever arrives with a different smiles, first-wins (data keys are stable).
     let mut fp_cache: HashMap<String, [u64; 32]> = HashMap::new();
+    // prepared spectra are covered by PREP_CACHE_CAP (see const): same
+    // (key, pos) pairs repeat across queries, so hits skip prepare() whole.
+    let mut prep_cache: HashMap<(String, usize), CSpectra> = HashMap::new();
     for line in lines {
         let line = line.expect("sengine: read");
         if line.trim().is_empty() {
@@ -810,7 +838,19 @@ fn sengine(params: EngineParams) {
             let specs = c
                 .specs
                 .iter()
-                .map(|s| prepare(&s.mzs, &s.ints, s.prec, params.qpeak, params.qloss))
+                .enumerate()
+                .map(|(pi, s)| {
+                    let ck = (c.key.clone(), pi);
+                    if let Some(hit) = prep_cache.get(&ck) {
+                        return hit.clone();
+                    }
+                    let cs = prepare(&s.mzs, &s.ints, s.prec, params.qpeak, params.qloss);
+                    if prep_cache.len() > PREP_CACHE_CAP {
+                        prep_cache.clear();
+                    }
+                    prep_cache.insert(ck, cs.clone());
+                    cs
+                })
                 .collect();
             cands.push(CandData {
                 key: c.key.clone(),
@@ -822,7 +862,19 @@ fn sengine(params: EngineParams) {
         // pool (input order = distance order from the launcher; keep it)
         let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(q.pool.len());
         for p in &q.pool {
-            let s = prepare(&p.mzs, &p.ints, p.prec, params.qpeak, params.qloss);
+            // pool first-spectrum == candidate position 0 for the same key,
+            // so pool hits share the candidate cache entries.
+            let ck = (p.key.clone(), 0usize);
+            let s = if let Some(hit) = prep_cache.get(&ck) {
+                hit.clone()
+            } else {
+                let cs = prepare(&p.mzs, &p.ints, p.prec, params.qpeak, params.qloss);
+                if prep_cache.len() > PREP_CACHE_CAP {
+                    prep_cache.clear();
+                }
+                prep_cache.insert(ck, cs.clone());
+                cs
+            };
             let fp = *fp_cache
                 .entry(p.key.clone())
                 .or_insert_with(|| morgan_bits_2048(&p.smiles));
@@ -860,11 +912,15 @@ fn sengine(params: EngineParams) {
         }
         hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         hits.truncate(TOP_N_ANALOG);
-        // channels per candidate
-        let mut cols: HashMap<String, Vec<f64>> = HashMap::new();
-        for name in VARIANTS {
-            cols.insert(name.to_string(), Vec::with_capacity(cands.len()));
-        }
+        // channels per candidate, accumulated in locals then inserted once
+        // (was: a HashMap lookup per channel per candidate).
+        let mut vlib: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vanalog: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vfrag: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vbin: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vbinw: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vstein: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vmass: Vec<f64> = Vec::with_capacity(cands.len());
         for c in &cands {
             let mut lib = 0.0;
             let mut stein = 0.0;
@@ -885,8 +941,7 @@ fn sengine(params: EngineParams) {
             }
             let mut frag = 0.0;
             for s in c.specs.iter().take(2) {
-                let fl = loss_set(&s.mz, s.prec);
-                let v = overlap_count(&qloss, &fl) as f64 / qn;
+                let v = overlap_count(&qloss, &s.floss) as f64 / qn;
                 if v > frag {
                     frag = v;
                 }
@@ -906,14 +961,22 @@ fn sengine(params: EngineParams) {
                     stein = st;
                 }
             }
-            cols.get_mut("lib").unwrap().push(lib);
-            cols.get_mut("analog").unwrap().push(analog);
-            cols.get_mut("frag").unwrap().push(frag);
-            cols.get_mut("bin").unwrap().push(bscore);
-            cols.get_mut("binw").unwrap().push(bwscore);
-            cols.get_mut("stein").unwrap().push(stein);
-            cols.get_mut("mass").unwrap().push(mass_score(q.qnm, c.neutral));
+            vlib.push(lib);
+            vanalog.push(analog);
+            vfrag.push(frag);
+            vbin.push(bscore);
+            vbinw.push(bwscore);
+            vstein.push(stein);
+            vmass.push(mass_score(q.qnm, c.neutral));
         }
+        let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(VARIANTS.len() * 2);
+        cols.insert("lib".to_string(), vlib);
+        cols.insert("analog".to_string(), vanalog);
+        cols.insert("frag".to_string(), vfrag);
+        cols.insert("bin".to_string(), vbin);
+        cols.insert("binw".to_string(), vbinw);
+        cols.insert("stein".to_string(), vstein);
+        cols.insert("mass".to_string(), vmass);
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
         let ranked = fuse_rank(&keys, &cols, &params);
         let neutrals: Vec<Option<f64>> = q.cands.iter().map(|c| c.neutral).collect();

@@ -13,7 +13,6 @@ import os
 from bisect import bisect_left, bisect_right
 
 import numpy as np
-import pandas as pd
 
 from . import metric as M
 from . import run as R
@@ -35,12 +34,12 @@ def aggregate(ranked_lists: list, k: int = 25) -> list:
     return sorted(score, key=lambda kk: -score[kk])[:k]
 
 
-def rank_spectrum(q, cands, pool_keys, lib_by_key, key2smi, engine,
-                  qnm=None, key2neutral=None):
+def rank_spectrum(Tlib, qrec, cand_keys, pool_keys, lib_by_key, key2smi,
+                  engine, qi, qnm=None, key2neutral=None):
     """One test spectrum -> top-25 keys by the engine's rrf fusion."""
-    out = engine.query(R.build_engine_query(q, cands, pool_keys, lib_by_key,
-                                            key2smi, R._SE_META, -1,
-                                            qnm, key2neutral))
+    out = engine.query(R.build_engine_query(Tlib, qrec, cand_keys, pool_keys,
+                                            lib_by_key, key2smi,
+                                            key2neutral or {}, qi, qnm))
     return out["ranked"]["rrf"][:25]
 
 
@@ -84,37 +83,39 @@ def main() -> None:
         else:
             a.out = "results/predict.json"
 
-    train = R.load_meta(a.train)
-    R._SE_META = train
-    ukeys = sorted(set(train["key14"].tolist()))
+    T = R.load_table(a.train, train=True)
+    ukeys = sorted(set(str(k) for k in T["key14"].tolist()))
     kindex = {k: i for i, k in enumerate(ukeys)}
     st = R.structs_call(a.rust_bin, ukeys,
-                        [kindex[k] for k in train["key14"].tolist()],
-                        [float(x) for x in train["precursor_mz"].tolist()],
-                        [str(x) for x in train["adduct"].tolist()], [])
-    struct_m = pd.DataFrame([{"key14": k, "neutral": st["neutrals"][k]}
-                             for k in st["neutrals"]]).sort_values("neutral").reset_index(drop=True)
-    masses = struct_m["neutral"].to_numpy()
-    lib_by_key: dict = {}
-    for idx in train.index:
-        lib_by_key.setdefault(train.at[idx, "key14"], []).append(int(idx))
-    _pairs = []
-    for k, js in lib_by_key.items():
-        _pairs.append((float(train.at[js[0], "precursor_mz"]), k))
-    _pairs.sort(key=lambda t: t[0])
-    lib_precs = [p for p, _ in _pairs]
-    lib_pkeys = [k for _, k in _pairs]
-    key2smi: dict = {}
-    for k, g in train.groupby("key14"):
-        key2smi.setdefault(k, str(g["smiles"].iloc[0]))
-    key2neutral = dict(zip(struct_m["key14"].tolist(), struct_m["neutral"].tolist()))
+                        [kindex[k] for k in [str(x) for x in T["key14"].tolist()]],
+                        [float(x) for x in T["prec"].tolist()],
+                        [str(x) for x in T["adduct"].tolist()], [])
+    skeys_all = np.array(ukeys)
+    sneu_all = np.array([float(st["neutrals"][k]) for k in ukeys], dtype=np.float64)
+    sord = np.argsort(sneu_all, kind="stable")
+    skeys, masses = skeys_all[sord], sneu_all[sord]
+    codes, inv = np.unique(T["key14"], return_inverse=True)
+    lib_arr = np.arange(len(T["key14"]), dtype=np.int64)
+    srt = np.argsort(inv[lib_arr], kind="stable")
+    sk = inv[lib_arr][srt]
+    bounds = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1], True])
+    lib_by_key = {}
+    for b, e in zip(bounds[:-1], bounds[1:]):
+        lib_by_key[str(codes[sk[b]])] = lib_arr[srt[b:e]].tolist()
+    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items()]
+    _prec_pairs.sort(key=lambda t: t[0])
+    lib_precs = [p for p, _ in _prec_pairs]
+    lib_pkeys = [k for _, k in _prec_pairs]
+    _, fidx = np.unique(inv, return_index=True)
+    key2smi = {str(codes[inv[int(i)]]): str(T["smiles"][int(i)]) for i in fidx}
+    key2neutral = {str(k): float(v) for k, v in zip(skeys.tolist(), masses.tolist())}
     engine = R._Engine(a.rust_bin, a.qpeak, a.qloss)
 
     def pool(qnm: float, ppm: float):
         tol = qnm * ppm * 1e-6
         lo = np.searchsorted(masses, qnm - tol)
         hi = np.searchsorted(masses, qnm + tol, side="right")
-        return struct_m.iloc[lo:hi]
+        return [str(k) for k in skeys[lo:hi].tolist()]
 
     def pool50(prec_q: float, cand_keys: set):
         lo = bisect_left(lib_precs, prec_q - 50.0)
@@ -128,31 +129,34 @@ def main() -> None:
         near.sort(key=lambda t: t[0])
         return [k for _, k in near[:1500]]
 
-    test = pd.read_parquet(a.test)
-    test = test.rename(columns={"ms2_mzs": "mzs",
-                                "ms2_normalized_intensities": "ints"})
+    Q = R.load_table(a.test, train=False)
     rows = []
-    for mid, g in test.groupby("molecule_id"):
+    for mid in np.unique(Q["mid"]).tolist():
+        mid = str(mid)
         # one structs round trip for the molecule's neutral masses
-        sq = [{"qi": int(i), "prec": float(r["precursor_mz"]), "adduct": str(r["adduct"])}
-              for i, r in enumerate(g.itertuples())]
+        gidx = np.flatnonzero(Q["mid"] == mid)
+        sq = [{"qi": int(pos), "prec": float(Q["prec"][int(i)]),
+               "adduct": str(Q["adduct"][int(i)])} for pos, i in enumerate(gidx)]
         st2 = R.structs_call(a.rust_bin, [], [], [], [], sq)
         qnm_map = {int(qi): v for qi, v in st2["qnm"] if v is not None}
         narrow, wide_lists = [], []
-        for pos, (_, q) in enumerate(g.iterrows()):
+        for pos, i in enumerate(gidx):
+            i = int(i)
             qnm = qnm_map.get(pos)
             if not qnm:
                 continue
+            qrec = {"mzs": Q["mzs"][i], "ints": Q["ints"][i],
+                    "prec": float(Q["prec"][i])}
             cn = pool(qnm, a.ppm)
             if len(cn):
-                narrow.append(rank_spectrum(q, cn, pool50(float(q["precursor_mz"]),
-                                            set(cn["key14"])), lib_by_key, key2smi, engine,
-                                            qnm, key2neutral))
+                narrow.append(rank_spectrum(T, qrec, cn, pool50(float(Q["prec"][i]),
+                                            set(cn)), lib_by_key, key2smi, engine,
+                                            i, qnm, key2neutral))
             cw = pool(qnm, a.wide)
             if len(cw):
-                wide_lists.append(rank_spectrum(q, cw, pool50(float(q["precursor_mz"]),
-                                               set(cw["key14"])), lib_by_key, key2smi, engine,
-                                               qnm, key2neutral))
+                wide_lists.append(rank_spectrum(T, qrec, cw, pool50(float(Q["prec"][i]),
+                                                set(cw)), lib_by_key, key2smi, engine,
+                                                i, qnm, key2neutral))
         top = aggregate(narrow)
         if len(top) < 25:
             for k_ in aggregate(wide_lists):
@@ -162,7 +166,7 @@ def main() -> None:
                     break
         cells = [key2smi[k_] for k_ in top[:25] if k_ in key2smi]
         rows.append([str(mid), ";".join(cells)])
-        print(f"{mid} spectra={len(g)} guesses={len(cells)}", flush=True)
+        print(f"{mid} spectra={len(gidx)} guesses={len(cells)}", flush=True)
     if a.out:
         with open(a.out, "w") as f:
             json.dump({"n": len(rows), "rows": rows}, f)

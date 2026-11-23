@@ -1,6 +1,4 @@
 """Aggregation + submission-format tests (no engine, no data files)."""
-import pandas as pd
-
 from mscpu.metric import validate_submission
 from mscpu.predict import aggregate
 
