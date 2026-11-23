@@ -110,6 +110,7 @@ def build_arrays(table) -> dict:
     in_of = {t: i for i, t in enumerate(insts)}
 
     mz_off = np.empty(n + 1, dtype=np.int64)
+    mz_off[0] = 0
     mz_parts: list = []
     int_parts: list = []
     off = 0
