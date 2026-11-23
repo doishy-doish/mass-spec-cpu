@@ -23,6 +23,7 @@ import numpy as np
 
 from . import metric as M
 from . import validation as V
+from . import input_plugs as IP
 
 VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure"]
 
@@ -336,6 +337,12 @@ def select_task(task):
         near.append((abs(precs[idx] - prec_q), k))
     near.sort(key=lambda t: t[0])
     pool_keys = [k for _, k in near[:1500]]
+    if _SE.get("inst_bonus"):
+        try:
+            pool_keys = IP.pool_rerank_by_instrument(
+                pool_keys, _SE.get("key2inst") or {}, _SE.get("qinst", {}).get(qi, ""))
+        except Exception:
+            pass
     tsel = (time.perf_counter() - t0) * 1000.0
     return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel)
 
@@ -409,6 +416,15 @@ def main() -> None:
     ap.add_argument("--rout-lib", type=float, default=0.5)
     ap.add_argument("--rout-bin", type=float, default=0.4)
     ap.add_argument("--rout-binw", type=float, default=0.4)
+    # I6 input plugs (all legacy-default OFF: 0 = old path byte-for-byte).
+    ap.add_argument("--inst-bonus", type=int, default=0,
+                    help="1 = re-rank analog pool with instrument-family matches first")
+    ap.add_argument("--adduct-retry", type=int, default=0,
+                    help="1 = second structs pass for queries with no neutral mass (neighbor adducts)")
+    ap.add_argument("--mass-replace", type=int, default=0,
+                    help="1 = v8 rank-1-by-mass replace at assemble (engine follow-up; helper stub-green)")
+    ap.add_argument("--formula-ppm", type=float, default=0.0,
+                    help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--out-suffix", default="",
                     help="inserted before the extension of --out, e.g. '-binwprobe'; "
@@ -446,6 +462,29 @@ def main() -> None:
     st = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, sq)
     neutrals = st["neutrals"]
     qnm = {int(qi): v for qi, v in st["qnm"] if v is not None}
+    # I6 adduct retry (zero-score-only): one extra structs pass for queries
+    # with no neutral mass, using the first neighbor adduct frame. Merges in
+    # only where the first pass failed, so the default path is untouched.
+    if a.adduct_retry:
+        _failed = [int(qi) for qi in queries if qnm.get(int(qi)) is None]
+        if _failed:
+            try:
+                _sq2 = []
+                for _qi in _failed:
+                    _orig = str(T["adduct"][int(_qi)])
+                    _nbs = IP.adduct_neighbors(_orig)
+                    _alt = _nbs[1] if len(_nbs) > 1 else _orig
+                    _sq2.append({"qi": int(_qi), "prec": float(T["prec"][int(_qi)]),
+                                 "adduct": _alt})
+                _st2 = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, _sq2)
+                for _qi, _v in _st2.get("qnm", []):
+                    if qnm.get(int(_qi)) is None and _v is not None:
+                        qnm[int(_qi)] = _v
+                print("adduct-retry rescued=" + str(sum(1 for _qi in _failed
+                      if qnm.get(int(_qi)) is not None)) + "/" + str(len(_failed)),
+                      flush=True)
+            except Exception as _e:
+                print("adduct-retry skipped (" + str(_e)[:120] + ")", flush=True)
     # struct arrays, stable-sorted by neutral (deterministic tie order).
     # M198: structs emits null for keys with no known-adduct spectra — NaN
     # sorts last and matches no ppm window (honest exclusion, never KeyError).
@@ -470,6 +509,8 @@ def main() -> None:
     # key2smi: first occurrence per key (matches groupby().iloc[0])
     _, fidx = np.unique(inv, return_index=True)
     key2smi = {str(codes[inv[i]]): str(T["smiles"][int(i)]) for i in fidx}
+    # I6: first-occurrence instrument per key + per-query instrument (pool re-rank only).
+    key2inst = {str(codes[inv[i]]): str(T["instrument"][int(i)]) for i in fidx}
 
     # SNAKE-DRAFT: balance shards by ppm pool size (slowest shard = fleet wall)
     if a.shards > 1 and len(queries) > 1:
@@ -516,6 +557,12 @@ def main() -> None:
                qints={qi: T["ints"][qi] for qi in qset},
                qprec={qi: float(T["prec"][qi]) for qi in qset},
                qkey={qi: str(T["key14"][qi]) for qi in qset},
+               qinst={qi: str(T["instrument"][qi]) for qi in qset},
+               key2inst=key2inst,
+               inst_bonus=bool(a.inst_bonus),
+               adduct_retry=bool(a.adduct_retry),
+               mass_replace=bool(a.mass_replace),
+               formula_ppm=float(a.formula_ppm or 0.0),
                shard=a.shard, variants=VARIANTS)
     # two-phase selection first: workers pick keys (engine-free pure numpy).
     tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
