@@ -12,6 +12,9 @@ Layout (row order == parquet order, so splits stay identical):
   keys.json        [key14...] (first-appearance order)
   smiles.json      {key14: smiles} (first occurrence per key)
   key_idx.int32.zst, prec.f64.zst, adduct.u8.zst, inst.u8.zst
+  key_inst.int32.zst (per-key first-occurrence instrument enum)
+  key_first.int32.zst (per-key first row index)
+  ce.f64.zst       (per-row collision energy eV, NaN = unknown/merged)
   adducts.json, instruments.json (enum tables)
   mz_off.int64.zst (n+1 offsets into mz stream)
   mz_data.zst      (int64 bit-deltas of concatenated float64 mzs)
@@ -48,8 +51,38 @@ except ImportError:
     sys.exit(2)
 
 COLS = ["inchikey14", "normalized_smiles", "precursor_mz",
-        "adduct", "instrument_type", "ms2_mzs", "ms2_normalized_intensities"]
+        "adduct", "instrument_type", "ms2_mzs", "ms2_normalized_intensities",
+        "collision_energy_ev"]
 LEVEL = 3
+CODEC = "f64bitdelta+zstd3+ce1"
+
+
+def ce_single(v):
+    """Mirror of run._ce_single (builder runs standalone, no src import).
+
+    One CE in eV, or None when unknown/merged. Pinned equal by
+    test_ce_matches_run in tests/test_slim.py — change both together.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        vals = []
+        for x in v:
+            try:
+                f = float(x)
+            except (TypeError, ValueError):
+                continue
+            if f == f:
+                vals.append(f)
+        uniq = sorted(set(vals))
+        if len(uniq) == 1:
+            return uniq[0]
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
 
 
 def sha(b: bytes) -> str:
@@ -90,11 +123,22 @@ def build_arrays(table) -> dict:
     inst = table.column("instrument_type").to_pylist()
     mzs_col = table.column("ms2_mzs").to_pylist()
     ints_col = table.column("ms2_normalized_intensities").to_pylist()
+    try:
+        ce_col = table.column("collision_energy_ev").to_pylist()
+    except Exception:
+        ce_col = [None] * n
+
+    adducts = sorted(set(str(a) for a in adduct))
+    insts = sorted(set(str(t) for t in inst))
+    ad_of = {a: i for i, a in enumerate(adducts)}
+    in_of = {t: i for i, t in enumerate(insts)}
 
     keys: list = []
     key_index: dict = {}
     smile_of: dict = {}
     key_idx = np.empty(n, dtype=np.int32)
+    key_inst_list: list = []  # per key: first-occurrence instrument enum
+    key_first_list: list = []  # per key: first row index
     for i, k in enumerate(key14):
         j = key_index.get(k)
         if j is None:
@@ -102,12 +146,9 @@ def build_arrays(table) -> dict:
             key_index[k] = j
             keys.append(k)
             smile_of[k] = smiles[i]  # first occurrence, matches groupby().iloc[0]
+            key_inst_list.append(in_of[str(inst[i])])
+            key_first_list.append(i)
         key_idx[i] = j
-
-    adducts = sorted(set(str(a) for a in adduct))
-    insts = sorted(set(str(t) for t in inst))
-    ad_of = {a: i for i, a in enumerate(adducts)}
-    in_of = {t: i for i, t in enumerate(insts)}
 
     mz_off = np.empty(n + 1, dtype=np.int64)
     mz_off[0] = 0
@@ -124,12 +165,16 @@ def build_arrays(table) -> dict:
         mz_off[i + 1] = off
     mz_all = np.concatenate(mz_parts) if mz_parts else np.empty(0, dtype=np.float64)
     int_all = np.concatenate(int_parts) if int_parts else np.empty(0, dtype=np.float64)
+    ce = np.array([c if (c is not None and c == c) else np.nan
+                   for c in (ce_single(v) for v in ce_col)], dtype=np.float64)
 
     return {
         "n": n,
         "keys": keys,
         "smiles": smile_of,
         "key_idx": key_idx,
+        "key_inst": np.array(key_inst_list, dtype=np.int32),
+        "key_first": np.array(key_first_list, dtype=np.int32),
         "prec": prec,
         "adduct": np.array([ad_of[str(a)] for a in adduct], dtype=np.uint8),
         "adducts": adducts,
@@ -138,6 +183,7 @@ def build_arrays(table) -> dict:
         "mz_off": mz_off,
         "mz_all": mz_all,
         "int_all": int_all,
+        "ce": ce,
         "adduct_str": [str(a) for a in adduct],
     }
 
@@ -177,11 +223,14 @@ def write_slim(d: dict, neutrals: np.ndarray, out: str) -> dict:
     w("mz_off.int64.zst", enc_raw(d["mz_off"]))
     w("mz_data.zst", enc_deltas_f64(d["mz_all"]))
     w("int_data.zst", enc_raw(d["int_all"]))
+    w("ce.f64.zst", enc_raw(d["ce"]))
+    w("key_inst.int32.zst", enc_raw(d["key_inst"]))
+    w("key_first.int32.zst", enc_raw(d["key_first"]))
     w("neutrals.f64.zst", enc_raw(neutrals))
     for name, obj in [("keys.json", d["keys"]), ("smiles.json", d["smiles"]),
                       ("adducts.json", d["adducts"]), ("instruments.json", d["instruments"])]:
         w(name, json.dumps(obj).encode())
-    manifest = {"rows": d["n"], "keys": len(d["keys"]), "codec": "f64bitdelta+zstd3",
+    manifest = {"rows": d["n"], "keys": len(d["keys"]), "codec": CODEC,
                 "mz_values": int(d["mz_all"].shape[0]), "files": files}
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f)

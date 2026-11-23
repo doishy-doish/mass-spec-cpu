@@ -301,6 +301,39 @@ def build_preload_chunks(lib_by_key: dict, Tlib: dict, key2smi: dict,
             "neutrals": nk, "specs": specs}})
 
 
+def build_preload_chunks_slim(lib_by_key: dict, S: dict, key2smi: dict,
+                              key2neutral: dict, per: int = 500):
+    """Slim-store preload chunks (same wire format as build_preload_chunks).
+
+    Spectra come from the flat mz_all/int_all buffers (views -> tolist per
+    touched row only — the full table is never materialized). CE from the
+    flat ce array (NaN -> None). Bit-identical JSON to the parquet path for
+    the same rows: same floats, same order, same key sort.
+    """
+    from . import slim as _SLmod
+    keys = sorted(lib_by_key)
+    for i in range(0, len(keys), per):
+        ks = keys[i:i + per]
+        specs = []
+        for k in ks:
+            ss = []
+            for j in lib_by_key.get(k, []):
+                mzs, ints = _SLmod.row_spec(S, int(j))
+                ss.append({"mzs": mzs.tolist(),
+                           "ints": ints.tolist(),
+                           "prec": float(S["prec"][int(j)]),
+                           "ce": _SLmod.row_ce(S, int(j))})
+            specs.append(ss)
+        nk = []
+        for k in ks:
+            v = (key2neutral or {}).get(k)
+            nk.append(None if (v is None or v != v) else float(v))
+        yield json.dumps({"preload": {
+            "keys": ks,
+            "smiles": [str(key2smi.get(k, "")) for k in ks],
+            "neutrals": nk, "specs": specs}})
+
+
 def subset_lib(lib_by_key: dict, keys) -> dict:
     """Library rows for exactly these keys (M211).
 
@@ -554,6 +587,10 @@ def main() -> None:
     ap.add_argument("--out-suffix", default="",
                     help="inserted before the extension of --out, e.g. '-binwprobe'; "
                          "probes must use one so they never clobber fleet shard files")
+    ap.add_argument("--slim-dir", default="data/slim",
+                    help="preconverted slim store (scripts/build_slim.py). "
+                         "Used automatically when its manifest.json exists; "
+                         "otherwise the parquet path runs (fallback).")
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, _sigterm_loud)
     _stop = threading.Event()
@@ -574,7 +611,16 @@ def main() -> None:
     except Exception:
         pass
 
-    T = load_table(a.data, train=True)
+    S = None
+    _slim_manifest = os.path.join(a.slim_dir, "manifest.json")
+    if os.path.exists(_slim_manifest):
+        from . import slim as SL
+        S = SL.load_slim(a.slim_dir)
+        print("slim store rows=" + str(S["n"]) + " keys=" + str(len(S["keys"]))
+              + " codec=" + str(S["manifest"].get("codec")), flush=True)
+        T = SL.as_table(S)
+    else:
+        T = load_table(a.data, train=True)
     pool = V.query_pool(T).tolist()
     if a.mask == "class2":
         library, queries, _ = V.split_class2(T, pool, a.n, a.seed)
@@ -582,10 +628,23 @@ def main() -> None:
         library, queries, _ = V.split_class3(T, pool, a.n, a.seed)
     else:
         library, queries, _ = V.split_cross_instrument(T, pool, a.n, a.seed)
-    # one structs round trip: neutrals for the pool + qnm per query
-    ukeys, kidx, precs, adducts, sq = build_structs_payload(T, queries)
-    st = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, sq)
-    neutrals = st["neutrals"]
+    # one structs round trip: neutrals for the pool + qnm per query.
+    # Slim path: neutrals ship IN the store (builder ran structs once), so
+    # the per-run call is qnm-only (empty ktable, tiny payload). Same qnm
+    # math (Rust adduct table), none of the 2.5M-row JSON.
+    if S is not None:
+        # Slim: qnm needs queries only — never build the 2.5M-row payload
+        # lists. (Same sq shape as build_structs_payload; neutrals ship in S.)
+        sq = [{"qi": int(qi), "prec": float(T["prec"][int(qi)]),
+               "adduct": str(T["adduct"][int(qi)])} for qi in queries]
+        ukeys, kidx, precs, adducts = [], [], [], []
+        st = structs_call(a.rust_bin, [], [], [], [], sq)
+        neutrals = S["neutrals"]
+        print("slim neutrals from store keys=" + str(len(neutrals)), flush=True)
+    else:
+        ukeys, kidx, precs, adducts, sq = build_structs_payload(T, queries)
+        st = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, sq)
+        neutrals = st["neutrals"]
     qnm = {int(qi): v for qi, v in st["qnm"] if v is not None}
     # I6 adduct retry (zero-score-only): one extra structs pass for queries
     # with no neutral mass, using the first neighbor adduct frame. Merges in
@@ -601,7 +660,8 @@ def main() -> None:
                     _alt = _nbs[1] if len(_nbs) > 1 else _orig
                     _sq2.append({"qi": int(_qi), "prec": float(T["prec"][int(_qi)]),
                                  "adduct": _alt})
-                _st2 = structs_call(a.rust_bin, ukeys, kidx, precs, adducts, _sq2)
+                _st2 = structs_call(a.rust_bin, [], [], [], [], _sq2) if S is not None \
+                    else structs_call(a.rust_bin, ukeys, kidx, precs, adducts, _sq2)
                 for _qi, _v in _st2.get("qnm", []):
                     if qnm.get(int(_qi)) is None and _v is not None:
                         qnm[int(_qi)] = _v
@@ -621,21 +681,39 @@ def main() -> None:
     sord = np.argsort(sneu_all, kind="stable")
     skeys, masses = skeys_all[sord], sneu_all[sord]
 
-    # lib_by_key, fully vectorized (no per-row .at loop over ~2.5M rows)
-    codes, inv = np.unique(T["key14"], return_inverse=True)
+    # lib_by_key, fully vectorized (no per-row .at loop over ~2.5M rows).
+    # Slim path: key_idx ships IN the store (builder assigned it), so no
+    # np.unique over 2.5M strings — straight int grouping. Same mapping.
     lib_arr = np.asarray(library, dtype=np.int64)
     lib_by_key = {}
-    if len(lib_arr):
-        srt = np.argsort(inv[lib_arr], kind="stable")
-        sk = inv[lib_arr][srt]
-        bounds = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1], True])
-        for b, e in zip(bounds[:-1], bounds[1:]):
-            lib_by_key[str(codes[sk[b]])] = lib_arr[srt[b:e]].tolist()
-    # key2smi: first occurrence per key (matches groupby().iloc[0])
-    _, fidx = np.unique(inv, return_index=True)
-    key2smi = {str(codes[inv[i]]): str(T["smiles"][int(i)]) for i in fidx}
-    # I6: first-occurrence instrument per key + per-query instrument (pool re-rank only).
-    key2inst = {str(codes[inv[i]]): str(T["instrument"][int(i)]) for i in fidx}
+    if S is not None:
+        _ki = S["key_idx"]
+        _keys = S["keys"]
+        if len(lib_arr):
+            srt = np.argsort(_ki[lib_arr], kind="stable")
+            sk = _ki[lib_arr][srt]
+            bounds = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1], True])
+            for b, e in zip(bounds[:-1], bounds[1:]):
+                lib_by_key[_keys[int(sk[b])]] = lib_arr[srt[b:e]].tolist()
+        # key2smi: first occurrence per key (builder recorded it).
+        key2smi = {str(k): str(v) for k, v in S["smiles"].items()}
+        # I6: first-occurrence instrument per key (builder recorded it).
+        _inst_tab = S["instruments"]
+        key2inst = {str(S["keys"][ki]): str(_inst_tab[int(v)])
+                    for ki, v in enumerate(S["key_inst"].tolist())}
+    else:
+        codes, inv = np.unique(T["key14"], return_inverse=True)
+        if len(lib_arr):
+            srt = np.argsort(inv[lib_arr], kind="stable")
+            sk = inv[lib_arr][srt]
+            bounds = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1], True])
+            for b, e in zip(bounds[:-1], bounds[1:]):
+                lib_by_key[str(codes[sk[b]])] = lib_arr[srt[b:e]].tolist()
+        # key2smi: first occurrence per key (matches groupby().iloc[0])
+        _, fidx = np.unique(inv, return_index=True)
+        key2smi = {str(codes[inv[i]]): str(T["smiles"][int(i)]) for i in fidx}
+        # I6: first-occurrence instrument per key + per-query instrument (pool re-rank only).
+        key2inst = {str(codes[inv[i]]): str(T["instrument"][int(i)]) for i in fidx}
 
     # SNAKE-DRAFT: balance shards by ppm pool size (slowest shard = fleet wall)
     if a.shards > 1 and len(queries) > 1:
@@ -679,21 +757,39 @@ def main() -> None:
     # copies (parent tables + engine raw table) exceed the 16GB runner —
     # peak must be one full copy (transient load), steady small + small.
     qset = set(int(qi) for qi in queries)
-    _SE.update(skeys=np.array([str(k) for k in skeys.tolist()]),
-               masses=masses, qnm=qnm, ppm=a.ppm,
-               lib_precs=lib_precs, lib_pkeys=lib_pkeys,
-               qmzs={qi: T["mzs"][qi] for qi in qset},
-               qints={qi: T["ints"][qi] for qi in qset},
-               qprec={qi: float(T["prec"][qi]) for qi in qset},
-               qce={qi: T["ce"][int(qi)] for qi in qset},
-               qkey={qi: str(T["key14"][qi]) for qi in qset},
-               qinst={qi: str(T["instrument"][qi]) for qi in qset},
-               key2inst=key2inst,
-               inst_bonus=bool(a.inst_bonus),
-               adduct_retry=bool(a.adduct_retry),
-               mass_replace=bool(a.mass_replace),
-               formula_ppm=float(a.formula_ppm or 0.0),
-               shard=a.shard, variants=VARIANTS)
+    if S is not None:
+        from . import slim as _SLmod
+        _SE.update(skeys=np.array([str(k) for k in skeys.tolist()]),
+                   masses=masses, qnm=qnm, ppm=a.ppm,
+                   lib_precs=lib_precs, lib_pkeys=lib_pkeys,
+                   qmzs={qi: _SLmod.row_spec(S, int(qi))[0] for qi in qset},
+                   qints={qi: _SLmod.row_spec(S, int(qi))[1] for qi in qset},
+                   qprec={qi: float(S["prec"][int(qi)]) for qi in qset},
+                   qce={qi: _SLmod.row_ce(S, int(qi)) for qi in qset},
+                   qkey={qi: str(T["key14"][int(qi)]) for qi in qset},
+                   qinst={qi: str(T["instrument"][int(qi)]) for qi in qset},
+                   key2inst=key2inst,
+                   inst_bonus=bool(a.inst_bonus),
+                   adduct_retry=bool(a.adduct_retry),
+                   mass_replace=bool(a.mass_replace),
+                   formula_ppm=float(a.formula_ppm or 0.0),
+                   shard=a.shard, variants=VARIANTS)
+    else:
+        _SE.update(skeys=np.array([str(k) for k in skeys.tolist()]),
+                   masses=masses, qnm=qnm, ppm=a.ppm,
+                   lib_precs=lib_precs, lib_pkeys=lib_pkeys,
+                   qmzs={qi: T["mzs"][qi] for qi in qset},
+                   qints={qi: T["ints"][qi] for qi in qset},
+                   qprec={qi: float(T["prec"][qi]) for qi in qset},
+                   qce={qi: T["ce"][int(qi)] for qi in qset},
+                   qkey={qi: str(T["key14"][qi]) for qi in qset},
+                   qinst={qi: str(T["instrument"][qi]) for qi in qset},
+                   key2inst=key2inst,
+                   inst_bonus=bool(a.inst_bonus),
+                   adduct_retry=bool(a.adduct_retry),
+                   mass_replace=bool(a.mass_replace),
+                   formula_ppm=float(a.formula_ppm or 0.0),
+                   shard=a.shard, variants=VARIANTS)
     # two-phase selection first: workers pick keys (engine-free pure numpy).
     tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
     if a.jobs > 1 and len(tasks) > 1:
@@ -730,9 +826,14 @@ def main() -> None:
     # key-only per-query messages. Streamed chunk-by-chunk (M207).
     print("preload build union=" + str(len(union)) + " lib_keys=" + str(len(lib_by_key)), flush=True)
     engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion)
-    nchunks = stream_preload(engine,
-                             build_preload_chunks(sub, T, key2smi,
-                                                  key2neutral))
+    if S is not None:
+        nchunks = stream_preload(engine,
+                                 build_preload_chunks_slim(sub, S, key2smi,
+                                                           key2neutral))
+    else:
+        nchunks = stream_preload(engine,
+                                 build_preload_chunks(sub, T, key2smi,
+                                                      key2neutral))
     _rss, _avail = _mem_state()
     _erss = _proc_rss(engine.p.pid)
     print("preload done chunks=" + str(nchunks)
@@ -747,6 +848,7 @@ def main() -> None:
     del key2smi
     del key2neutral
     del T
+    del S
     _rss, _avail = _mem_state()
     print("precompute done queries=" + str(len(queries))
           + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),

@@ -35,6 +35,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+      - name: restore cargo cache (lossless: compiled deps only, no math)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-bitvec/target
+            rust-chem/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-bitvec/Cargo.toml', 'rust-chem/Cargo.toml', 'rust-bitvec/src/**', 'rust-chem/src/**') }}
       - run: pip install -r requirements.txt
       - run: mkdir -p data results
       - name: build rust engine

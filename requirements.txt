@@ -1,9 +1,10 @@
 numpy>=1.26
 pyarrow>=15
+zstandard>=0.23  # slim store codec (run-path loader + builder); tiny wheel
 # NOTE 2026-11-23 (pandas-free): run path is numpy + pyarrow only. pandas was
 # removed (loader/index/splits rewritten on arrays; metric.py import was dead).
-# zstandard is installed in workflow steps that need it (slim builder/loader),
-# not here — compute jobs stay lean.
+# NOTE 2026-11-23 (store cutover): zstandard moved into requirements — the
+# run-path slim loader needs it whenever data/slim exists. Tiny wheel.
 # NOTE: pytest (test step) and kaggle CLI (cache-miss download step) are
 # installed inside their own workflow steps, not here — compute jobs stay lean.
 # NOTE 2026-11-22 (single engine): RDKit removed — all chemistry/scoring lives
