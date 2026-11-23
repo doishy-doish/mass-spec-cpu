@@ -84,7 +84,7 @@ def test_rust_engine_present():
 def test_variants_complete():
     from mscpu import run as R
     assert set(R.VARIANTS) == {"z", "lib", "analog", "frag", "rrf", "cascade",
-                               "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw"}
+                               "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure"}
 
 def test_fusion_defaults_neutral():
     from mscpu import run as R
