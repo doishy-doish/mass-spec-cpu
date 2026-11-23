@@ -72,6 +72,9 @@ on:
       funnel-off:
         description: "I6 funnel A/B: disable Jaccard prefilter (0/1)"
         default: "0"
+      loss-gate:
+        description: "R2 diagnostic-loss demotion: sink candidates failing the loss/subformula gate (0/1)"
+        default: "0"
       formula-ppm:
         description: "I6 input plug: formula-gate ppm (0 = off; wiring-ready)"
         default: "0.0"
@@ -121,7 +124,7 @@ jobs:
           PYTHONPATH: src
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --formula-ppm "${{ inputs.formula-ppm }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --formula-ppm "${{ inputs.formula-ppm }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --loss-gate "${{ inputs.loss-gate }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: smart probe (GREEN / RED / INFRA — never ships blind, never cries code-bug on host death)
         if: ${{ always() && inputs.task == 'validate' }}
         env:
@@ -190,12 +193,12 @@ jobs:
           n = out.get("n", 0)
           need(isinstance(n, int) and n >= min(10, nreq), f"n too small ({n} < min(10,{nreq})) — queries never ran")
           rrs = out.get("rrs", {})
-          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw","pure"},
+          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw","pure","libce","ent","gate"},
                f"variants incomplete ({sorted(rrs.keys())}) — a channel never returned")
           for v, arr in rrs.items():
               need(len(arr) == n, f"rrs[{v}] len {len(arr)} != n {n}")
           # 2. score fields present + sane (catches silent NaN/zero collapse)
-          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw","mrr_pure"]
+          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw","mrr_pure","mrr_libce","mrr_ent","mrr_gate"]
           for k in mkeys:
               v = out.get(k)
               need(isinstance(v,(int,float)) and v==v and 0.0 <= v <= 1.0, f"{k} insane ({v!r})")
@@ -243,7 +246,7 @@ jobs:
               need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
           if red:
               emit("RED", red)
-          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f}"])
+          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}"])
           PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}

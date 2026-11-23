@@ -30,6 +30,31 @@ def test_adduct_neighbors_self_first():
     assert IP.adduct_neighbors("[unknown]+") == ["[unknown]+"]
 
 
+def test_adduct_neighbors_test_set_complete():
+    # R2: all 10 competition test adducts resolve past self (case-insensitive).
+    for ad in ["[M+H]+", "[M+NH4]+", "[M-H2O+H]+", "[M-2H2O+H]+", "[M+Na]+",
+               "[M+K]+", "[M-H]-", "[M-H2O-H]-", "[M+CH2O2-H]-", "[M+Cl]-"]:
+        nbs = IP.adduct_neighbors(ad)
+        assert nbs[0] == ad, ad
+        assert IP.adduct_neighbors(ad.lower())[0] == ad, ad
+    # water-loss neighbors stay in-lane and terminate at the base frame.
+    assert IP.adduct_neighbors("[M-H2O+H]+")[1] == "[M+H]+"
+    assert IP.adduct_neighbors("[M-H2O-H]-")[1] == "[M-H]-"
+    assert IP.adduct_neighbors("[M+CH2O2-H]-")[0] == "[M+CH2O2-H]-"
+
+
+def test_adduct_deltas_frames():
+    # positive lane vs [M+H]+ frame; negative lane vs [M-H]- frame.
+    assert abs(IP.retry_precisions(300.0, "[M+H]+", "[M+Na]+") - 321.98194) < 1e-9
+    assert abs(IP.retry_precisions(300.0, "[M-H]-", "[M+Cl]-") - 335.97613) < 1e-9
+    # formate matches the Rust engine shift in this frame.
+    assert abs(IP.retry_precisions(300.0, "[M-H]-", "[M+CH2O2-H]-") - 346.00548) < 1e-9
+    # H2O mass shared by train/test spellings.
+    assert abs(IP.ADDUCT_DELTA["[m-h2o+h]+"] - (-18.01056)) < 1e-9
+    assert abs(IP.ADDUCT_DELTA["[m-h2o-h]-"] - (-18.01056)) < 1e-9
+    assert abs(IP.ADDUCT_DELTA["[m-2h2o+h]+"] - (-36.02113)) < 1e-9
+
+
 def test_mass_grade_plateau_and_zero():
     assert IP.mass_grade(-1.5) == 1.0
     assert IP.mass_grade(0.0) == 1.0       # within 3ppm of center

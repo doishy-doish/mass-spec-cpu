@@ -32,9 +32,9 @@
 //!     -> {"ranked": {variant: [keys<=25]}, "pools": n}
 //! Progress heartbeats go to stderr (the launcher forwards them).
 
-use chem::{morgan_bits_2048, tanimoto as chem_tanimoto};
+use chem::{morgan_bits_2048, parse_smiles, tanimoto as chem_tanimoto};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 
 #[allow(dead_code)]
@@ -68,9 +68,9 @@ const TOP_K_OUT: usize = 25;
 /// functions of these inputs, so lazy values equal eager ones bit-for-bit.
 /// Pool takes position 0. Replaces the old eager preload (prepared all 275k
 /// keys, 7.3min, before query 1 — most keys are never touched).
-const VARIANTS: [&str; 15] = [
+const VARIANTS: [&str; 18] = [
     "lib", "analog", "frag", "bin", "binw", "stein", "mass", "z", "rrf", "rrfb", "cascade", "router",
-    "zw", "rrfw", "pure",
+    "zw", "rrfw", "pure", "libce", "ent", "gate",
 ];
 
 fn mix(x: u64, salt: u64) -> u64 {
@@ -171,7 +171,9 @@ fn adduct_shift(a: &str) -> Option<f64> {
         // [M-2H2O+H]+ = 1.007276 - 2*18.010565; [M-H2O-H]- = -1.007276 - 18.010565.
         "[M-2H2O+H]+" => Some(-35.013854),
         "[M-H2O-H]-" => Some(-19.017841),
-        "[M+CH2O2-H]-" => Some(43.990901),
+        // formate: M + CH2O2 - H (46.005479 - 1.007276). Was 43.990901
+        // (double-subtracted proton): formate neutrals off by ~1 Da.
+        "[M+CH2O2-H]-" => Some(44.998203),
         "[M]+" => Some(0.0),
         _ => None,
     }
@@ -223,9 +225,11 @@ struct CSpectra {
     /// Neutral-loss set, precomputed once per spectrum (the frag channel used
     /// to rebuild it per candidate spec per query — same inputs, same output).
     floss: Vec<f64>,
+    /// Collision-energy band source (None = unknown/merged ramp).
+    ce: Option<f64>,
 }
 
-fn prepare(mzs: &[f64], ints: &[f64], prec: f64, qpeak: f64, qloss: f64) -> CSpectra {
+fn prepare(mzs: &[f64], ints: &[f64], prec: f64, qpeak: f64, qloss: f64, ce: Option<f64>) -> CSpectra {
     let (mz, w) = clean(mzs, ints, prec);
     let norm = w.iter().map(|x| x * x).sum();
     // Stein-Scott-lite mass weights (mass-linear, mz/1000 scale): same peaks, high-mass
@@ -253,7 +257,7 @@ fn prepare(mzs: &[f64], ints: &[f64], prec: f64, qpeak: f64, qloss: f64) -> CSpe
     }
     let wb = build_w(&pb, &pw, &lb, &lw);
     let floss = loss_set(&mz, prec);
-    CSpectra { mz, w, prec, norm, sw, snorm, bits, wb, floss }
+    CSpectra { mz, w, prec, norm, sw, snorm, bits, wb, floss, ce }
 }
 
 fn match_dot(amz: &[f64], ai: &[f64], bmz: &[f64], bi: &[f64], delta: f64, tol: f64) -> f64 {
@@ -565,6 +569,11 @@ struct EngineParams {
     /// I6: funnel A/B — disable the Jaccard prefilter (0 = funnel on, 1 = off).
     #[serde(default = "def0")]
     funnel_off: f64,
+    /// R2: diagnostic-loss demotion — stable-partition ranked lists so
+    /// candidates failing the loss/subformula gate sink below passing ones.
+    /// 0 = off (bit-identical lists), 1 = on.
+    #[serde(default = "def0")]
+    lossgate: f64,
 }
 
 impl EngineParams {
@@ -585,6 +594,7 @@ impl EngineParams {
             mass_replace: 0.0,
             recall_topk: 0.0,
             funnel_off: 0.0,
+            lossgate: 0.0,
         }
     }
 }
@@ -594,6 +604,9 @@ struct RawSpec {
     mzs: Vec<f64>,
     ints: Vec<f64>,
     prec: f64,
+    /// Single collision energy in eV (None = unknown or merged ramp).
+    #[serde(default)]
+    ce: Option<f64>,
 }
 
 /// One library table chunk (preload protocol v2): per-query messages carry
@@ -652,6 +665,7 @@ struct CandData {
     specs: Vec<CSpectra>,
     fp: Option<[u64; 32]>,
     neutral: Option<f64>,
+    formula: Option<BTreeMap<String, u32>>,
 }
 
 /// Preloaded library table entry (protocol v2): raw spectra + smiles stored
@@ -663,6 +677,7 @@ struct TableEntry {
     smiles: String,
     fp: Option<[u64; 32]>,
     neutral: Option<f64>,
+    formula: Option<BTreeMap<String, u32>>,
 }
 
 /// M209: prepare-on-first-use. prepare() is a pure function of (raw spectra,
@@ -675,14 +690,211 @@ fn ensure_prepared(e: &mut TableEntry, qpeak: f64, qloss: f64) {
         let specs: Vec<CSpectra> = e
             .raw
             .iter()
-            .map(|s| prepare(&s.mzs, &s.ints, s.prec, qpeak, qloss))
+            .map(|s| prepare(&s.mzs, &s.ints, s.prec, qpeak, qloss, s.ce))
             .collect();
         e.specs = Some(specs);
         e.raw = Vec::new();
+        // parsed once with the spectra (None = unparseable, not retried).
+        e.formula = formula_counts(&e.smiles);
     }
     if e.fp.is_none() {
         e.fp = Some(morgan_bits_2048(&e.smiles));
     }
+}
+
+/// R2: collision-energy band. Query and library CE are single eV values
+/// (merged ramps arrive as None from the launcher); bands split the three
+/// acquisition energies the test set uses (20 / 40 / 60 eV).
+fn ce_band(ce: f64) -> u8 {
+    if ce <= 25.0 {
+        0
+    } else if ce <= 50.0 {
+        1
+    } else {
+        2
+    }
+}
+
+/// R2: diagnostic neutral losses (exact monoisotopic masses, verified by
+/// arithmetic 2026-11-23): water, ammonia, CO, CO2, formic acid, hexose,
+/// glucuronide, deoxyhexose. Match tolerance is absolute Da (fragment side).
+const DIAG_LOSSES: [(f64, &[(&str, u32)]); 8] = [
+    (18.010565, &[("H", 2), ("O", 1)]),
+    (17.026549, &[("N", 1), ("H", 3)]),
+    (27.994915, &[("C", 1), ("O", 1)]),
+    (43.989829, &[("C", 1), ("O", 2)]),
+    (46.005479, &[("C", 1), ("H", 2), ("O", 2)]),
+    (162.052823, &[("C", 6), ("H", 10), ("O", 5)]),
+    (176.032088, &[("C", 6), ("H", 8), ("O", 6)]),
+    (146.057909, &[("C", 6), ("H", 10), ("O", 4)]),
+];
+const LOSS_TOL_DA: f64 = 0.02;
+
+fn el_norm(el: &str) -> String {
+    let mut c = el.chars();
+    match c.next() {
+        None => "C".to_string(),
+        Some(f) => {
+            let mut s = f.to_ascii_uppercase().to_string();
+            for ch in c {
+                s.push(ch.to_ascii_lowercase());
+            }
+            s
+        }
+    }
+}
+
+/// R2: atom counts from a SMILES via the chem parser. The parser stores
+/// implicit H as 0 on unbracketed atoms, so implicit H is reconstructed from
+/// standard organic valences minus bond-order sums (bracket/charged atoms
+/// carry their own explicit h and are trusted as-is). The rule errs toward
+/// OVERCOUNTING H, which is the fail-safe direction for a demotion gate
+/// (extra H never wrongly demotes; missing H could).
+fn formula_counts(smiles: &str) -> Option<BTreeMap<String, u32>> {
+    let mol = parse_smiles(smiles)?;
+    if mol.atoms.is_empty() {
+        return None;
+    }
+    let mut bond_sum = vec![0u32; mol.atoms.len()];
+    for &(a, b, o) in &mol.bonds {
+        if a < bond_sum.len() && b < bond_sum.len() {
+            bond_sum[a] += o as u32;
+            bond_sum[b] += o as u32;
+        }
+    }
+    let mut m = BTreeMap::new();
+    for (i, a) in mol.atoms.iter().enumerate() {
+        let e = el_norm(&a.el);
+        *m.entry(e.clone()).or_insert(0) += 1;
+        let h = if a.h > 0 || a.charge != 0 {
+            a.h
+        } else if a.aromatic && e == "N" {
+            0 // bare aromatic n is pyridine-like (pyrrole arrives bracketed)
+        } else {
+            let v: u32 = match e.as_str() {
+                "C" => {
+                    if a.aromatic {
+                        3
+                    } else {
+                        4
+                    }
+                }
+                "N" => 3,
+                "O" | "S" => 2,
+                "P" => 3,
+                "F" | "Cl" | "Br" | "I" => 1,
+                _ => 4,
+            };
+            v.saturating_sub(bond_sum[i])
+        };
+        if h > 0 {
+            *m.entry("H".to_string()).or_insert(0) += h;
+        }
+    }
+    Some(m)
+}
+
+/// R2: diagnostic-loss gate fraction for one candidate: of the diagnostic
+/// neutral losses observed in the query (prec - frag within LOSS_TOL_DA),
+/// how many have atoms ⊆ candidate formula. Vacuous (no losses observed or
+/// no formula) scores 1.0 — the gate only demotes, never promotes.
+fn gate_frac(qmz: &[f64], qprec: f64, formula: Option<&BTreeMap<String, u32>>) -> f64 {
+    let mut observed = 0u32;
+    let mut explained = 0u32;
+    for &(lmass, atoms) in DIAG_LOSSES.iter() {
+        let mut seen = false;
+        for &m in qmz {
+            if m < qprec && (qprec - m - lmass).abs() <= LOSS_TOL_DA {
+                seen = true;
+                break;
+            }
+        }
+        if !seen {
+            continue;
+        }
+        observed += 1;
+        match formula {
+            None => explained += 1,
+            Some(f) => {
+                let mut ok = true;
+                for &(el, n) in atoms.iter() {
+                    if f.get(el).copied().unwrap_or(0) < n {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    explained += 1;
+                }
+            }
+        }
+    }
+    if observed == 0 {
+        1.0
+    } else {
+        explained as f64 / observed as f64
+    }
+}
+
+/// R2: loss-gate demotion — stable-partition one ranked list so gate-passing
+/// keys keep their relative order ahead of failing ones. Passing = gate
+/// fraction 1.0 (fully explained or vacuous).
+fn partition_by_gate(list: &mut Vec<String>, gate_of: &HashMap<String, f64>) {
+    if list.is_empty() {
+        return;
+    }
+    let mut pass = Vec::with_capacity(list.len());
+    let mut fail = Vec::with_capacity(list.len());
+    for k in list.drain(..) {
+        if gate_of.get(&k).copied().unwrap_or(1.0) >= 1.0 - 1e-12 {
+            pass.push(k);
+        } else {
+            fail.push(k);
+        }
+    }
+    list.extend(pass);
+    list.extend(fail);
+}
+
+/// R2: dynamic spectral-entropy weight exponent (Li & Fiehn shape): sparse
+/// spectra (S < 3 nats) boost minor peaks, busy spectra stay linear.
+fn entropy_exp(rel: &[f64]) -> f64 {
+    let sum: f64 = rel.iter().sum();
+    if !(sum > 0.0) {
+        return 1.0;
+    }
+    let mut s = 0.0;
+    for &x in rel {
+        if x > 0.0 {
+            let p = x / sum;
+            s -= p * p.ln();
+        }
+    }
+    if s < 3.0 {
+        0.25 + 0.25 * s
+    } else {
+        1.0
+    }
+}
+
+/// R2: entropy-weighted cosine. Relative intensities recovered as w^2
+/// (clean stores sqrt), raised to the dynamic exponent, cosine-normalized.
+/// Self-match is exactly 1.0 (same accumulation order both sides).
+fn ent_row(qmz: &[f64], qw: &[f64], smz: &[f64], sw: &[f64], tol: f64) -> f64 {
+    if qmz.is_empty() || smz.is_empty() {
+        return 0.0;
+    }
+    let qe = entropy_exp(&qw.iter().map(|x| x * x).collect::<Vec<f64>>());
+    let se = entropy_exp(&sw.iter().map(|x| x * x).collect::<Vec<f64>>());
+    let qew: Vec<f64> = qw.iter().map(|x| (x * x).powf(qe)).collect();
+    let sew: Vec<f64> = sw.iter().map(|x| (x * x).powf(se)).collect();
+    let qn: f64 = qew.iter().map(|x| x * x).sum();
+    let sn: f64 = sew.iter().map(|x| x * x).sum();
+    let den = (qn * sn).sqrt();
+    if !(den > 0.0) {
+        return 0.0;
+    }
+    match_dot(qmz, &qew, smz, &sew, 0.0, tol) / den
 }
 
 fn fuse_rank(
@@ -703,6 +915,9 @@ fn fuse_rank(
     let binw = col("binw");
     let stein = col("stein"); // standalone (Loop-2 replication): ranked, NOT fused yet
     let mass = col("mass"); // standalone (Loop-3 v8-mass-lite): ranked, NOT fused yet
+    let libce = col("libce"); // standalone (R2 CE band): ranked, NOT fused yet
+    let ent = col("ent"); // standalone (R2 entropy-weighted cosine): ranked, NOT fused yet
+    let gate = col("gate"); // standalone (R2 diagnostic-loss gate): ranked, NOT fused yet
     let z_of = |xs: &[f64]| -> Vec<f64> {
         let mean = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
         let s = sample_std(xs, mean) + 1e-9;
@@ -819,6 +1034,9 @@ fn fuse_rank(
         ("zw", &zw),
         ("rrfw", &rrfw),
         ("pure", &pure),
+        ("libce", libce),
+        ("ent", ent),
+        ("gate", gate),
     ];
     for (name, vals) in named {
         let kv: Vec<String> = order_desc(vals)
@@ -929,7 +1147,7 @@ fn sengine(params: EngineParams) {
                 .zip(ch.specs.into_iter())
             {
                 // M209: store raw; prepare on first use (see ensure_prepared).
-                table.insert(k, TableEntry { raw: ss, specs: None, smiles: sm, fp: None, neutral: n });
+                table.insert(k, TableEntry { raw: ss, specs: None, smiles: sm, fp: None, neutral: n, formula: None });
             }
             continue;
         }
@@ -941,7 +1159,7 @@ fn sengine(params: EngineParams) {
         let q = m.q.expect("sengine: query without q");
         let t_parse = t0.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss);
+        let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss, q.ce);
         let qloss = loss_set(&qc.mz, qc.prec);
         let qn = qloss.len().max(1) as f64;
         let qi: i64 = m.qi.unwrap_or(0);
@@ -958,6 +1176,7 @@ fn sengine(params: EngineParams) {
                     specs: e.specs.clone().unwrap_or_default(),
                     fp: if e.smiles.is_empty() { None } else { e.fp },
                     neutral: e.neutral,
+                    formula: e.formula.clone(),
                 });
             }
         }
@@ -1028,13 +1247,37 @@ fn sengine(params: EngineParams) {
         let mut vbinw: Vec<f64> = Vec::with_capacity(cands.len());
         let mut vstein: Vec<f64> = Vec::with_capacity(cands.len());
         let mut vmass: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vlibce: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vent: Vec<f64> = Vec::with_capacity(cands.len());
+        let mut vgate: Vec<f64> = Vec::with_capacity(cands.len());
         for c in &cands {
             let mut lib = 0.0;
             let mut stein = 0.0;
+            let mut ent = 0.0;
             for s in &c.specs {
                 let v = cosine_row(&qc, s, TOL);
                 if v > lib {
                     lib = v;
+                }
+            }
+            // R2 CE band: same-band max; missing CE anywhere falls back to
+            // lib, so the variant never scores below lib on missing data.
+            let mut libce = lib;
+            if let Some(qce) = qc.ce {
+                let qb = ce_band(qce);
+                let mut found = false;
+                let mut best = 0.0;
+                for s in &c.specs {
+                    if s.ce.map(ce_band) == Some(qb) {
+                        found = true;
+                        let v = cosine_row(&qc, s, TOL);
+                        if v > best {
+                            best = v;
+                        }
+                    }
+                }
+                if found {
+                    libce = best;
                 }
             }
             let mut analog = 0.0;
@@ -1067,6 +1310,10 @@ fn sengine(params: EngineParams) {
                 if st > stein {
                     stein = st;
                 }
+                let en = ent_row(&qc.mz, &qc.w, &s.mz, &s.w, TOL);
+                if en > ent {
+                    ent = en;
+                }
             }
             vlib.push(lib);
             vanalog.push(analog);
@@ -1075,6 +1322,9 @@ fn sengine(params: EngineParams) {
             vbinw.push(bwscore);
             vstein.push(stein);
             vmass.push(mass_score(qnm, c.neutral));
+            vlibce.push(libce);
+            vent.push(ent);
+            vgate.push(gate_frac(&qc.mz, qc.prec, c.formula.as_ref()));
         }
         let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(VARIANTS.len() * 2);
         cols.insert("lib".to_string(), vlib);
@@ -1084,6 +1334,9 @@ fn sengine(params: EngineParams) {
         cols.insert("binw".to_string(), vbinw);
         cols.insert("stein".to_string(), vstein);
         cols.insert("mass".to_string(), vmass);
+        cols.insert("libce".to_string(), vlibce);
+        cols.insert("ent".to_string(), vent);
+        cols.insert("gate".to_string(), vgate);
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
         let t_chan = t0.elapsed();
         let mut ranked = fuse_rank(&keys, &cols, &params);
@@ -1099,6 +1352,19 @@ fn sengine(params: EngineParams) {
                         apply_mass_replace(&mut ranked, &ppm_of);
                     }
                 }
+            }
+        }
+        // R2 loss-gate demotion: stable-partition each ranked list so
+        // gate-passing keys keep order ahead of failing ones. Off = untouched.
+        if params.lossgate > 0.5 {
+            let gcol: &[f64] = cols.get("gate").map(Vec::as_slice).unwrap_or(&[]);
+            let gate_of: HashMap<String, f64> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), gcol.get(i).copied().unwrap_or(1.0)))
+                .collect();
+            for list in ranked.values_mut() {
+                partition_by_gate(list, &gate_of);
             }
         }
         let neutrals: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
@@ -1211,10 +1477,85 @@ mod engine_tests {
     fn adduct_table_matches_python() {
         assert!(approx(adduct_shift("[M+H]+").unwrap(), 1.007276));
         assert!(approx(adduct_shift("[M+Na]+").unwrap(), 22.989218));
+        assert!(approx(adduct_shift("[M+NH4]+").unwrap(), 18.033823));
+        assert!(approx(adduct_shift("[M+K]+").unwrap(), 38.963158));
+        assert!(approx(adduct_shift("[M-H]-").unwrap(), -1.007276));
+        assert!(approx(adduct_shift("[M+Cl]-").unwrap(), 34.968853));
+        assert!(approx(adduct_shift("[M-H2O+H]+").unwrap(), -17.003289));
         assert!(approx(adduct_shift("[M-2H2O+H]+").unwrap(), -35.013854));
         assert!(approx(adduct_shift("[M-H2O-H]-").unwrap(), -19.017841));
+        // R2: formate was 43.990901 (double-subtracted proton, ~1 Da off).
+        assert!(approx(adduct_shift("[M+CH2O2-H]-").unwrap(), 44.998203));
+        assert!(approx(adduct_shift("[M]+").unwrap(), 0.0));
         assert!(approx(500.0 - adduct_shift("[M+H]+").unwrap(), 498.992724));
         assert!(adduct_shift("[NOPE]").is_none());
+    }
+
+    #[test]
+    fn ce_band_edges() {
+        assert_eq!(ce_band(20.0), 0);
+        assert_eq!(ce_band(25.0), 0);
+        assert_eq!(ce_band(25.1), 1);
+        assert_eq!(ce_band(40.0), 1);
+        assert_eq!(ce_band(50.0), 1);
+        assert_eq!(ce_band(50.1), 2);
+        assert_eq!(ce_band(60.0), 2);
+    }
+
+    #[test]
+    fn entropy_single_peak_quarter_and_self_is_one() {
+        // single peak: S = 0 -> exponent 0.25.
+        assert!(approx(entropy_exp(&[3.0]), 0.25));
+        // empty/zero -> linear fallback.
+        assert!(approx(entropy_exp(&[]), 1.0));
+        // self-match is exactly 1.0 (same accumulation order both sides).
+        let mz = vec![100.0, 200.0, 300.0];
+        let w = vec![1.0, 0.5, 0.25];
+        assert!(approx(ent_row(&mz, &w, &mz, &w, 0.01), 1.0));
+        assert_eq!(ent_row(&[], &[], &mz, &w, 0.01), 0.0);
+    }
+
+    #[test]
+    fn gate_vacuous_passes_and_subset_logic() {
+        // no peaks -> vacuous 1.0, even without a formula.
+        assert!(approx(gate_frac(&[], 200.0, None), 1.0));
+        // hexose loss observed at prec - 162.052823.
+        let qmz = vec![37.947177, 150.0];
+        assert!(approx(gate_frac(&qmz, 200.0, None), 1.0)); // unknown = no gate
+        let mut full = BTreeMap::new();
+        full.insert("C".to_string(), 6);
+        full.insert("H".to_string(), 12);
+        full.insert("O".to_string(), 6);
+        assert!(approx(gate_frac(&qmz, 200.0, Some(&full)), 1.0));
+        let mut short = BTreeMap::new();
+        short.insert("C".to_string(), 6);
+        short.insert("H".to_string(), 12);
+        short.insert("O".to_string(), 4); // hexose needs O5
+        assert!(approx(gate_frac(&qmz, 200.0, Some(&short)), 0.0));
+        // formula parser: ethanol counts heavy atoms + implicit H (3+2+1).
+        let fc = formula_counts("CCO").unwrap();
+        assert_eq!(fc.get("C"), Some(&2));
+        assert_eq!(fc.get("O"), Some(&1));
+        assert_eq!(fc.get("H"), Some(&6));
+        assert_eq!(formula_counts(""), None);
+    }
+
+    #[test]
+    fn lossgate_partition_stable_pass_first() {
+        let mut list = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+        let mut g = HashMap::new();
+        g.insert("a".to_string(), 1.0);
+        g.insert("b".to_string(), 0.0);
+        g.insert("c".to_string(), 1.0);
+        partition_by_gate(&mut list, &g);
+        assert_eq!(list, vec!["a".to_string(), "c".to_string(), "b".to_string()]);
+        // missing key passes vacuously; empty list safe.
+        let mut list2 = vec!["z".to_string()];
+        partition_by_gate(&mut list2, &HashMap::new());
+        assert_eq!(list2, vec!["z".to_string()]);
+        let mut empty: Vec<String> = vec![];
+        partition_by_gate(&mut empty, &g);
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -1231,10 +1572,10 @@ mod engine_tests {
     #[test]
     fn channels_match_python_reference() {
         // banked reference: q=(100,200) vs k1 identical, k2 far, k3 near-miss
-        let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01);
-        let k1 = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01);
-        let k2 = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01);
-        let k3 = prepare(&[100.05, 300.0], &[0.9, 0.8], 301.0, 0.05, 0.01);
+        let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01, None);
+        let k1 = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01, None);
+        let k2 = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
+        let k3 = prepare(&[100.05, 300.0], &[0.9, 0.8], 301.0, 0.05, 0.01, None);
         assert!(approx(cosine_row(&q, &k1, TOL), 1.0));
         assert!(approx(cosine_row(&q, &k2, TOL), 0.0));
         let ql = loss_set(&q.mz, q.prec);
@@ -1329,11 +1670,11 @@ mod engine_tests {
         ];
         let eager: Vec<CSpectra> = raws
             .iter()
-            .map(|s| prepare(&s.mzs, &s.ints, s.prec, 0.05, 0.01))
+            .map(|s| prepare(&s.mzs, &s.ints, s.prec, 0.05, 0.01, None))
             .collect();
         let mut e = TableEntry {
             raw: raws, specs: None, smiles: "CCO".to_string(), fp: None,
-            neutral: Some(200.0),
+            neutral: Some(200.0), formula: None,
         };
         ensure_prepared(&mut e, 0.05, 0.01);
         assert!(e.raw.is_empty(), "raw dropped after prepare");
@@ -1357,7 +1698,7 @@ mod engine_tests {
         assert_eq!(e.specs.clone().unwrap().len(), eager.len());
         let mut e2 = TableEntry {
             raw: vec![], specs: None, smiles: String::new(), fp: None,
-            neutral: None,
+            neutral: None, formula: None,
         };
         ensure_prepared(&mut e2, 0.05, 0.01);
         assert_eq!(e2.fp, Some([0u64; 32]));
@@ -1401,14 +1742,14 @@ mod engine_tests {
     #[test]
     fn stein_mass_weighted_self_and_far() {
         // Stein-Scott-lite: self 1.0, far 0.0, and high-mass matches outweigh low-mass.
-        let q = prepare(&[100.0, 900.0], &[1.0, 1.0], 901.0, 0.05, 0.01);
-        let same = prepare(&[100.0, 900.0], &[1.0, 1.0], 901.0, 0.05, 0.01);
-        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01);
+        let q = prepare(&[100.0, 900.0], &[1.0, 1.0], 901.0, 0.05, 0.01, None);
+        let same = prepare(&[100.0, 900.0], &[1.0, 1.0], 901.0, 0.05, 0.01, None);
+        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
         assert!((stein_row(&q, &same, TOL) - 1.0).abs() < 1e-9);
         assert_eq!(stein_row(&q, &far, TOL), 0.0);
         // low-only vs high-only match: high-mass partial scores higher than low-mass partial
-        let low = prepare(&[100.0, 500.0], &[1.0, 1.0], 501.0, 0.05, 0.01);
-        let high = prepare(&[900.0, 500.0], &[1.0, 1.0], 901.0, 0.05, 0.01);
+        let low = prepare(&[100.0, 500.0], &[1.0, 1.0], 501.0, 0.05, 0.01, None);
+        let high = prepare(&[900.0, 500.0], &[1.0, 1.0], 901.0, 0.05, 0.01, None);
         assert!(stein_row(&q, &high, TOL) > stein_row(&q, &low, TOL));
         // cosine ties single-peak matches (both 0.5); stein separates by mass
         assert!((cosine_row(&q, &high, TOL) - cosine_row(&q, &low, TOL)).abs() < 1e-9);
@@ -1470,12 +1811,12 @@ mod engine_tests {
         // analog pool, and shifting it by (201-251)=-50 aligns it exactly,
         // so modified==1.0 is the CORRECT analog signal, not a false hit.
         // The runner caught the bad expectation; this is the corrected one.)
-        let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01);
-        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 301.0, 0.05, 0.01);
+        let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01, None);
+        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 301.0, 0.05, 0.01, None);
         assert_eq!(modified_row(&q, &far, TOL), 0.0);
         assert_eq!(cosine_row(&q, &far, TOL), 0.0);
         // in-pool shifted matches DO hit — that is the analog signal itself.
-        let near = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01);
+        let near = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
         assert_eq!(modified_row(&q, &near, TOL), 1.0);
         assert_eq!(cosine_row(&q, &near, TOL), 0.0);
     }

@@ -126,6 +126,25 @@ def test_engine_query_carries_qnm():
     json.dumps(m)
 
 
+def test_ce_single_values_and_merges():
+    assert R._ce_single(20.0) == 20.0
+    assert R._ce_single("40") == 40.0
+    assert R._ce_single([20.0]) == 20.0
+    assert R._ce_single([20, 40, 60]) is None  # merged ramp matches any band
+    assert R._ce_single(None) is None
+    assert R._ce_single(float("nan")) is None
+
+
+def test_engine_query_carries_ce():
+    qrec = dict(_qrec(_table(), 0))
+    qrec["ce"] = 40.0
+    m = R.build_engine_query(qrec, ["k1"], ["k2"], 0)
+    assert m["q"]["ce"] == 40.0
+    json.dumps(m)
+    m2 = R.build_engine_query(_qrec(_table(), 0), ["k1"], ["k2"], 0)
+    assert m2["q"]["ce"] is None  # missing CE degrades, never crashes
+
+
 class _StubEngine:
     def __init__(self, ranked):
         self.ranked = ranked
@@ -173,6 +192,7 @@ def test_load_table_stub_parquet(tmp_path):
         "precursor_mz": [201.0, 251.0],
         "adduct": ["[M+H]+", "[M+H]+"],
         "instrument_type": ["timsTOF", "Orbitrap"],
+        "collision_energy_ev": [[20.0], [20.0, 40.0]],
         "ms2_mzs": [[100.0, 200.0], [150.0]],
         "ms2_normalized_intensities": [[1.0, 0.5], [1.0]],
     }), p)
@@ -181,4 +201,5 @@ def test_load_table_stub_parquet(tmp_path):
     assert T["smiles"] == ["CCO", "CCC"]
     assert T["prec"].tolist() == [201.0, 251.0]
     assert T["instrument"].tolist() == ["timsTOF", "Orbitrap"]
+    assert T["ce"] == [20.0, None]  # single CE passes, merged ramp -> None
     assert [a.tolist() for a in T["mzs"]] == [[100.0, 200.0], [150.0]]

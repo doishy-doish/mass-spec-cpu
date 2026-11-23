@@ -81,27 +81,42 @@ def pool_rerank_by_instrument(pool_keys, key2inst: dict, q_inst: str):
 
 # Neighbor reinterpretations, self first. Protonated / deprotonated lanes
 # stay separate (charge flip is never a "neighbor"). Keys are lowercase;
-# values are canonical data-case (train data uses [M+H]+ / [M-H]-).
+# values are canonical data-case. R2 (2026-11-23): completed for all 10
+# test-set adducts — the water-loss keys ([m-h2o+h]+, [m-2h2o+h]+,
+# [m-h2o-h]-) and the test formate string ([m+ch2o2-h]-) were missing, so retry silently fell back to self on exactly the
+# hidden-test chemistry. Train strings ([m+h-h2o]+, [m+hcoo]-) kept.
 ADDUCT_NEIGHBORS = {
     "[m+h]+": ["[M+H]+", "[M+Na]+", "[M+K]+", "[M+H-H2O]+", "[M+NH4]+"],
     "[m+na]+": ["[M+Na]+", "[M+H]+", "[M+K]+"],
     "[m+k]+": ["[M+K]+", "[M+Na]+", "[M+H]+"],
     "[m+nh4]+": ["[M+NH4]+", "[M+H]+", "[M+Na]+"],
     "[m+h-h2o]+": ["[M+H-H2O]+", "[M+H]+"],
+    "[m-h2o+h]+": ["[M-H2O+H]+", "[M+H]+", "[M+Na]+"],
+    "[m-2h2o+h]+": ["[M-2H2O+H]+", "[M-H2O+H]+", "[M+H]+"],
     "[m-h]-": ["[M-H]-", "[M+Cl]-", "[M+HCOO]-", "[M+CH3COO]-"],
     "[m+cl]-": ["[M+Cl]-", "[M-H]-"],
     "[m+hcoo]-": ["[M+HCOO]-", "[M-H]-"],
+    "[m+ch2o2-h]-": ["[M+CH2O2-H]-", "[M-H]-", "[M+HCOO]-"],
+    "[m-h2o-h]-": ["[M-H2O-H]-", "[M-H]-"],
 }
 
-# Neutral-mass deltas for the retry lane (Da). Applied as prec shift so the
-# existing neutral-mass pipeline (structs) can be reused without new math.
-# Values are monoisotopic adduct-mass differences vs the base lane ion.
+# Neutral-mass deltas for the retry lane (Da). Positive-lane deltas are
+# prec offsets vs the [M+H]+ frame; negative-lane vs the [M-H]- frame.
+# R2: added the test-set water-loss/formate keys ([m-h2o+h]+ and
+# [m-h2o-h]- share the -18.01056 H2O mass; [m-2h2o+h]+ doubles it;
+# [m+ch2o2-h]- matches the Rust formate shift 44.998203 in this frame:
+# (M+44.998203) - (M-1.007276) = 46.00548). Fixed [m+cl]- (was 35.97668,
+# forgot the electron mass; correct 34.968853+1.007276 = 35.97613).
 ADDUCT_DELTA = {
     "[m+na]+": 21.98194,   # Na - H
     "[m+k]+": 37.95588,    # K - H
     "[m+nh4]+": 17.02655,  # NH4 - H
     "[m+h-h2o]+": -18.01056,
-    "[m+cl]-": 35.97668,   # Cl + H (vs [M-H]- neutral frame)
+    "[m-h2o+h]+": -18.01056,
+    "[m-2h2o+h]+": -36.02113,
+    "[m+ch2o2-h]-": 46.00548,
+    "[m-h2o-h]-": -18.01056,
+    "[m+cl]-": 35.97613,   # Cl + H (vs [M-H]- neutral frame)
     "[m+hcoo]-": 46.00548,
     "[m+ch3coo]-": 60.02113,
 }

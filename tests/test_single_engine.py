@@ -84,7 +84,8 @@ def test_rust_engine_present():
 def test_variants_complete():
     from mscpu import run as R
     assert set(R.VARIANTS) == {"z", "lib", "analog", "frag", "rrf", "cascade",
-                               "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure"}
+                               "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure",
+                               "libce", "ent", "gate"}
 
 def test_fusion_defaults_neutral():
     from mscpu import run as R
@@ -93,7 +94,7 @@ def test_fusion_defaults_neutral():
                                  "rout_lib": 0.5, "rout_bin": 0.4,
                                  "rout_binw": 0.4,
                                  "mass_replace": 0.0, "recall_topk": 0.0,
-                                 "funnel_off": 0.0}
+                                 "funnel_off": 0.0, "lossgate": 0.0}
 
 
 def test_good_probe_plumbing():

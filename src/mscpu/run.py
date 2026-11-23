@@ -25,7 +25,7 @@ from . import metric as M
 from . import validation as V
 from . import input_plugs as IP
 
-VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure"]
+VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure", "libce", "ent", "gate"]
 
 # BET-EVOLVE genome defaults (replication queue #3): neutral = legacy behavior
 # bit-identically (wl/wa/wf/rl/ra/rf = 1.0, casc_z = 3.0, rout_* = legacy gates).
@@ -34,7 +34,8 @@ VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw
 FUSION_DEFAULTS = {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0, "ra": 1.0,
                    "rf": 1.0, "casc_z": 3.0, "rout_lib": 0.5,
                    "rout_bin": 0.4, "rout_binw": 0.4,
-                   "mass_replace": 0.0, "recall_topk": 0.0, "funnel_off": 0.0}
+                   "mass_replace": 0.0, "recall_topk": 0.0,
+                   "funnel_off": 0.0, "lossgate": 0.0}
 
 
 TRAIN_COLS = ["inchikey14", "normalized_smiles", "precursor_mz",
@@ -93,7 +94,62 @@ def load_table(path: str, train: bool = True) -> dict:
     T["ints"] = ints
     _ = nb  # row-group count (log only, batching is by row count above)
     assert len(T["prec"]) == n
+    try:
+        T["ce"] = _load_ce_column(path, n)
+    except Exception:
+        T["ce"] = [None] * n
     return T
+
+
+def _ce_single(v):
+    """One CE value in eV, or None when unknown/merged (R2).
+
+    Train/test store single eV, lists (merged ramps like [20,40,60]),
+    or nulls. Merged ramps match any band, so they arrive as None and
+    the engine falls back to all-specs scoring for them.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        vals = []
+        for x in v:
+            try:
+                f = float(x)
+            except (TypeError, ValueError):
+                continue
+            if f == f:
+                vals.append(f)
+        uniq = sorted(set(vals))
+        if len(uniq) == 1:
+            return uniq[0]
+        return None
+    try:
+        import numpy as _np
+        if isinstance(v, _np.ndarray):
+            return _ce_single(v.tolist())
+        if isinstance(v, _np.generic):
+            v = float(v)
+    except Exception:
+        pass
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _load_ce_column(path, n):
+    """Optional collision-energy column (R2 CE band). Never raises: a
+    missing/unreadable column degrades to all-None (engine falls back)."""
+    try:
+        import pyarrow.parquet as pq
+        t = pq.read_table(path, columns=["collision_energy_ev"])
+        col = t.column(0).to_pylist()
+        if len(col) != n:
+            return [None] * n
+        return [_ce_single(v) for v in col]
+    except Exception:
+        return [None] * n
 
 
 def _mem_state():
@@ -216,15 +272,24 @@ def build_preload_chunks(lib_by_key: dict, Tlib: dict, key2smi: dict,
     one, drop it. Never materialize the full library in the parent.
     """
     keys = sorted(lib_by_key)
+    tce = (Tlib.get("ce") if isinstance(Tlib, dict) else []) or []
     for i in range(0, len(keys), per):
         ks = keys[i:i + per]
         specs = []
         for k in ks:
             ss = []
             for j in lib_by_key.get(k, []):
+                ce = None
+                try:
+                    ce = tce[int(j)]
+                    ce = None if ce is None else float(ce)
+                    if ce != ce:
+                        ce = None
+                except Exception:
+                    ce = None
                 ss.append({"mzs": Tlib["mzs"][int(j)].tolist(),
                            "ints": Tlib["ints"][int(j)].tolist(),
-                           "prec": float(Tlib["prec"][int(j)])})
+                           "prec": float(Tlib["prec"][int(j)]), "ce": ce})
             specs.append(ss)
         nk = []
         for k in ks:
@@ -297,7 +362,14 @@ def build_engine_query(qrec: dict, cand_keys, pool_keys,
     """
     qm = [float(x) for x in np.ascontiguousarray(qrec["mzs"], dtype=np.float64).tolist()]
     qi_ = [float(x) for x in np.ascontiguousarray(qrec["ints"], dtype=np.float64).tolist()]
-    return {"q": {"mzs": qm, "ints": qi_, "prec": float(qrec["prec"])},
+    ce = qrec.get("ce")
+    try:
+        ce = None if ce is None else float(ce)
+        if ce != ce:
+            ce = None
+    except (TypeError, ValueError):
+        ce = None
+    return {"q": {"mzs": qm, "ints": qi_, "prec": float(qrec["prec"]), "ce": ce},
             "cand_keys": [str(k) for k in cand_keys],
             "pool_keys": [str(k) for k in pool_keys], "qi": int(qi),
             "qnm": (None if qnm is None else float(qnm))}
@@ -373,7 +445,8 @@ def score_one(sel, engine):
     """
     qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel
     V_ = _SE["variants"]
-    qrec = {"mzs": _SE["qmzs"][qi], "ints": _SE["qints"][qi], "prec": prec_q}
+    qrec = {"mzs": _SE["qmzs"][qi], "ints": _SE["qints"][qi], "prec": prec_q,
+            "ce": (_SE.get("qce") or {}).get(qi)}
     qmsg = build_engine_query(qrec, cand_keys, pool_keys, qi,
                               _SE["qnm"].get(qi))
     try:
@@ -435,6 +508,8 @@ def main() -> None:
                     help="0 = off; else engine echoes first-K funnel pool keys for recall scoring")
     ap.add_argument("--funnel-off", type=int, default=0,
                     help="1 = disable Jaccard prefilter (I6 A/B: donor-retention question)")
+    ap.add_argument("--loss-gate", type=int, default=0,
+                    help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -559,7 +634,8 @@ def main() -> None:
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw,
               "mass_replace": 1.0 if a.mass_replace else 0.0,
               "recall_topk": float(a.recall_topk or 0.0),
-              "funnel_off": 1.0 if a.funnel_off else 0.0}
+              "funnel_off": 1.0 if a.funnel_off else 0.0,
+              "lossgate": 1.0 if a.loss_gate else 0.0}
     # M211: select FIRST from small arrays, preload ONLY the union of keys
     # queries touch, slim T BEFORE spawning the engine. Two full in-memory
     # copies (parent tables + engine raw table) exceed the 16GB runner —
@@ -571,6 +647,7 @@ def main() -> None:
                qmzs={qi: T["mzs"][qi] for qi in qset},
                qints={qi: T["ints"][qi] for qi in qset},
                qprec={qi: float(T["prec"][qi]) for qi in qset},
+               qce={qi: T["ce"][int(qi)] for qi in qset},
                qkey={qi: str(T["key14"][qi]) for qi in qset},
                qinst={qi: str(T["instrument"][qi]) for qi in qset},
                key2inst=key2inst,
@@ -675,6 +752,8 @@ def main() -> None:
             "mrr_mass": _avg(rrs["mass"]),
             "mrr_zw": _avg(rrs["zw"]), "mrr_rrfw": _avg(rrs["rrfw"]),
             "mrr_pure": _avg(rrs["pure"]),
+            "mrr_libce": _avg(rrs["libce"]), "mrr_ent": _avg(rrs["ent"]),
+            "mrr_gate": _avg(rrs["gate"]),
             "fusion": fusion,
            "recall_topk_k": float(a.recall_topk or 0.0),
            "recall_at_k": _avg(_SE.get("recall_hits") or []),
