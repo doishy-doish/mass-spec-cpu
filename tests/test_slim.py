@@ -74,6 +74,7 @@ def test_slim_round_trip_exact(tmp_path):
     b = bytearray(open(p, "rb").read())
     b[10] ^= 1
     assert hashlib.sha256(bytes(b)).hexdigest() != man["files"]["prec.f64.zst"]
-    # zstandard is genuinely compressing (not a pass-through)
-    raw = d["mz_all"].tobytes()
-    assert len(open(os.path.join(str(tmp_path), "mz_data.zst"), "rb").read()) < len(raw)
+    # zstandard is genuinely compressing (not a pass-through) — on a real-size
+    # array; tiny synthetic arrays are smaller raw than the frame overhead.
+    big = np.sort(np.random.default_rng(7).random(2000) * 2000 + 50)
+    assert len(B.enc_deltas_f64(big)) < len(big.tobytes())
