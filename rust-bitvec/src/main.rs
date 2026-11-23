@@ -827,11 +827,16 @@ fn sengine(params: EngineParams) {
         if line.trim().is_empty() {
             continue;
         }
+        let t0 = std::time::Instant::now();
+        let ipc_bytes = line.len();
         let q: EngineQuery = serde_json::from_str(&line).expect("sengine: parse query");
+        let t_parse = t0.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let qc = prepare(&q.q.mzs, &q.q.ints, q.q.prec, params.qpeak, params.qloss);
         let qloss = loss_set(&qc.mz, qc.prec);
         let qn = qloss.len().max(1) as f64;
         // candidates
+        let t_qprep = t0.elapsed();
         let mut cands: Vec<CandData> = Vec::with_capacity(q.cands.len());
         for c in &q.cands {
             let fp = fp_cache
@@ -862,6 +867,7 @@ fn sengine(params: EngineParams) {
             });
         }
         // pool (input order = distance order from the launcher; keep it)
+        let t_cands = t0.elapsed();
         let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(q.pool.len());
         for p in &q.pool {
             // pool first-spectrum == candidate position 0 for the same key,
@@ -883,6 +889,7 @@ fn sengine(params: EngineParams) {
             pool.push((p.key.clone(), s, (p.prec - qc.prec).abs(), fp));
         }
         // funnel: jaccard over first-spectrum bits when the pool is big
+        let t_pool = t0.elapsed();
         let mut pool_idx: Vec<usize> = (0..pool.len()).collect();
         if pool.len() > FUNNEL_MIN && qc.bits.iter().any(|&w| w != 0) {
             let mut scored: Vec<(f64, f64, usize)> = pool
@@ -901,6 +908,7 @@ fn sengine(params: EngineParams) {
             pool_idx.truncate(POOL_CAP);
         }
         // analog hits: first-spectrum mass-shift matches, ms > thresh, top 10
+        let t_funnel = t0.elapsed();
         let mut hits: Vec<([u64; 32], f64)> = Vec::new();
         for &i in &pool_idx {
             let (_, s, _, fp) = &pool[i];
@@ -916,6 +924,7 @@ fn sengine(params: EngineParams) {
         hits.truncate(TOP_N_ANALOG);
         // channels per candidate, accumulated in locals then inserted once
         // (was: a HashMap lookup per channel per candidate).
+        let t_analog = t0.elapsed();
         let mut vlib: Vec<f64> = Vec::with_capacity(cands.len());
         let mut vanalog: Vec<f64> = Vec::with_capacity(cands.len());
         let mut vfrag: Vec<f64> = Vec::with_capacity(cands.len());
@@ -980,6 +989,7 @@ fn sengine(params: EngineParams) {
         cols.insert("stein".to_string(), vstein);
         cols.insert("mass".to_string(), vmass);
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
+        let t_chan = t0.elapsed();
         let ranked = fuse_rank(&keys, &cols, &params);
         let neutrals: Vec<Option<f64>> = q.cands.iter().map(|c| c.neutral).collect();
         let mass_swap = mass_swap_flag(
@@ -988,6 +998,7 @@ fn sengine(params: EngineParams) {
             q.qnm,
             &neutrals,
         );
+        let t_fuse = t0.elapsed();
         writeln!(
             h,
             "{}",
@@ -1000,7 +1011,8 @@ fn sengine(params: EngineParams) {
         )
         .unwrap();
         h.flush().unwrap();
-        writeln!(err, "sengine q={} cands={} pool={}", q.qi, keys.len(), pool_idx.len())
+        let t_ser = t0.elapsed();
+        writeln!(err, "sengine q={} cands={} pool={} ipc={} t_parse={:.1} t_qprep={:.1} t_cands={:.1} t_pool={:.1} t_funnel={:.1} t_analog={:.1} t_chan={:.1} t_fuse={:.1} t_ser={:.1} t_tot={:.1}", q.qi, keys.len(), pool_idx.len(), ipc_bytes, ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), ms(t_pool - t_cands), ms(t_funnel - t_pool), ms(t_analog - t_funnel), ms(t_chan - t_analog), ms(t_fuse - t_chan), ms(t_ser - t_fuse), ms(t_ser))
             .unwrap();
     }
 }
