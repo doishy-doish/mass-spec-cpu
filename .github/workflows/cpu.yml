@@ -104,8 +104,8 @@ jobs:
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
-      - name: probe assertions (GOOD PROBE — fails loud, never ships blind)
-        if: ${{ inputs.task == 'validate' }}
+      - name: smart probe (GREEN / RED / INFRA — never ships blind, never cries code-bug on host death)
+        if: ${{ always() && inputs.task == 'validate' }}
         env:
           MASK: ${{ inputs.mask }}
           SHARD: ${{ inputs.shard }}
@@ -125,19 +125,46 @@ jobs:
           mask = os.environ["MASK"]; shard = os.environ["SHARD"]; suffix = os.environ.get("SUFFIX","")
           nreq = int(os.environ.get("NREQ","0") or 0)
           path = f"results/{mask}-{shard}{suffix}.json"
+          status_path = path + ".status"
+          verdict_path = f"results/verdict-{mask}-{shard}{suffix}.txt"
+          def emit(verdict, lines):
+              msg = f"SMART-PROBE {verdict}: " + "; ".join(lines)
+              print(msg, flush=True)
+              try:
+                  with open(verdict_path, "w") as vf:
+                      vf.write(verdict + "\n" + "\n".join(lines) + "\n")
+              except Exception as e:
+                  print(f"(verdict file unwritable: {e})", flush=True)
+              # INFRA exits 3 so the step table tells host-death apart from code-RED (exit 1).
+              sys.exit({"GREEN": 0, "RED": 1, "INFRA": 3}[verdict])
           cands = [path] + sorted(glob.glob(f"results/{mask}-{shard}*.json"))
+          # never mistake the sidecar (.status) or verdict file for output
+          cands = [c for c in cands if not c.endswith((".status", ".txt"))]
           fp = next((c for c in cands if os.path.exists(c)), None)
+          status_txt = None
+          try:
+              if os.path.exists(status_path):
+                  with open(status_path) as sf:
+                      status_txt = sf.read()
+          except Exception:
+              status_txt = None
+          if fp is None:
+              started = bool(status_txt and "STARTED" in status_txt)
+              pre = bool(status_txt and "PRECOMPUTE-DONE" in status_txt)
+              sigterm = bool(status_txt and "SIGTERM" in status_txt)
+              emit("INFRA", [f"no output file (looked for {path})",
+                             f"sidecar started={started} precompute={pre} sigterm={sigterm}",
+                             "host died before JSON existed — retry with backoff, do NOT revert code"])
+          print(f"SMART-PROBE checking {fp} (+ {status_path})");
           red = []
           def need(cond, msg):
               if not cond: red.append(msg)
-          if fp is None:
-              print(f"GOOD-PROBE RED: no output file (looked for {path} + {cands}) — probe missed everything it was sent to check");
-              sys.exit(1)
-          print(f"GOOD-PROBE checking {fp}");
           try:
               out = json.load(open(fp))
           except Exception as e:
-              print(f"GOOD-PROBE RED: unreadable JSON {fp}: {e}"); sys.exit(1)
+              if status_txt and "DONE" not in status_txt:
+                  emit("INFRA", [f"unreadable JSON {fp}: {e}", "run never reached DONE — host died mid-write, retry"])
+              emit("RED", [f"unreadable JSON {fp}: {e}"])
           # 1. engine + shape: the probe ran the Rust engine on real queries
           need(out.get("engine") == "rust", f"engine != rust ({out.get('engine')!r}) — wrong binary path or fallback")
           n = out.get("n", 0)
@@ -180,9 +207,8 @@ jobs:
               moved = (rrs.get("zw") != rrs.get("z")) or (rrs.get("rrfw") != rrs.get("rrf"))
               need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
           if red:
-              print("GOOD-PROBE RED:");
-              [print(" - " + r) for r in red]; sys.exit(1)
-          print(f"GOOD-PROBE GREEN: {fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f}")
+              emit("RED", red)
+          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f}"])
           PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}

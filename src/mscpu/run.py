@@ -45,28 +45,51 @@ def load_table(path: str, train: bool = True) -> dict:
     Row order == parquet order, so mask splits stay identical. String columns
     are coerced with str() (None-safe); ragged peak lists become float64 arrays
     (None row -> empty, same as the old raw_list behavior).
+
+    Streams in batches (M197): one pq.read_table(2.5M rows) held the GIL for
+    tens of seconds with no heartbeat and died 4x at the same age. Per-batch
+    prints land between C calls so the next death has a location.
     """
     import pyarrow.parquet as pq
     cols = TRAIN_COLS if train else ["molecule_id", "precursor_mz", "adduct",
                                      "ms2_mzs", "ms2_normalized_intensities"]
-    t = pq.read_table(path, columns=cols)
-    n = t.num_rows
+    pf = pq.ParquetFile(path, memory_map=True)
+    nb = pf.num_row_groups
+    key14, smiles, instrument, mid = [], [], [], []
+    prec, adduct, mzs, ints = [], [], [], []
+    seen = 0
+    for bi, batch in enumerate(pf.iter_batches(batch_size=250_000, columns=cols)):
+        d = batch.to_pydict()
+        n = batch.num_rows
+        if train:
+            key14.extend(str(x) for x in d["inchikey14"])
+            smiles.extend(str(x) for x in d["normalized_smiles"])
+            instrument.extend(str(x) for x in d["instrument_type"])
+        else:
+            mid.extend(str(x) for x in d["molecule_id"])
+        prec.extend(float(x) for x in d["precursor_mz"])
+        adduct.extend(str(x) for x in d["adduct"])
+        for v in d["ms2_mzs"]:
+            mzs.append(np.empty(0, dtype=np.float64) if v is None
+                       else np.ascontiguousarray(v, dtype=np.float64))
+        for v in d["ms2_normalized_intensities"]:
+            ints.append(np.empty(0, dtype=np.float64) if v is None
+                        else np.ascontiguousarray(v, dtype=np.float64))
+        seen += n
+        print(f"LOAD batch {bi + 1} rows={seen} (+{n})", flush=True)
+    n = seen
     T = {}
     if train:
-        T["key14"] = np.array([str(x) for x in t.column("inchikey14").to_pylist()])
-        T["smiles"] = [str(x) for x in t.column("normalized_smiles").to_pylist()]
-        T["instrument"] = np.array([str(x) for x in t.column("instrument_type").to_pylist()])
+        T["key14"] = np.array(key14)
+        T["smiles"] = smiles
+        T["instrument"] = np.array(instrument)
     else:
-        T["mid"] = np.array([str(x) for x in t.column("molecule_id").to_pylist()])
-    T["prec"] = np.array([float(x) for x in t.column("precursor_mz").to_pylist()],
-                          dtype=np.float64)
-    T["adduct"] = np.array([str(x) for x in t.column("adduct").to_pylist()])
-    T["mzs"] = [np.empty(0, dtype=np.float64) if v is None
-                else np.ascontiguousarray(v, dtype=np.float64)
-                for v in t.column("ms2_mzs").to_pylist()]
-    T["ints"] = [np.empty(0, dtype=np.float64) if v is None
-                 else np.ascontiguousarray(v, dtype=np.float64)
-                 for v in t.column("ms2_normalized_intensities").to_pylist()]
+        T["mid"] = np.array(mid)
+    T["prec"] = np.array(prec, dtype=np.float64)
+    T["adduct"] = np.array(adduct)
+    T["mzs"] = mzs
+    T["ints"] = ints
+    _ = nb  # row-group count (log only, batching is by row count above)
     assert len(T["prec"]) == n
     return T
 
@@ -95,8 +118,15 @@ def _sigterm_loud(signum, frame):
     rss, avail = _mem_state()
     try:
         print("LOUD-SIGTERM host shutdown rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
-    finally:
-        os._exit(143)
+    except Exception:
+        pass
+    try:
+        if _STATUS_PATH:
+            with open(_STATUS_PATH, "a") as sf:
+                sf.write("SIGTERM host shutdown\n")
+    except Exception:
+        pass
+    os._exit(143)
 
 
 def _mem_watch(stop, interval=20.0):
@@ -198,6 +228,8 @@ def build_engine_query(Tlib: dict, qrec: dict, cand_keys, pool_keys,
 
 
 _SE = {}
+
+_STATUS_PATH = None
 
 
 def _worker():
@@ -304,6 +336,13 @@ def main() -> None:
         stem, dot, ext = tail.rpartition(".")
         tail2 = stem + a.out_suffix + dot + ext if dot else tail + a.out_suffix
         out_path = head + sep + tail2 if sep else tail2
+    global _STATUS_PATH
+    _STATUS_PATH = out_path + ".status"
+    try:
+        with open(_STATUS_PATH, "w") as sf:
+            sf.write("STARTED mask=" + str(a.mask) + " shard=" + str(a.shard) + "\n")
+    except Exception:
+        pass
 
     T = load_table(a.data, train=True)
     pool = V.query_pool(T).tolist()
@@ -383,6 +422,11 @@ def main() -> None:
     print("precompute done lib_keys=" + str(len(lib_by_key)) + " queries=" + str(len(queries))
           + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),
           flush=True)  # HEARTBEAT
+    try:
+        with open(_STATUS_PATH, "a") as sf:
+            sf.write("PRECOMPUTE-DONE lib_keys=" + str(len(lib_by_key)) + " queries=" + str(len(queries)) + "\n")
+    except Exception:
+        pass
     tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
     results = []
     if a.jobs > 1 and len(tasks) > 1:
@@ -434,6 +478,11 @@ def main() -> None:
            "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps]}
     with open(out_path, "w") as f:
         json.dump(out, f)
+    try:
+        with open(_STATUS_PATH, "a") as sf:
+            sf.write("DONE n=" + str(len(rrs["z"])) + "\n")
+    except Exception:
+        pass
     try:
         if _SE.get("worker") is not None:
             _SE["worker"].close()
