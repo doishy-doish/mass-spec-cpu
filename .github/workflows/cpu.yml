@@ -11,10 +11,10 @@ on:
         description: "queries"
         default: "200"
       task:
-        description: "validate, predict, or gates (checks-only: build+test, no data, no run)"
+        description: "validate, predict, slimbuild (one-time store), or gates (checks-only: build+test, no data, no run)"
         default: "validate"
         type: choice
-        options: [validate, predict, gates]
+        options: [validate, predict, slimbuild, gates]
       shard:
         description: "shard index"
         default: "0"
@@ -132,6 +132,21 @@ jobs:
       - run: pip install -q pytest zstandard && python -m pytest -q tests/
         env:
           PYTHONPATH: src
+      - name: restore slim cache (miss = parquet fallback, lossless)
+        if: ${{ inputs.task == 'validate' || inputs.task == 'predict' }}
+        uses: actions/cache@v4
+        with:
+          path: data/slim
+          key: slim-store-v1
+      - name: build slim store (one-time convert, then cached)
+        if: ${{ inputs.task == 'slimbuild' }}
+        run: PYTHONPATH=src python scripts/build_slim.py --train data/train.parquet --rust-bin rust-bitvec/target/release/binvec --out data/slim
+      - name: save slim cache
+        if: ${{ inputs.task == 'slimbuild' }}
+        uses: actions/cache@v4
+        with:
+          path: data/slim
+          key: slim-store-v1
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --formula-ppm "${{ inputs.formula-ppm }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --loss-gate "${{ inputs.loss-gate }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json

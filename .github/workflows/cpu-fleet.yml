@@ -72,6 +72,11 @@ jobs:
       - run: pip install -q pytest && python -m pytest -q tests/
         env:
           PYTHONPATH: src
+      - name: restore slim cache (miss = parquet fallback, lossless)
+        uses: actions/cache@v4
+        with:
+          path: data/slim
+          key: slim-store-v1
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ matrix.shard }}" --shards "20" --jobs "5" --out results/${{ inputs.mask }}-${{ matrix.shard }}.json
