@@ -60,9 +60,9 @@ const ROUTER_BIN: f64 = 0.4;
 const ROUTER_BINW: f64 = 0.4;
 const CASCADE_Z: f64 = 3.0;
 const TOP_K_OUT: usize = 25;
-const VARIANTS: [&str; 14] = [
+const VARIANTS: [&str; 15] = [
     "lib", "analog", "frag", "bin", "binw", "stein", "mass", "z", "rrf", "rrfb", "cascade", "router",
-    "zw", "rrfw",
+    "zw", "rrfw", "pure",
 ];
 
 fn mix(x: u64, salt: u64) -> u64 {
@@ -618,6 +618,27 @@ fn fuse_rank(
     let libz = z_of(&lib);
     let analogz = z_of(&analog);
     let fragz = z_of(&frag);
+    let steinz = z_of(&stein);
+    let massz = z_of(&mass);
+    // pure (pure-algo canary v0): equal-weight z of stein + frag + mass.
+    // All three already exist as standalone channels; this only fuses them.
+    // Predicted class2 N=10: lands between frag and stein (~0.7-0.8); measures
+    // whether the combo beats stein alone. N=10 is smoke + direction, fit nothing.
+    let pure: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut s = 0.0;
+            if !steinz[i].is_nan() {
+                s += steinz[i];
+            }
+            if !fragz[i].is_nan() {
+                s += fragz[i];
+            }
+            if !massz[i].is_nan() {
+                s += massz[i];
+            }
+            s
+        })
+        .collect();
     let z: Vec<f64> = (0..n)
         .map(|i| {
             [libz[i], analogz[i], fragz[i]]
@@ -717,6 +738,7 @@ fn fuse_rank(
         ("router", router),
         ("zw", zw),
         ("rrfw", rrfw),
+        ("pure", pure),
     ];
     for (name, vals) in named {
         let kv: Vec<String> = order_desc(&vals)
@@ -1071,6 +1093,27 @@ mod engine_tests {
         assert_eq!(ranked["rrf"][0], "a");
         assert_eq!(ranked["rrf"][1], "b");
         assert_eq!(ranked["rrf"][2], "c");
+    }
+
+    #[test]
+    fn pure_fusion_sums_channels() {
+        // pure = z(stein) + z(frag) + z(mass), equal weights, NaN-skipped.
+        // stein [0.9,0.5,0.0] -> z [0.9610,0.0739,-1.0349]
+        // frag  [0.3,0.3,0.9] -> z [-0.5774,-0.5774,1.1547]
+        // mass  [1.0,0.5,0.0] -> z [1.0,0.0,-1.0]
+        // pure = [1.3836,-0.5035,-0.8802] -> order a,b,c.
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut cols = HashMap::new();
+        cols.insert("lib".to_string(), vec![0.9, 0.5, 0.0]);
+        cols.insert("analog".to_string(), vec![0.2, 0.8, 0.1]);
+        cols.insert("frag".to_string(), vec![0.3, 0.3, 0.9]);
+        cols.insert("bin".to_string(), vec![0.0, 0.0, 0.0]);
+        cols.insert("binw".to_string(), vec![0.0, 0.0, 0.0]);
+        cols.insert("stein".to_string(), vec![0.9, 0.5, 0.0]);
+        cols.insert("mass".to_string(), vec![1.0, 0.5, 0.0]);
+        let fw = EngineParams::neutral(0.05, 0.01);
+        let ranked = fuse_rank(&keys, &cols, &fw);
+        assert_eq!(ranked["pure"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 
     #[test]
