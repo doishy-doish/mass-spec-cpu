@@ -42,57 +42,67 @@ def test_structs_payload_schema():
                 "adducts": adducts, "queries": sq})
 
 
-def test_engine_query_schema():
+def test_preload_chunks_schema():
     T = _table()
-    m = R.build_engine_query(T, _qrec(T, 0), ["k1"], ["k2"],
-                             {"k1": [0, 1], "k2": [2]},
-                             {"k1": "CCO", "k2": "CCC"}, {}, 0)
-    assert set(m) == {"q", "cands", "pool", "qi", "qnm"}
+    lib_by_key = {"k1": [0, 1], "k2": [2]}
+    chunks = R.build_preload_chunks(lib_by_key, T, {"k1": "CCO", "k2": "CCC"},
+                                    {"k1": 200.0, "k2": None}, per=1)
+    assert len(chunks) == 2
+    c0 = json.loads(chunks[0])["preload"]
+    assert c0["keys"] == ["k1"] and c0["smiles"] == ["CCO"]
+    assert c0["neutrals"] == [200.0] and len(c0["specs"][0]) == 2
+    c1 = json.loads(chunks[1])["preload"]
+    assert c1["neutrals"] == [None]  # M198: null, never NaN (serde rejects NaN)
+
+
+def test_engine_query_schema():
+    m = R.build_engine_query(_qrec(_table(), 0), ["k1"], ["k2"], 0)
+    assert set(m) == {"q", "cand_keys", "pool_keys", "qi", "qnm"}
     assert m["qi"] == 0 and m["qnm"] is None
-    assert len(m["cands"]) == 1 and len(m["cands"][0]["specs"]) == 2
-    assert m["cands"][0]["neutral"] is None
-    assert len(m["pool"]) == 1 and m["pool"][0]["key"] == "k2"
+    assert m["cand_keys"] == ["k1"] and m["pool_keys"] == ["k2"]
     assert m["q"]["prec"] == 201.0
     json.dumps(m)
 
 
-def test_engine_query_carries_neutrals():
-    T = _table()
-    m = R.build_engine_query(T, _qrec(T, 0), ["k1"], ["k2"],
-                             {"k1": [0, 1], "k2": [2]},
-                             {"k1": "CCO", "k2": "CCC"},
-                             {"k1": 200.0, "k2": 250.0}, 0, 200.0)
+def test_engine_query_carries_qnm():
+    m = R.build_engine_query(_qrec(_table(), 0), ["k1"], ["k2"], 0, 200.0)
     assert m["qnm"] == 200.0
-    assert m["cands"][0]["neutral"] == 200.0
     json.dumps(m)
 
 
 class _StubEngine:
     def __init__(self, ranked):
         self.ranked = ranked
+        self.seen_preload = 0
+
+    def preload(self, chunks):
+        self.seen_preload = len(chunks)
+
+    def preload_done(self):
+        pass
 
     def query(self, qmsg):
-        assert set(qmsg) == {"q", "cands", "pool", "qi", "qnm"}
-        return {"ranked": self.ranked, "pools": len(qmsg["pool"]),
-                "mass_swap": True}
+        assert set(qmsg) == {"q", "cand_keys", "pool_keys", "qi", "qnm"}
+        return {"ranked": self.ranked, "pools": len(qmsg["pool_keys"]),
+                "mass_swap": True, "timing": [1.0] * 8}
 
 
-def test_run_query_assembles_rr_with_stub_engine():
+def test_two_phase_select_then_score_with_stub_engine():
     T = _table()
     ranked = {v: (["k1", "k2"] if v != "router" else ["k2", "k1"]) for v in R.VARIANTS}
-    R._SE.update(table=T, skeys=np.array(["k1", "k2"]),
+    R._SE.update(skeys=np.array(["k1", "k2"]),
                  masses=np.array([200.0, 250.0]),
-                 lib_by_key={"k1": [0, 1], "k2": [2]},
+                 qnm={0: 200.0}, qprec={0: 201.0},
+                 qmzs={0: T["mzs"][0]}, qints={0: T["ints"][0]},
+                 qkey={0: "k1"},
                  lib_precs=[201.0, 201.5, 251.0], lib_pkeys=["k1", "k1", "k2"],
-                 key2smi={"k1": "CCO", "k2": "CCC"}, qnm={0: 200.0},
-                 key2neutral={"k1": 200.0, "k2": 250.0},
-                 ppm=8.5, shard=0, variants=R.VARIANTS, rust_bin="x",
-                 qpeak=0.05, qloss=0.01,
-                 worker=_StubEngine(ranked), worker_pid=os.getpid())
-    qi, row, plen, ranked_z, line, swap = R._run_query((0, 0, 1))
+                 ppm=8.5, shard=0, variants=R.VARIANTS)
+    sel = R.select_task((0, 0, 1))
+    assert sel is not None and sel[1] == 0 and len(sel[3]) == 1
+    qi, row, plen, ranked_z, line, swap = R.score_one(sel, _StubEngine(ranked))
     assert qi == 0 and plen == 1 and ranked_z == ["k1", "k2"]
     assert row["lib"] == 1.0 and row["router"] == 0.5
-    assert "q=0 pool=1" in line
+    assert "q=0 pool=1" in line and "tm=1,1,1,1,1,1,1,1" in line
     assert swap is True
 
 

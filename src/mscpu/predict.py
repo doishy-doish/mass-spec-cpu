@@ -34,12 +34,10 @@ def aggregate(ranked_lists: list, k: int = 25) -> list:
     return sorted(score, key=lambda kk: -score[kk])[:k]
 
 
-def rank_spectrum(Tlib, qrec, cand_keys, pool_keys, lib_by_key, key2smi,
-                  engine, qi, qnm=None, key2neutral=None):
+def rank_spectrum(qrec, cand_keys, pool_keys, engine, qi, qnm=None):
     """One test spectrum -> top-25 keys by the engine's rrf fusion."""
-    out = engine.query(R.build_engine_query(Tlib, qrec, cand_keys, pool_keys,
-                                            lib_by_key, key2smi,
-                                            key2neutral or {}, qi, qnm))
+    out = engine.query(R.build_engine_query(qrec, cand_keys, pool_keys,
+                                            qi, qnm))
     return out["ranked"]["rrf"][:25]
 
 
@@ -114,7 +112,13 @@ def main() -> None:
     _, fidx = np.unique(inv, return_index=True)
     key2smi = {str(codes[inv[int(i)]]): str(T["smiles"][int(i)]) for i in fidx}
     key2neutral = {str(k): float(v) for k, v in zip(skeys.tolist(), masses.tolist())}
+    # protocol v2: preload the prepared train table once, then key-only
+    # queries. Slim the parent afterwards (engine owns train spectra now).
     engine = R._Engine(a.rust_bin, a.qpeak, a.qloss)
+    engine.preload(R.build_preload_chunks(lib_by_key, T, key2smi, key2neutral))
+    engine.preload_done()
+    del lib_by_key
+    T = {"prec": T["prec"]}
 
     def pool(qnm: float, ppm: float):
         tol = qnm * ppm * 1e-6
@@ -154,14 +158,12 @@ def main() -> None:
                     "prec": float(Q["prec"][i])}
             cn = pool(qnm, a.ppm)
             if len(cn):
-                narrow.append(rank_spectrum(T, qrec, cn, pool50(float(Q["prec"][i]),
-                                            set(cn)), lib_by_key, key2smi, engine,
-                                            i, qnm, key2neutral))
+                narrow.append(rank_spectrum(qrec, cn, pool50(float(Q["prec"][i]),
+                                            set(cn)), engine, i, qnm))
             cw = pool(qnm, a.wide)
             if len(cw):
-                wide_lists.append(rank_spectrum(T, qrec, cw, pool50(float(Q["prec"][i]),
-                                                set(cw)), lib_by_key, key2smi, engine,
-                                                i, qnm, key2neutral))
+                wide_lists.append(rank_spectrum(qrec, cw, pool50(float(Q["prec"][i]),
+                                                set(cw)), engine, i, qnm))
         top = aggregate(narrow)
         if len(top) < 25:
             for k_ in aggregate(wide_lists):

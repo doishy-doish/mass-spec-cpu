@@ -63,14 +63,10 @@ const ROUTER_BIN: f64 = 0.4;
 const ROUTER_BINW: f64 = 0.4;
 const CASCADE_Z: f64 = 3.0;
 const TOP_K_OUT: usize = 25;
-/// Cross-query prepared-spectra cache: same library spectra repeat across
-/// queries (pools overlap heavily), but each query used to re-prepare every
-/// candidate + pool spectrum from scratch. Key (key, pos) is a sound
-/// identity: per-key spec order is deterministic within a run (stable index
-/// build), and the pool takes position 0. Bounded: spectra are ~2KB, so the
-/// cap is ~100MB per worker; on overflow the cache clears (correct, just
-/// recompute churn — tuning owed per the MASS-DEATHS lesson).
-const PREP_CACHE_CAP: usize = 50_000;const VARIANTS: [&str; 15] = [
+/// Preloaded library table (protocol v2): one prepared copy per key, built
+/// once from preload chunks. Pool takes position 0. Replaces the old
+/// bounded per-query prep cache (removed — preload dedups by construction).
+const VARIANTS: [&str; 15] = [
     "lib", "analog", "frag", "bin", "binw", "stein", "mass", "z", "rrf", "rrfb", "cascade", "router",
     "zw", "rrfw", "pure",
 ];
@@ -583,33 +579,33 @@ struct RawSpec {
     prec: f64,
 }
 
+/// One library table chunk (preload protocol v2): per-query messages carry
+/// keys only, so the ~1MB/query JSON transfer+parse+re-prepare — ~70% of
+/// per-query time on the profile — happens exactly once per engine.
 #[derive(Deserialize)]
-struct CandSpec {
-    key: String,
-    smiles: String,
-    specs: Vec<RawSpec>,
-    #[serde(default)]
-    neutral: Option<f64>,
+struct PreloadChunk {
+    keys: Vec<String>,
+    smiles: Vec<String>,
+    neutrals: Vec<Option<f64>>,
+    specs: Vec<Vec<RawSpec>>,
 }
 
 #[derive(Deserialize)]
-struct PoolSpec {
-    key: String,
-    smiles: String,
-    mzs: Vec<f64>,
-    ints: Vec<f64>,
-    prec: f64,
-}
-
-#[derive(Deserialize)]
-struct EngineQuery {
-    q: RawSpec,
-    cands: Vec<CandSpec>,
-    pool: Vec<PoolSpec>,
+struct EngineIn {
     #[serde(default)]
-    qi: i64,
+    q: Option<RawSpec>,
+    #[serde(default)]
+    cand_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pool_keys: Option<Vec<String>>,
+    #[serde(default)]
+    qi: Option<i64>,
     #[serde(default)]
     qnm: Option<f64>,
+    #[serde(default)]
+    preload: Option<PreloadChunk>,
+    #[serde(default)]
+    preload_done: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -634,6 +630,16 @@ struct CandData {
     key: String,
     specs: Vec<CSpectra>,
     fp: Option<[u64; 32]>,
+    neutral: Option<f64>,
+}
+
+/// Preloaded library table (protocol v2): one prepared copy per key,
+/// shared by every query. Pool uses specs[0]; candidates use all specs —
+/// the same spectra the launcher used to send per query.
+struct TableEntry {
+    specs: Vec<CSpectra>,
+    fp: [u64; 32],
+    has_fp: bool,
     neutral: Option<f64>,
 }
 
@@ -818,15 +824,10 @@ fn sengine(params: EngineParams) {
     let mut lines = stdin.lock().lines();
     let e = std::io::stderr();
     let mut err = e.lock();
-    // cross-query fingerprint cache: same structure keys repeat across queries
-    // (pool overlap); Morgan is ~10us with format!/allocs per key, so caching
-    // across the whole run beats the old per-query rebuild by ~5-10x.
-    // Correctness: fp depends only on smiles, which is fixed per key.
-    // If a key ever arrives with a different smiles, first-wins (data keys are stable).
-    let mut fp_cache: HashMap<String, [u64; 32]> = HashMap::new();
-    // prepared spectra are covered by PREP_CACHE_CAP (see const): same
-    // (key, pos) pairs repeat across queries, so hits skip prepare() whole.
-    let mut prep_cache: HashMap<(String, usize), CSpectra> = HashMap::new();
+    // Preloaded library table (protocol v2): one engine, one copy.
+    // Per-query messages carry keys only, so the transfer+parse+prepare of
+    // the same library spectra on every query happens exactly once.
+    let mut table: HashMap<String, TableEntry> = HashMap::new();
     for line in lines {
         let line = line.expect("sengine: read");
         if line.trim().is_empty() {
@@ -834,64 +835,66 @@ fn sengine(params: EngineParams) {
         }
         let t0 = std::time::Instant::now();
         let ipc_bytes = line.len();
-        let q: EngineQuery = serde_json::from_str(&line).expect("sengine: parse query");
+        let m: EngineIn = serde_json::from_str(&line).expect("sengine: parse");
+        // preload path: table chunks, then done -> ready.
+        if let Some(ch) = m.preload {
+            for (((k, sm), n), ss) in ch
+                .keys
+                .into_iter()
+                .zip(ch.smiles.into_iter())
+                .zip(ch.neutrals.into_iter())
+                .zip(ch.specs.into_iter())
+            {
+                let specs: Vec<CSpectra> = ss
+                    .iter()
+                    .map(|s| prepare(&s.mzs, &s.ints, s.prec, params.qpeak, params.qloss))
+                    .collect();
+                let has_fp = !sm.is_empty();
+                let fp = morgan_bits_2048(&sm);
+                table.insert(k, TableEntry { specs, fp, has_fp, neutral: n });
+            }
+            continue;
+        }
+        if m.preload_done.unwrap_or(false) {
+            writeln!(h, "{}", serde_json::to_string(&Ready { ready: true }).unwrap()).unwrap();
+            h.flush().unwrap();
+            continue;
+        }
+        let q = m.q.expect("sengine: query without q");
         let t_parse = t0.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let qc = prepare(&q.q.mzs, &q.q.ints, q.q.prec, params.qpeak, params.qloss);
+        let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss);
         let qloss = loss_set(&qc.mz, qc.prec);
         let qn = qloss.len().max(1) as f64;
-        // candidates
+        let qi: i64 = m.qi.unwrap_or(0);
+        let qnm: Option<f64> = m.qnm;
+        // candidates (table lookups only — prepared once at preload)
         let t_qprep = t0.elapsed();
-        let mut cands: Vec<CandData> = Vec::with_capacity(q.cands.len());
-        for c in &q.cands {
-            let fp = fp_cache
-                .entry(c.key.clone())
-                .or_insert_with(|| morgan_bits_2048(&c.smiles));
-            let specs = c
-                .specs
-                .iter()
-                .enumerate()
-                .map(|(pi, s)| {
-                    let ck = (c.key.clone(), pi);
-                    if let Some(hit) = prep_cache.get(&ck) {
-                        return hit.clone();
-                    }
-                    let cs = prepare(&s.mzs, &s.ints, s.prec, params.qpeak, params.qloss);
-                    if prep_cache.len() > PREP_CACHE_CAP {
-                        prep_cache.clear();
-                    }
-                    prep_cache.insert(ck, cs.clone());
-                    cs
-                })
-                .collect();
-            cands.push(CandData {
-                key: c.key.clone(),
-                specs,
-                fp: if c.smiles.is_empty() { None } else { Some(*fp) },
-                neutral: c.neutral,
-            });
+        let cand_keys = m.cand_keys.unwrap_or_default();
+        let mut cands: Vec<CandData> = Vec::with_capacity(cand_keys.len());
+        for k in &cand_keys {
+            if let Some(e) = table.get(k) {
+                cands.push(CandData {
+                    key: k.clone(),
+                    specs: e.specs.clone(),
+                    fp: if e.has_fp { Some(e.fp) } else { None },
+                    neutral: e.neutral,
+                });
+            }
         }
-        // pool (input order = distance order from the launcher; keep it)
+        // pool (input order = distance order from the launcher; keep it).
+        // Pool entry = first spectrum of the key — the same spectra the
+        // launcher used to send per query as first-spectrum messages.
         let t_cands = t0.elapsed();
-        let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(q.pool.len());
-        for p in &q.pool {
-            // pool first-spectrum == candidate position 0 for the same key,
-            // so pool hits share the candidate cache entries.
-            let ck = (p.key.clone(), 0usize);
-            let s = if let Some(hit) = prep_cache.get(&ck) {
-                hit.clone()
-            } else {
-                let cs = prepare(&p.mzs, &p.ints, p.prec, params.qpeak, params.qloss);
-                if prep_cache.len() > PREP_CACHE_CAP {
-                    prep_cache.clear();
+        let pool_keys = m.pool_keys.unwrap_or_default();
+        let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_keys.len());
+        for k in &pool_keys {
+            if let Some(e) = table.get(k) {
+                if let Some(s) = e.specs.first() {
+                    let d = (s.prec - qc.prec).abs();
+                    pool.push((k.clone(), s.clone(), d, e.fp));
                 }
-                prep_cache.insert(ck, cs.clone());
-                cs
-            };
-            let fp = *fp_cache
-                .entry(p.key.clone())
-                .or_insert_with(|| morgan_bits_2048(&p.smiles));
-            pool.push((p.key.clone(), s, (p.prec - qc.prec).abs(), fp));
+            }
         }
         // funnel: jaccard over first-spectrum bits when the pool is big
         let t_pool = t0.elapsed();
@@ -983,7 +986,7 @@ fn sengine(params: EngineParams) {
             vbin.push(bscore);
             vbinw.push(bwscore);
             vstein.push(stein);
-            vmass.push(mass_score(q.qnm, c.neutral));
+            vmass.push(mass_score(qnm, c.neutral));
         }
         let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(VARIANTS.len() * 2);
         cols.insert("lib".to_string(), vlib);
@@ -996,11 +999,11 @@ fn sengine(params: EngineParams) {
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
         let t_chan = t0.elapsed();
         let ranked = fuse_rank(&keys, &cols, &params);
-        let neutrals: Vec<Option<f64>> = q.cands.iter().map(|c| c.neutral).collect();
+        let neutrals: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
         let mass_swap = mass_swap_flag(
             cols.get("lib").map(|v| v.as_slice()).unwrap_or(&[]),
             cols.get("mass").map(|v| v.as_slice()).unwrap_or(&[]),
-            q.qnm,
+            qnm,
             &neutrals,
         );
         let t_fuse = t0.elapsed();
@@ -1030,7 +1033,7 @@ fn sengine(params: EngineParams) {
         .unwrap();
         h.flush().unwrap();
         let t_ser = t0.elapsed();
-        writeln!(err, "sengine q={} cands={} pool={} ipc={} t_parse={:.1} t_qprep={:.1} t_cands={:.1} t_pool={:.1} t_funnel={:.1} t_analog={:.1} t_chan={:.1} t_fuse={:.1} t_ser={:.1} t_tot={:.1}", q.qi, keys.len(), pool_idx.len(), ipc_bytes, ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), ms(t_pool - t_cands), ms(t_funnel - t_pool), ms(t_analog - t_funnel), ms(t_chan - t_analog), ms(t_fuse - t_chan), ms(t_ser - t_fuse), ms(t_ser))
+        writeln!(err, "sengine q={} cands={} pool={} ipc={} t_parse={:.1} t_qprep={:.1} t_cands={:.1} t_pool={:.1} t_funnel={:.1} t_analog={:.1} t_chan={:.1} t_fuse={:.1} t_ser={:.1} t_tot={:.1}", qi, keys.len(), pool_idx.len(), ipc_bytes, ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), ms(t_pool - t_cands), ms(t_funnel - t_pool), ms(t_analog - t_funnel), ms(t_chan - t_analog), ms(t_fuse - t_chan), ms(t_ser - t_fuse), ms(t_ser))
             .unwrap();
     }
 }

@@ -136,7 +136,7 @@ def _mem_watch(stop, interval=20.0):
 
 
 class _Engine:
-    """Persistent sengine worker: one JSON line per query, ranked lists back."""
+    """Persistent sengine worker: preload once, then one JSON line per query."""
 
     def __init__(self, bin_path, qpeak=0.05, qloss=0.01, fusion=None):
         self.p = subprocess.Popen([bin_path, "sengine"], stdin=subprocess.PIPE,
@@ -150,6 +150,19 @@ class _Engine:
         ready = self.p.stdout.readline()
         if "ready" not in ready:
             raise RuntimeError("sengine not ready: " + ready[:200])
+
+    def preload(self, chunk_lines):
+        """Stream pre-serialized table chunks (protocol v2); no reply yet."""
+        for ln in chunk_lines:
+            self.p.stdin.write(ln + "\n")
+        self.p.stdin.flush()
+
+    def preload_done(self):
+        self.p.stdin.write(json.dumps({"preload_done": True}) + "\n")
+        self.p.stdin.flush()
+        line = self.p.stdout.readline()
+        if "ready" not in line:
+            raise RuntimeError("sengine table not ready: " + line[:200])
 
     def query(self, qmsg):
         self.p.stdin.write(json.dumps(qmsg) + "\n")
@@ -190,64 +203,60 @@ def build_structs_payload(T: dict, queries) -> tuple:
             [str(x) for x in T["adduct"].tolist()], sq)
 
 
-def build_engine_query(Tlib: dict, qrec: dict, cand_keys, pool_keys,
-                       lib_by_key: dict, key2smi: dict, key2neutral: dict,
-                       qi: int, qnm=None) -> dict:
-    """Pure builder for one sengine query (no binary needed, testable).
+def build_preload_chunks(lib_by_key: dict, Tlib: dict, key2smi: dict,
+                          key2neutral: dict, per: int = 500) -> list:
+    """Library table -> pre-serialized JSON chunk lines (protocol v2).
 
-    Tlib carries candidate/pool spectra; qrec carries the query's own
-    {mzs, ints, prec} (same table in the run path, test table in predict path).
-    qnm/key2neutral carry neutral masses for the v8-mass-lite channel
-    (Loop-3 replication, standalone). None-safe: missing -> Rust scores 0.0 ties.
+    tolist/J dumps happen ONCE per run here, not per query: per-query
+    messages carry keys only. Sorted key order for determinism.
     """
-    k2n = key2neutral or {}
-    L = Tlib
-    cands_msg = []
-    for k in cand_keys:
-        ks = str(k)
-        specs = [{"mzs": L["mzs"][j].tolist(), "ints": L["ints"][j].tolist(),
-                  "prec": float(L["prec"][j])} for j in lib_by_key.get(ks, [])]
-        nk = k2n.get(ks)
-        # M198: NaN neutrals (no known-adduct spectra) travel as null —
-        # serde_json rejects NaN, and the key matches no window anyway.
-        cands_msg.append({"key": ks, "smiles": key2smi.get(ks, ""), "specs": specs,
-                          "neutral": (None if (nk is None or nk != nk) else float(nk))})
-    pool_msg = []
-    for k in pool_keys:
-        ks = str(k)
-        js = lib_by_key.get(ks)
-        if not js:
-            continue
-        j0 = js[0]
-        pool_msg.append({"key": ks, "smiles": key2smi.get(ks, ""),
-                         "mzs": L["mzs"][j0].tolist(), "ints": L["ints"][j0].tolist(),
-                         "prec": float(L["prec"][j0])})
+    keys = sorted(lib_by_key)
+    out = []
+    for i in range(0, len(keys), per):
+        ks = keys[i:i + per]
+        specs = []
+        for k in ks:
+            ss = []
+            for j in lib_by_key.get(k, []):
+                ss.append({"mzs": Tlib["mzs"][int(j)].tolist(),
+                           "ints": Tlib["ints"][int(j)].tolist(),
+                           "prec": float(Tlib["prec"][int(j)])})
+            specs.append(ss)
+        nk = []
+        for k in ks:
+            v = (key2neutral or {}).get(k)
+            nk.append(None if (v is None or v != v) else float(v))
+        out.append(json.dumps({"preload": {
+            "keys": ks,
+            "smiles": [str(key2smi.get(k, "")) for k in ks],
+            "neutrals": nk, "specs": specs}}))
+    return out
+
+
+def build_engine_query(qrec: dict, cand_keys, pool_keys,
+                       qi: int, qnm=None) -> dict:
+    """Pure builder for one sengine query, protocol v2 (no binary, testable).
+
+    Keys only — the engine owns the prepared library table from preload.
+    Same signature shape as v1 minus the table arguments.
+    """
     qm = [float(x) for x in np.ascontiguousarray(qrec["mzs"], dtype=np.float64).tolist()]
     qi_ = [float(x) for x in np.ascontiguousarray(qrec["ints"], dtype=np.float64).tolist()]
     return {"q": {"mzs": qm, "ints": qi_, "prec": float(qrec["prec"])},
-            "cands": cands_msg, "pool": pool_msg, "qi": int(qi),
+            "cand_keys": [str(k) for k in cand_keys],
+            "pool_keys": [str(k) for k in pool_keys], "qi": int(qi),
             "qnm": (None if qnm is None else float(qnm))}
 
 
-_SE = {}
+def select_task(task):
+    """One query's key selection (engine-free; runs in forked workers).
 
-_STATUS_PATH = None
-
-
-def _worker():
-    """One engine worker per process (forks never share the parent's pipes)."""
-    if _SE.get("worker") is None or _SE.get("worker_pid") != os.getpid():
-        _SE["worker"] = _Engine(_SE["rust_bin"], _SE["qpeak"], _SE["qloss"],
-                               _SE.get("fusion"))
-        _SE["worker_pid"] = os.getpid()
-    return _SE["worker"]
-
-
-def _run_query(task):
-    """One query end-to-end. Reads only _SE + engine worker; never raises."""
+    task = (qpos, qi, total). Returns (qpos, qi, total, cand_keys, pool_keys,
+    prec_q, tsel_ms) or None when the query has no neutral mass.
+    """
+    import time
+    t0 = time.perf_counter()
     qpos, qi, total = task
-    V_ = _SE["variants"]
-    T = _SE["table"]
     qi = int(qi)
     qnm = _SE["qnm"].get(qi)
     if qnm is None:
@@ -263,7 +272,7 @@ def _run_query(task):
     # nearest-first (mirrors the old bisect + dist sort; engine funnels it)
     precs = _SE["lib_precs"]
     pkeys = _SE["lib_pkeys"]
-    prec_q = float(T["prec"][qi])
+    prec_q = float(_SE["qprec"].get(qi))
     plo = bisect_left(precs, prec_q - 50.0)
     phi = bisect_right(precs, prec_q + 50.0, lo=plo)
     near = []
@@ -274,30 +283,54 @@ def _run_query(task):
         near.append((abs(precs[idx] - prec_q), k))
     near.sort(key=lambda t: t[0])
     pool_keys = [k for _, k in near[:1500]]
-    qrec = {"mzs": T["mzs"][qi], "ints": T["ints"][qi], "prec": prec_q}
-    qmsg = build_engine_query(T, qrec, cand_keys, pool_keys, _SE["lib_by_key"],
-                              _SE["key2smi"], _SE.get("key2neutral"), qi, qnm)
-    try:
-        out = _worker().query(qmsg)
-    except Exception as e:
-        print("sengine failed on q=" + str(qi) + " (" + str(e)[:120] + "), skipping", flush=True)
-        return None
-    truth = str(T["key14"][qi])
+    tsel = (time.perf_counter() - t0) * 1000.0
+    return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel)
+
+
+def assemble_row(out, truth, qi, row_order):
+    """Engine reply + truth -> (row dict, ranked_z, swap). Pure, testable."""
     row = {}
     ranked_z = None
-    for v in V_:
+    for v in row_order:
         ranked = out.get("ranked", {}).get(v, [])
         row[v] = M.reciprocal_rank(truth, ranked)
         if v == "z":
             ranked_z = ranked
+    return row, ranked_z, bool(out.get("mass_swap", False))
+
+
+_SE = {}
+
+_STATUS_PATH = None
+
+
+def score_one(sel, engine):
+    """Score one selected query through the shared preloaded engine (parent).
+
+    sel = select_task output. Returns the standard results tuple
+    (qi, row, plen, ranked_z, line, swap); never raises.
+    """
+    qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel
+    V_ = _SE["variants"]
+    qrec = {"mzs": _SE["qmzs"][qi], "ints": _SE["qints"][qi], "prec": prec_q}
+    qmsg = build_engine_query(qrec, cand_keys, pool_keys, qi,
+                              _SE["qnm"].get(qi))
+    try:
+        out = engine.query(qmsg)
+    except Exception as e:
+        print("sengine failed on q=" + str(qi) + " (" + str(e)[:120] + "), skipping", flush=True)
+        return None
+    truth = str(_SE["qkey"][qi])
+    row, ranked_z, swap = assemble_row(out, truth, qi, V_)
     line = ("shard " + str(_SE["shard"]) + " " + str(qpos + 1) + "/" + str(total) + " ("
             + str(int(100 * (qpos + 1) / max(1, total))) + "%) q=" + str(qi) + " pool="
-            + str(hi - lo) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_)
+            + str(len(cand_keys)) + " " + " ".join(v + "=" + ("%.2f" % row[v]) for v in V_)
+            + " tsel=" + ("%.0f" % tsel)
             + " tm=" + ",".join("%.0f" % t for t in (out.get("timing") or [])))
-    print(line, flush=True)  # HEARTBEAT: workers print as they finish
+    print(line, flush=True)  # HEARTBEAT: parent prints as it scores
     # GOOD-PROBE: surface the v8 rank-1-by-mass swap signal (was discarded —
     # old probes could never see the mass channel they were sent to check).
-    return (qi, row, hi - lo, ranked_z, line, bool(out.get("mass_swap", False)))
+    return (qi, row, len(cand_keys), ranked_z, line, swap)
 
 
 def main() -> None:
@@ -418,37 +451,55 @@ def main() -> None:
     fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw}
-    _SE.update(table=T, skeys=np.array([str(k) for k in skeys.tolist()]),
-               masses=masses, key2neutral=key2neutral,
-               fusion=fusion,
-               lib_by_key=lib_by_key,
-               lib_precs=lib_precs, lib_pkeys=lib_pkeys,
-               key2smi=key2smi, qnm=qnm, ppm=a.ppm,
-               shard=a.shard, variants=VARIANTS, rust_bin=a.rust_bin,
-               qpeak=a.qpeak, qloss=a.qloss)
+    # protocol v2: engine preloads the prepared library table once (parent,
+    # before any fork — one engine, one copy). Per-query messages are keys.
+    print("preload build lib_keys=" + str(len(lib_by_key)), flush=True)
+    chunks = build_preload_chunks(lib_by_key, T, key2smi, key2neutral)
+    engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion)
+    engine.preload(chunks)
+    engine.preload_done()
     _rss, _avail = _mem_state()
-    print("precompute done lib_keys=" + str(len(lib_by_key)) + " queries=" + str(len(queries))
+    print("preload done chunks=" + str(len(chunks))
+          + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),
+          flush=True)  # HEARTBEAT
+    # slim the parent: the engine owns library spectra now; the parent keeps
+    # query spectra + small lookup arrays only (CoW-fork stays light).
+    qset = set(int(qi) for qi in queries)
+    _SE.update(skeys=np.array([str(k) for k in skeys.tolist()]),
+               masses=masses, qnm=qnm, ppm=a.ppm,
+               lib_precs=lib_precs, lib_pkeys=lib_pkeys,
+               qmzs={qi: T["mzs"][qi] for qi in qset},
+               qints={qi: T["ints"][qi] for qi in qset},
+               qprec={qi: float(T["prec"][qi]) for qi in qset},
+               qkey={qi: str(T["key14"][qi]) for qi in qset},
+               shard=a.shard, variants=VARIANTS)
+    del lib_by_key
+    del T
+    _rss, _avail = _mem_state()
+    print("precompute done queries=" + str(len(queries))
           + " jobs=" + str(a.jobs) + " rss_mb=" + str(_rss) + " memavail_mb=" + str(_avail),
           flush=True)  # HEARTBEAT
     try:
         with open(_STATUS_PATH, "a") as sf:
-            sf.write("PRECOMPUTE-DONE lib_keys=" + str(len(lib_by_key)) + " queries=" + str(len(queries)) + "\n")
+            sf.write("PRECOMPUTE-DONE queries=" + str(len(queries)) + "\n")
     except Exception:
         pass
+    # two-phase: workers select keys (engine-free pure numpy), parent scores
+    # through the single preloaded engine. No per-query spectra cross a pipe.
     tasks = [(i, int(qi), len(queries)) for i, qi in enumerate(queries)]
-    results = []
     if a.jobs > 1 and len(tasks) > 1:
         with CF.ProcessPoolExecutor(max_workers=a.jobs) as ex:
-            for res in ex.map(_run_query, tasks):
-                if res is None:
-                    continue
-                results.append(res)
+            selected = list(ex.map(select_task, tasks))
     else:
-        for t in tasks:
-            res = _run_query(t)
-            if res is None:
-                continue
-            results.append(res)
+        selected = [select_task(t) for t in tasks]
+    results = []
+    for sel in selected:
+        if sel is None:
+            continue
+        res = score_one(sel, engine)
+        if res is None:
+            continue
+        results.append(res)
 
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
@@ -492,8 +543,7 @@ def main() -> None:
     except Exception:
         pass
     try:
-        if _SE.get("worker") is not None:
-            _SE["worker"].close()
+        engine.close()
     except Exception:
         pass
     try:
