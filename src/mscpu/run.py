@@ -1210,7 +1210,9 @@ def main() -> None:
            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
            "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
-           "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps]}
+           "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps],
+           "qhit_lib": "".join("1" if float(x) > 0 else "0" for x in rrs["lib"]),
+           "qhit_z": "".join("1" if float(x) > 0 else "0" for x in rrs["z"])}
     with open(out_path, "w") as f:
         json.dump(out, f)
     try:
