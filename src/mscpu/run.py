@@ -353,7 +353,8 @@ def union_selected_keys(selected) -> list:
 
     Selection is deterministic, so preloading exactly this set is identical
     to preloading everything: every key a query can touch is in the union.
-    sel layout: (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel).
+    sel layout: (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel,
+    sword_n0, sword_n1, sword_surv).
     """
     u = set()
     for sel in selected:
@@ -500,6 +501,23 @@ def select_task(task):
         near.append((abs(precs[idx] - prec_q), k))
     near.sort(key=lambda t: t[0])
     pool_keys = [k for _, k in near[:1500]]
+    # SWORD-1 (pure prec-ppm, given value 8.5ppm): shrink the analog pool to
+    # the query precursor window. Empty-after-cut falls back to the uncut pool
+    # (recall lock). Pool sizes + truth survival ride the sel tuple for
+    # parent-side aggregation (fork workers can't write back to _SE).
+    sword_n0, sword_n1, sword_surv = len(pool_keys), len(pool_keys), None
+    if _SE.get("sword_prec"):
+        try:
+            sword_tol = prec_q * 8.5e-6
+            sword_cut = [k for _d, k in near[:1500] if _d <= sword_tol]
+            if sword_cut:
+                pool_keys = sword_cut
+            sword_truth = (_SE.get("qkey") or {}).get(qi)
+            sword_n1 = len(pool_keys)
+            if sword_truth is not None:
+                sword_surv = 1.0 if str(sword_truth) in [str(_k) for _k in pool_keys] else 0.0
+        except Exception:
+            pass
     if _SE.get("inst_bonus"):
         try:
             pool_keys = IP.pool_rerank_by_instrument(
@@ -507,7 +525,8 @@ def select_task(task):
         except Exception:
             pass
     tsel = (time.perf_counter() - t0) * 1000.0
-    return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel)
+    return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel,
+            sword_n0, sword_n1, sword_surv)
 
 
 def assemble_row(out, truth, qi, row_order):
@@ -533,7 +552,7 @@ def score_one(sel, engine):
     sel = select_task output. Returns the standard results tuple
     (qi, row, plen, ranked_z, line, swap); never raises.
     """
-    qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel
+    qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel[:7]
     V_ = _SE["variants"]
     if _SE.get("erun"):
         # E1: row-ref + keys only — the engine owns the spectra.
@@ -605,6 +624,8 @@ def main() -> None:
                     help="1 = disable Jaccard prefilter (I6 A/B: donor-retention question)")
     ap.add_argument("--loss-gate", type=int, default=0,
                     help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
+    ap.add_argument("--sword-prec", type=int, default=0,
+                    help="1 = SWORD-1 pure prec-ppm analog-pool cut at 8.5ppm (recall-locked fallback)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -830,6 +851,7 @@ def main() -> None:
                    qinst={qi: str(T["instrument"][int(qi)]) for qi in qset},
                    key2inst=key2inst,
                    inst_bonus=bool(a.inst_bonus),
+                   sword_prec=bool(a.sword_prec),
                    adduct_retry=bool(a.adduct_retry),
                    mass_replace=bool(a.mass_replace),
                    formula_ppm=float(a.formula_ppm or 0.0),
@@ -846,6 +868,7 @@ def main() -> None:
                    qinst={qi: str(T["instrument"][qi]) for qi in qset},
                    key2inst=key2inst,
                    inst_bonus=bool(a.inst_bonus),
+                   sword_prec=bool(a.sword_prec),
                    adduct_retry=bool(a.adduct_retry),
                    mass_replace=bool(a.mass_replace),
                    formula_ppm=float(a.formula_ppm or 0.0),
@@ -863,7 +886,8 @@ def main() -> None:
     # the preload with no error, so a coverage hole reads as MRR 0.00, not a
     # crash (C3-RED: 463/463 zeros, pools non-empty). Count it here, where
     # the keys still exist to be counted. sel layout (qpos,qi,total,cand,pool,
-    # prec,tsel) copied from select_task (M212-class: producer is source).
+    # prec,tsel,sword_n0,sword_n1,sword_surv) copied from select_task
+    # (M212-class: producer is source).
     _subkeys = set(sub)
     _ncand = _npool = _hit = 0
     for _sel in selected:
@@ -877,6 +901,11 @@ def main() -> None:
             _npool += 1
             if _k in _subkeys:
                 _hit += 1
+    # SWORD-1 aggregation: mean pool sizes + truth survival (None = cut off
+    # or truth unknown; excluded from the survival mean).
+    _sw0 = [_s[7] for _s in selected if _s is not None and len(_s) > 9]
+    _sw1 = [_s[8] for _s in selected if _s is not None and len(_s) > 9]
+    _sws = [_s[9] for _s in selected if _s is not None and len(_s) > 9 and _s[9] is not None]
     _truths = [str(_SE["qkey"][int(_qi)]) for _, _qi, _ in tasks]
     _tin = sum(1 for _t in _truths if _t in _subkeys)
     print("coverage truth_in_union=" + str(_tin) + "/" + str(len(_truths))
@@ -976,6 +1005,10 @@ def main() -> None:
            "qpeak": a.qpeak, "qloss": a.qloss,
            "mass_swap_rate": _avg(swaps),
            "truth_in_union": _tin, "keys_in_lib": _hit,
+           "sword_on": bool(a.sword_prec),
+           "sword_pool0": (sum(_sw0) / len(_sw0)) if _sw0 else 0.0,
+           "sword_pool1": (sum(_sw1) / len(_sw1)) if _sw1 else 0.0,
+           "sword_surv": (sum(_sws) / len(_sws)) if _sws else None,
            "keys_total": _ncand + _npool, "n_truths": len(_truths),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
