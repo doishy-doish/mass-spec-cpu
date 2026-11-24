@@ -1,0 +1,30 @@
+name: watchdog
+on:
+  schedule:
+    - cron: "*/20 * * * *"  # sweep stuck runs so the lane clears itself
+  workflow_dispatch: {}
+permissions:
+  actions: write
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          set -u
+          STUCK_AFTER_MIN=75  # legal max ~55 (class3-n500 single ~45 + setup); only the stuck exceed this
+          NOW=$(date +%s)
+          echo "watchdog sweep at $(date -u +%FT%TZ), threshold ${STUCK_AFTER_MIN}min"
+          LIST=$(gh api "repos/${{ github.repository }}/actions/runs?per_page=30" --jq '.workflow_runs[] | select(.status == "in_progress") | "\(.id) \(.created_at) \(.name)"') || { echo "LIST FAILED - watchdog blind"; exit 1; }
+          echo "$LIST" | while read -r ID CREATED NAME; do
+            [ -z "$ID" ] && continue
+            AGE_MIN=$(( (NOW - $(date -d "$CREATED" +%s)) / 60 ))
+            echo "run $ID ($NAME) age ${AGE_MIN}min"
+            if [ "$AGE_MIN" -gt "$STUCK_AFTER_MIN" ]; then
+              echo "CANCELLING stuck run $ID (age ${AGE_MIN}min > ${STUCK_AFTER_MIN}min)"
+              gh api -X POST "repos/${{ github.repository }}/actions/runs/$ID/cancel" --silent || echo "cancel failed for $ID (non-fatal; next sweep retries)"
+            fi
+          done
+          echo "sweep done"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
