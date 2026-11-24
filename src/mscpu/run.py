@@ -14,6 +14,7 @@ import argparse
 import concurrent.futures as CF
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -173,7 +174,21 @@ def _mem_state():
 
 
 def _sigterm_loud(signum, frame):
-    """Host asked us to die: scream our memory state, then go."""
+    """Host asked us to die: kill our child, scream state, then go.
+
+    Bare os._exit orphans the engine + fork workers and pins Complete
+    job (the -n10e 39-min UI wall) — terminate the child first so the
+    runner can finish cleanup.
+    """
+    try:
+        _eng = globals().get("_ENGINE_REF")
+        if _eng is not None and getattr(_eng, "p", None) is not None:
+            try:
+                _eng.p.terminate()
+            except Exception:
+                pass
+    except Exception:
+        pass
     rss, avail = _mem_state()
     try:
         print("LOUD-SIGTERM host shutdown rss_mb=" + str(rss) + " memavail_mb=" + str(avail), flush=True)
@@ -227,9 +242,13 @@ class _Engine:
         if "ready" not in line:
             raise RuntimeError("sengine table not ready: " + line[:200])
 
-    def query(self, qmsg):
+    def query(self, qmsg, timeout=600.0):
         self.p.stdin.write(json.dumps(qmsg) + "\n")
         self.p.stdin.flush()
+        # Hang guard: a dead engine fails loud instead of pinning run mask.
+        r, _, _ = select.select([self.p.stdout], [], [], timeout)
+        if not r:
+            raise TimeoutError("sengine query timed out")
         return json.loads(self.p.stdout.readline())
 
     def close(self):
@@ -248,7 +267,7 @@ def structs_call(bin_path, ktable, kidx, precs, adducts, queries):
     p = subprocess.run([bin_path, "structs"],
                        input=json.dumps({"ktable": ktable, "kidx": kidx, "precs": precs,
                                          "adducts": adducts, "queries": queries}),
-                       capture_output=True, text=True, timeout=1200)
+                       capture_output=True, text=True, timeout=600)  # hung structs fails loud, never pins the mask
     if p.returncode != 0:
         raise RuntimeError("structs failed: " + (p.stderr or "")[-500:])
     return json.loads(p.stdout)
@@ -548,6 +567,27 @@ _SE = {}
 
 _STATUS_PATH = None
 
+_ENGINE_REF = None
+
+
+def _cleanup_engine():
+    """Best-effort child cleanup on any Python-raised exit (atexit).
+
+    An unclosed engine pipe orphans the rust child and pins the runner's
+    Complete job behind a step that already failed (the -n10e 39-min UI
+    wall shape). SIGTERM goes through _sigterm_loud instead — atexit
+    never runs on os._exit.
+    """
+    try:
+        _eng = globals().get("_ENGINE_REF")
+        if _eng is not None:
+            try:
+                _eng.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def score_one(sel, engine):
     """Score one selected query through the shared preloaded engine (parent).
@@ -645,6 +685,8 @@ def main() -> None:
                          "zero per-query spectra JSON. Off = protocol v2.")
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, _sigterm_loud)
+    import atexit as _atexit
+    _atexit.register(_cleanup_engine)
     _stop = threading.Event()
     threading.Thread(target=_mem_watch, args=(_stop,), daemon=True).start()
     _rss0, _avail0 = _mem_state()
@@ -947,8 +989,10 @@ def main() -> None:
     # key-only per-query messages. Streamed chunk-by-chunk (M207).
     print("preload build union=" + str(len(union)) + " lib_keys=" + str(len(lib_by_key)), flush=True)
     _SE["erun"] = bool(a.erun and S is not None)
+    global _ENGINE_REF
     engine = _Engine(a.rust_bin, a.qpeak, a.qloss, fusion,
                      store=(a.slim_dir if _SE["erun"] else None))
+    _ENGINE_REF = engine
     if _SE["erun"]:
         # E1: engine resolves spectra from its own store — zero preload
         # chunks, zero per-query spectra JSON. Selection stays Python-side
