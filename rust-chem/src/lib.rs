@@ -341,6 +341,270 @@ pub fn tanimoto(a: &[u64; NWORDS], b: &[u64; NWORDS]) -> f64 {
     }
 }
 
+/// Monoisotopic mass table (method-light, no RDKit).
+fn el_mass(el: &str) -> f64 {
+    match el {
+        "H" => 1.00782503223,
+        "C" => 12.0,
+        "N" => 14.00307400443,
+        "O" => 15.99491461957,
+        "P" => 30.9737619985,
+        "S" => 31.9720711744,
+        "F" => 18.99840316273,
+        "Cl" => 34.968852682,
+        "Br" => 78.9183376,
+        "I" => 126.9044719,
+        "Na" => 22.9897692809,
+        "K" => 38.9637074864,
+        _ => 12.0,
+    }
+}
+
+/// Implicit-H reconstruction shared with main.rs formula_counts.
+/// Returns per-atom total H (explicit + implicit) for mass sums.
+fn atom_h_total(mol: &Mol, idx: usize, bond_sum: &[u32]) -> u32 {
+    let a = &mol.atoms[idx];
+    if a.h > 0 || a.charge != 0 {
+        return a.h;
+    }
+    if a.aromatic && a.el == "N" {
+        return 0;
+    }
+    let v: u32 = match a.el.as_str() {
+        "C" => if a.aromatic { 3 } else { 4 },
+        "N" => 3,
+        "O" | "S" => 2,
+        "P" => 3,
+        "F" | "Cl" | "Br" | "I" => 1,
+        _ => 4,
+    };
+    v.saturating_sub(bond_sum[idx])
+}
+
+/// Per-atom heavy mass + implicit H mass (method-light fragment masses).
+fn atom_masses(mol: &Mol) -> Vec<f64> {
+    let mut bond_sum = vec![0u32; mol.atoms.len()];
+    for &(a, b, o) in &mol.bonds {
+        if a < bond_sum.len() && b < bond_sum.len() {
+            bond_sum[a] += o as u32;
+            bond_sum[b] += o as u32;
+        }
+    }
+    mol.atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            el_mass(&a.el) + atom_h_total(mol, i, &bond_sum) as f64 * el_mass("H")
+        })
+        .collect()
+}
+
+/// S2 MetFrag-lite cleavage enumeration (method-light, ≤2-bond cuts).
+/// Returns sorted unique neutral fragment masses (each side of every cut).
+/// Single-bond cuts always; double-bond cuts capped (first 64 bonds pairs).
+/// Unparseable SMILES -> empty (caller scores 0, never crashes).
+pub fn cleavage_masses(smi: &str) -> Vec<f64> {
+    let mol = match parse_smiles(smi) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+    if mol.atoms.is_empty() || mol.bonds.is_empty() {
+        return Vec::new();
+    }
+    let am = atom_masses(&mol);
+    let adj = adjacency(&mol);
+    let n = mol.atoms.len();
+    let mut out: Vec<f64> = Vec::new();
+    // single-bond cuts: BFS from one side
+    for &(a, b, _) in &mol.bonds {
+        let mut seen = vec![false; n];
+        let mut stack = vec![a];
+        seen[a] = true;
+        seen[b] = true; // block crossing
+        // flood from a without passing through b
+        let mut comp_a = vec![a];
+        while let Some(u) = stack.pop() {
+            for &(v, _) in &adj[u] {
+                if (u == a && v == b) || (u == b && v == a) {
+                    continue;
+                }
+                if !seen[v] {
+                    seen[v] = true;
+                    stack.push(v);
+                    comp_a.push(v);
+                }
+            }
+        }
+        if comp_a.len() < n {
+            let ma: f64 = comp_a.iter().map(|&i| am[i]).sum();
+            let total: f64 = am.iter().sum();
+            let mb = total - ma;
+            if ma > 20.0 && ma < 3000.0 {
+                out.push(ma);
+            }
+            if mb > 20.0 && mb < 3000.0 {
+                out.push(mb);
+            }
+        }
+    }
+    // double-bond cuts: capped pairs (method-light, keeps O(B^2) bounded)
+    let nb = mol.bonds.len().min(64);
+    for i in 0..nb {
+        for j in (i + 1)..nb {
+            let (a1, b1, _) = mol.bonds[i];
+            let (a2, b2, _) = mol.bonds[j];
+            let mut seen = vec![false; n];
+            let mut stack = vec![a1];
+            seen[a1] = true;
+            // block both cut bonds
+            let blocked = |u: usize, v: usize| {
+                (u == a1 && v == b1) || (u == b1 && v == a1)
+                    || (u == a2 && v == b2) || (u == b2 && v == a2)
+            };
+            let mut comp = vec![a1];
+            while let Some(u) = stack.pop() {
+                for &(v, _) in &adj[u] {
+                    if blocked(u, v) {
+                        continue;
+                    }
+                    if !seen[v] {
+                        seen[v] = true;
+                        stack.push(v);
+                        comp.push(v);
+                    }
+                }
+            }
+            if comp.len() < n && !comp.is_empty() {
+                let m: f64 = comp.iter().map(|&k| am[k]).sum();
+                if m > 20.0 && m < 3000.0 {
+                    out.push(m);
+                    if out.len() > 512 {
+                        break;
+                    }
+                }
+            }
+        }
+        if out.len() > 512 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    out.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    out.truncate(512);
+    out
+}
+
+/// S2 explained-intensity fraction: query peaks matched by candidate
+/// cleavage fragments (or precursor-neutral losses derived from them).
+/// Match tolerance absolute Da (fragment side). Intensity-weighted
+/// (sqrt weights like clean). Vacuous (no frags) -> 0.0 (no evidence).
+pub fn explained_frac(qmz: &[f64], qw: &[f64], frags: &[f64], tol_da: f64) -> f64 {
+    if frags.is_empty() || qmz.is_empty() {
+        return 0.0;
+    }
+    let mut hit_w = 0.0;
+    let mut tot_w = 0.0;
+    for (m, w) in qmz.iter().zip(qw.iter()) {
+        tot_w += *w;
+        let mut hit = false;
+        for f in frags {
+            if (*m - *f).abs() <= tol_da {
+                hit = true;
+                break;
+            }
+        }
+        if hit {
+            hit_w += *w;
+        }
+    }
+    if tot_w <= 0.0 {
+        0.0
+    } else {
+        hit_w / tot_w
+    }
+}
+
+/// Neural fingerprint channel, method-light (no learned weights).
+/// Deterministic spectrum -> bits: each query peak votes for bits derived
+/// from (a) its m/z bin, (b) its neutral-loss bin (prec - mz), (c) the
+/// query neutral mass bin. FNV-1a-32 over invariant strings, same hashing
+/// as morgan_bits_2048, so predicted bits live in the same 2048 space and
+/// Tanimoto vs candidate Morgan is meaningful without any fitting.
+/// Empty spectrum -> zeros (Tanimoto 0, honest).
+pub fn fp_predict_bits(qmz: &[f64], qprec: f64, qnm: Option<f64>) -> [u64; NWORDS] {
+    let mut out = [0u64; NWORDS];
+    if qmz.is_empty() {
+        return out;
+    }
+    let mut bit = |x: u32| {
+        let b = (x as usize) % NBITS;
+        out[b / 64] |= 1u64 << (b % 64);
+    };
+    for m in qmz.iter().take(64) {
+        let mzbin = (*m / 1.0).round() as i64;
+        bit(fnv1a32(&format!("mz:{}", mzbin)));
+        let loss = qprec - *m;
+        if loss > 0.0 {
+            let lbin = (loss / 0.02).round() as i64;
+            bit(fnv1a32(&format!("loss:{}", lbin)));
+        }
+    }
+    if let Some(q) = qnm {
+        if q > 0.0 {
+            let nbin = (q / 0.05).round() as i64;
+            bit(fnv1a32(&format!("nm:{}", nbin)));
+        }
+    }
+    let pbin = (qprec / 0.05).round() as i64;
+    bit(fnv1a32(&format!("prec:{}", pbin)));
+    out
+}
+
+/// Q6 spectral-entropy quality (Li & Fiehn shape, computed only).
+/// Returns (entropy_nats, weight_exp): S over relative intensities,
+/// exponent 0.25+0.25S for S<3 else 1.0. Empty -> (0, 1).
+pub fn spectral_entropy_info(rel: &[f64]) -> (f64, f64) {
+    let sum: f64 = rel.iter().sum();
+    if !(sum > 0.0) {
+        return (0.0, 1.0);
+    }
+    let mut s = 0.0;
+    for &x in rel {
+        if x > 0.0 {
+            let p = x / sum;
+            s -= p * p.ln();
+        }
+    }
+    let e = if s < 3.0 { 0.25 + 0.25 * s } else { 1.0 };
+    (s, e)
+}
+
+/// Q6 entropy grade: query-entropy-weighted gate agreement.
+/// gate in [0,1] (loss/subformula), query entropy S -> weight w in [0.25,1].
+/// entw = gate * (0.5 + 0.5*w). Sparse spectra keep full gate; busy stay linear.
+/// Pure computed, no library spectra.
+pub fn entropy_grade(gate: f64, entropy_exp: f64) -> f64 {
+    gate * (0.5 + 0.5 * entropy_exp)
+}
+
+/// Hand-set stumps (NOT LightGBM — no fitting, no trees, no training).
+/// Features: [mass, gate, cleav, entw] each in [0,1]; fp QUARANTINED (always 0).
+/// Three variants span the weight simplex (mass-heavy / gate-heavy / balanced).
+/// Each is a linear blend + 2 hand-set bonuses. Deterministic, monotone
+/// in each live feature (higher evidence never demotes).
+pub fn lgbm_scores(mass: f64, gate: f64, cleav: f64, _fp: f64, entw: f64) -> (f64, f64, f64) {
+    let a = 0.40 * mass + 0.25 * gate + 0.20 * cleav + 0.05 * entw
+        + if mass > 0.5 { 0.10 } else { 0.0 }
+        + if gate >= 1.0 - 1e-12 { 0.05 } else { 0.0 };
+    let b = 0.15 * mass + 0.40 * gate + 0.20 * cleav + 0.15 * entw
+        + if gate >= 1.0 - 1e-12 { 0.10 } else { 0.0 }
+        + if cleav > 0.3 { 0.05 } else { 0.0 };
+    let c = 0.25 * mass + 0.25 * gate + 0.20 * cleav + 0.15 * entw
+        + if entw > 0.2 { 0.05 } else { 0.0 }
+        + if mass > 0.8 && gate >= 1.0 - 1e-12 { 0.05 } else { 0.0 };
+    (a, b, c)
+}
+
 fn fnv1a64(s: &str) -> u64 {
     let mut x: u64 = 14695981039346656037;
     for b in s.bytes() {
@@ -425,5 +689,59 @@ mod tests {
         assert_eq!(a.len(), 14);
         assert_ne!(a, connectivity_key14("CCC").unwrap());
         assert!(connectivity_key14("").is_none());
+    }
+
+    #[test]
+    fn cleavage_known_and_capped() {
+        // ethanol: single-bond cuts yield C / CH3O-ish fragments in range.
+        let frags = cleavage_masses("CCO");
+        assert!(!frags.is_empty());
+        assert!(frags.iter().all(|&m| m > 20.0 && m < 3000.0));
+        // sorted + deduped
+        for w in frags.windows(2) {
+            assert!(w[0] <= w[1]);
+        }
+        // unparseable -> empty, never panics
+        assert!(cleavage_masses("").is_empty());
+        // cap respected
+        assert!(frags.len() <= 512);
+    }
+
+    #[test]
+    fn explained_frac_weights_hits() {
+        let frags = vec![100.0, 150.0];
+        // both peaks hit -> 1.0
+        assert!((explained_frac(&[100.005, 150.005], &[1.0, 1.0], &frags, 0.02) - 1.0).abs() < 1e-12);
+        // one of two (equal weights) -> 0.5
+        assert!((explained_frac(&[100.005, 999.0], &[1.0, 1.0], &frags, 0.02) - 0.5).abs() < 1e-12);
+        // vacuous -> 0
+        assert_eq!(explained_frac(&[], &[], &frags, 0.02), 0.0);
+        assert_eq!(explained_frac(&[100.0], &[1.0], &[], 0.02), 0.0);
+    }
+
+    #[test]
+    fn fp_predict_deterministic_and_sized() {
+        let a = fp_predict_bits(&[100.0, 150.0], 200.0, Some(199.0));
+        let b = fp_predict_bits(&[100.0, 150.0], 200.0, Some(199.0));
+        assert_eq!(a, b);
+        assert!(a.iter().any(|&w| w != 0));
+        assert_eq!(fp_predict_bits(&[], 200.0, None), [0u64; NWORDS]);
+        // Tanimoto self is 1 when non-empty
+        assert!((tanimoto(&a, &a) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn entropy_and_lgbm_monotone() {
+        let (s, e) = spectral_entropy_info(&[3.0]);
+        assert!((s - 0.0).abs() < 1e-12);
+        assert!((e - 0.25).abs() < 1e-12);
+        let (_, e2) = spectral_entropy_info(&[]);
+        assert_eq!(e2, 1.0);
+        assert!((entropy_grade(1.0, 1.0) - 1.0).abs() < 1e-12);
+        assert!(entropy_grade(0.0, 0.5) == 0.0);
+        // monotone: more evidence never demotes
+        let (a0, b0, c0) = lgbm_scores(0.0, 0.0, 0.0, 0.0, 0.0);
+        let (a1, b1, c1) = lgbm_scores(1.0, 1.0, 1.0, 1.0, 1.0);
+        assert!(a1 > a0 && b1 > b0 && c1 > c0);
     }
 }
