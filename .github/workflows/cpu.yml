@@ -76,7 +76,7 @@ on:
         description: "E1 engine-owned store: engine resolves spectra from slim (0/1; needs slim cache, else falls back)"
         default: "0"
       sword-prec:
-        description: "SWORD-1 pure prec-ppm analog-pool cut at 8.5ppm (0/1; recall-locked fallback)"
+        description: "SWORD-1b pure prec-ppm candidate cut at 8.5ppm (0/1; recall-locked fallback)"
         default: "0"
       loss-gate:
         description: "R2 diagnostic-loss demotion: sink candidates failing the loss/subformula gate (0/1)"
@@ -311,7 +311,7 @@ jobs:
               need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
           if red:
               emit("RED", red)
-          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}"])
+          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}" + (f" sword=on cand={out.get('sword_cand0')}/{out.get('sword_cand1')} fb={out.get('sword_fb_rate')}" if out.get("sword_on") else "")])
           PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
