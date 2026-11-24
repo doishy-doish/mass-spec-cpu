@@ -1,6 +1,6 @@
 """Aggregation + submission-format tests (no engine, no data files)."""
 from mscpu.metric import validate_submission
-from mscpu.predict import aggregate
+from mscpu.predict import aggregate, aggregate_rrf
 
 
 def test_aggregate_sums_reciprocal_rank():
@@ -11,6 +11,14 @@ def test_aggregate_sums_reciprocal_rank():
 def test_aggregate_dedupes_within_list():
     top = aggregate([["a", "a", "b"]], k=2)
     assert top == ["a", "b"]
+
+
+def test_aggregate_rrf_single_equals_order_and_fuses():
+    # S=1 monotonic in rank; S=2 agreeing keeps winner.
+    assert aggregate_rrf([["a", "b", "c"]]) == ["a", "b", "c"]
+    assert aggregate_rrf([["a", "b"], ["a", "c"]])[0] == "a"
+    assert aggregate_rrf([]) == []
+    assert aggregate_rrf([["a", "a", "b"]], k=2) == ["a", "b"]
 
 
 def test_submission_format_ok():
