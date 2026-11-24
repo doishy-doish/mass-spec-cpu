@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 from bisect import bisect_left, bisect_right
 
@@ -633,6 +634,20 @@ def main() -> None:
     global _STATUS_PATH
     _STATUS_PATH = out_path + ".status"
     try:
+        _crash_path = os.path.join("results", "crash" + (a.out_suffix or "") + ".txt")
+        _hook0 = sys.excepthook
+        def _crash_hook(t, v, tb, _p=_crash_path, _h0=_hook0):
+            try:
+                import traceback as _tb
+                with open(_p, "w") as _f:
+                    _f.write("".join(_tb.format_exception(t, v, tb)))
+            except Exception:
+                pass
+            _h0(t, v, tb)
+        sys.excepthook = _crash_hook
+    except Exception:
+        pass
+    try:
         with open(_STATUS_PATH, "w") as sf:
             sf.write("STARTED mask=" + str(a.mask) + " shard=" + str(a.shard) + "\n")
     except Exception:
@@ -648,6 +663,11 @@ def main() -> None:
         T = SL.as_table(S)
     else:
         T = load_table(a.data, train=True)
+        try:
+            with open(_STATUS_PATH, "a") as _sf:
+                _sf.write("LOAD-DONE rows=" + str(len(T["prec"])) + "\n")
+        except Exception:
+            pass
     pool = V.query_pool(T).tolist()
     if a.mask == "class2":
         library, queries, _ = V.split_class2(T, pool, a.n, a.seed)
