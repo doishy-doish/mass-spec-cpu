@@ -1,0 +1,2 @@
+GREEN
+results/class2-0-n50q1.json engine=rust n=50 mrr=0.5507 lib=0.5329 analog=0.1414 stein=0.4803 mass=0.1188 zw=0.5507 swap=0.100 pure=0.5600 libce=0.4617 ent=0.5169 gate=0.0929 sword=on cand=4516/2288 fb=0.0
