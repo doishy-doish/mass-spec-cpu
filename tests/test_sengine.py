@@ -243,6 +243,13 @@ def test_sword_stage_applies_cumulative_and_only_modes():
     assert R.sword_stage_applies(13, 1) is False
 
 
+def test_pool_parity_exact_and_null():
+    assert R.pool_parity(["a"], ["b"], {"cand_keys": ["a"], "pool_keys": ["b"]}) == (True, "")
+    assert R.pool_parity(["a"], ["b"], {"cand_keys": ["x"], "pool_keys": ["b"]}) == (False, "cand")
+    assert R.pool_parity(["a"], ["b"], {"cand_keys": ["a"], "pool_keys": ["x"]}) == (False, "pool")
+    assert R.pool_parity(["a"], ["b"], None) == (False, "null")
+
+
 def test_load_table_stub_parquet(tmp_path):
     """Loader stub: tiny real parquet in, table dict out (exercises pyarrow path)."""
     import pyarrow as pa
