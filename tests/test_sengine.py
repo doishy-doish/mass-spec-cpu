@@ -229,6 +229,20 @@ def test_sword_cut_adduct_exact_with_recall_fallback():
     assert R.sword_cut_adduct(["k2"], k2a, "[M+H]+") == (["k2"], 1, 1, 1.0)
 
 
+def test_sword_stage_applies_cumulative_and_only_modes():
+    assert R.sword_stage_applies(0, 1) is False
+    assert R.sword_stage_applies(1, 1) is True
+    assert R.sword_stage_applies(1, 2) is False
+    assert R.sword_stage_applies(3, 3) is True
+    assert R.sword_stage_applies(11, 1) is True
+    assert R.sword_stage_applies(11, 2) is False
+    assert R.sword_stage_applies(12, 1) is False
+    assert R.sword_stage_applies(12, 2) is True
+    assert R.sword_stage_applies(12, 3) is False
+    assert R.sword_stage_applies(13, 3) is True
+    assert R.sword_stage_applies(13, 1) is False
+
+
 def test_load_table_stub_parquet(tmp_path):
     """Loader stub: tiny real parquet in, table dict out (exercises pyarrow path)."""
     import pyarrow as pa
