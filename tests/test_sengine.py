@@ -196,6 +196,28 @@ def test_two_phase_select_then_score_with_stub_engine():
     assert swap is True
 
 
+def test_sword_prec_cut_pure_window_with_recall_fallback():
+    T = _table()
+    R._SE.update(skeys=np.array(["k1", "k2"]),
+                 masses=np.array([200.0, 250.0]),
+                 qnm={0: 200.0}, qprec={0: 200.0},
+                 qmzs={0: T["mzs"][0]}, qints={0: T["ints"][0]},
+                 qkey={0: "k1"},
+                 lib_precs=[199.0, 199.9995, 200.0, 200.0005, 250.0],
+                 lib_pkeys=["d0", "d1", "k1", "d3", "k2"],
+                 ppm=8.5, shard=0, variants=R.VARIANTS,
+                 sword_prec=1)
+    sel = R.select_task((0, 0, 1))
+    assert sel is not None
+    assert sel[7] == 5 and sel[8] == 3 and sel[9] == 1.0
+    assert sel[4] == ["k1", "d1", "d3"]
+    # recall lock: a cut that empties the pool falls back, truth survives
+    R._SE.update(lib_precs=[199.0, 201.0], lib_pkeys=["kT", "d9"],
+                 qprec={0: 200.0}, qkey={0: "kT"})
+    sel3 = R.select_task((0, 0, 1))
+    assert sel3[8] == 2 and sel3[9] == 1.0 and sel3[4] == ["kT", "d9"]
+
+
 def test_load_table_stub_parquet(tmp_path):
     """Loader stub: tiny real parquet in, table dict out (exercises pyarrow path)."""
     import pyarrow as pa
