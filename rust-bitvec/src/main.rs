@@ -618,6 +618,7 @@ impl EngineParams {
             recall_topk: 0.0,
             funnel_off: 0.0,
             lossgate: 0.0,
+            dump_scores: 0.0,
             store: None,
             fp_weights: None,
         }
@@ -2033,6 +2034,7 @@ fn sengine(params: EngineParams) {
                     pools: pool_union,
                     mass_swap: mass_swap_any,
                     prefilter_topk: None,
+                    scores: None,
                     timing: vec![ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), 0.0, 0.0, 0.0, 0.0, ms(t_fuse - t_cands)],
                 })
                 .unwrap()
