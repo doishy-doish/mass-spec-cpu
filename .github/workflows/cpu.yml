@@ -81,9 +81,6 @@ on:
       loss-gate:
         description: "R2 diagnostic-loss demotion: sink candidates failing the loss/subformula gate (0/1)"
         default: "0"
-      pool-check:
-        description: "E2-pool parity: engine rebuilds pools, compares key-for-key (0/1)"
-        default: "0"
 permissions:
   contents: write
   actions: read
@@ -172,7 +169,7 @@ jobs:
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         timeout-minutes: 60  # backend auto-cancels hung masks; no manual deadman kills
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --sword-prec "${{ inputs.sword-prec }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --pool-check "${{ inputs.pool-check }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --sword-prec "${{ inputs.sword-prec }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: smart probe (GREEN / RED / INFRA — never ships blind, never cries code-bug on host death)
         if: ${{ always() && inputs.task == 'validate' }}
         env:
@@ -315,7 +312,10 @@ jobs:
           else:
               moved = (rrs.get("zw") != rrs.get("z")) or (rrs.get("rrfw") != rrs.get("rrf"))
               need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
+          if "poolcheck" in (os.environ.get("SUFFIX","") or ""):
+              need(out.get("pool_parity_n", 0) > 0, "poolcheck suffix but parity never ran (n=0) — flag wiring broken")
           if out.get("pool_parity_n"):
+              need(out.get("pool_parity_nulls", -1) == 0, f"pool parity nulls={out.get('pool_parity_nulls')} — engine store missing, parity unmeasured")
               need(out.get("pool_parity_rate") == 1.0, f"pool parity {out.get('pool_parity_rate')} != 1.0 nulls={out.get('pool_parity_nulls')} — engine pools != Python pools")
           if red:
               emit("RED", red)
