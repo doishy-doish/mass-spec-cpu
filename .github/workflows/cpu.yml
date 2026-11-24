@@ -158,6 +158,7 @@ jobs:
           PYTHONPATH: src
       - name: build slim store (one-time convert, then cached)
         if: ${{ inputs.task == 'slimbuild' }}
+        timeout-minutes: 75 # host-lottery guard: convert ~50min healthy; dead host fails fast, never blocks the lane for hours
         run: PYTHONPATH=src python scripts/build_slim.py --train data/train.parquet --rust-bin rust-bitvec/target/release/binvec --out data/slim
       - name: save slim cache
         if: ${{ inputs.task == 'slimbuild' }}
