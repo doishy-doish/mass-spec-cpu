@@ -754,7 +754,7 @@ def main() -> None:
                     help="preconverted slim store (scripts/build_slim.py). "
                          "Used automatically when its manifest.json exists; "
                          "otherwise the parquet path runs (fallback).")
-    ap.add_argument("--erun", type=int, default=0,
+    ap.add_argument("--erun", type=int, default=1,
                     help="1 = E1 engine-owned store: the engine resolves spectra "
                          "from slim itself (params.store); zero preload chunks, "
                          "zero per-query spectra JSON. Off = protocol v2.")
