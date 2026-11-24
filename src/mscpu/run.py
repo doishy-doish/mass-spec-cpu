@@ -484,6 +484,23 @@ def mol_union_keys(selected: list) -> tuple:
     return (sorted(cand), sorted(pool))
 
 
+def sword_stage_applies(raw_level, stage) -> bool:
+    """SWORD isolation (non-cumulative) arms: raw 11/12/13 = only stage 1/2/3.
+
+    Cumulative 0-3 keep >= semantics; only-modes apply exactly one stage so
+    CE-alone (12) and adduct-alone (13) marginals are measurable. Pure,
+    testable; the run block calls this per stage.
+    """
+    try:
+        _raw = int(raw_level or 0)
+    except (TypeError, ValueError):
+        return False
+    _only = {11: 1, 12: 2, 13: 3}.get(_raw, 0)
+    if _only:
+        return _only == int(stage)
+    return _raw >= int(stage)
+
+
 def sword_cut_cands(cand_keys, key2prec, qprec, ppm=8.5) -> tuple:
     """SWORD-1b: pure prec-ppm window over candidate keys (given value 8.5ppm).
 
@@ -725,8 +742,8 @@ def main() -> None:
                     help="1 = disable Jaccard prefilter (I6 A/B: donor-retention question)")
     ap.add_argument("--loss-gate", type=int, default=0,
                     help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
-    ap.add_argument("--sword-prec", type=int, default=0, choices=[0, 1, 2, 3],
-                    help="SWORD pure-cut level, cumulative and sequential: 0=off, 1=+prec-ppm, 2=+CE-band, 3=+adduct-exact. Each stage recall-locked (empty->uncut, unknown->kept)")
+    ap.add_argument("--sword-prec", type=int, default=0, choices=[0, 1, 2, 3, 11, 12, 13],
+                    help="SWORD pure-cut level, cumulative and sequential: 0=off, 1=+prec-ppm, 2=+CE-band, 3=+adduct-exact. Isolation arms (non-cumulative): 11=prec-only, 12=CE-only, 13=adduct-only. Each stage recall-locked (empty->uncut, unknown->kept)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -1023,7 +1040,11 @@ def main() -> None:
     # prec-ppm (s2-benched single cut), 2 = +CE-band, 3 = +adduct-exact.
     # Per-query fb = 1.0 if any applied stage fell back, else 0.0; stage
     # counts accumulate in _sword_c[0..3] (pre + post each stage).
-    _sword_level = int(a.sword_prec or 0)
+    _sword_raw = int(a.sword_prec or 0)
+    _sword_only = {11: 1, 12: 2, 13: 3}.get(_sword_raw, 0)
+    # Isolation arms (11/12/13): exactly one stage runs; level records it, so
+    # sword_cand1 = post-that-stage count and fb/stages stay comparable.
+    _sword_level = _sword_only or _sword_raw
     _sword_c = [0, 0, 0, 0]
     _sword_fb = 0.0
     _sword_fn = 0
@@ -1041,21 +1062,21 @@ def main() -> None:
             _kc = list(_s[3])
             _stages = [len(_kc)]
             _fb = 0.0
-            if _sword_level >= 1:
+            if sword_stage_applies(_sword_raw, 1):
                 _qq = _qp.get(_s[1])
                 if _qq is not None:
                     _kc, _, _n1, _f1 = sword_cut_cands(_kc, key2prec, float(_qq))
                     if _f1:
                         _fb = 1.0
                 _stages.append(len(_kc))
-            if _sword_level >= 2:
+            if sword_stage_applies(_sword_raw, 2):
                 _qce = _qc.get(_s[1])
                 if _qce is not None:
                     _kc, _, _n2, _f2 = sword_cut_ce(_kc, key2ce, _qce)
                     if _f2:
                         _fb = 1.0
                 _stages.append(len(_kc))
-            if _sword_level >= 3:
+            if sword_stage_applies(_sword_raw, 3):
                 try:
                     _qad = str(_T_ad_list[int(_s[1])])
                 except (IndexError, TypeError, ValueError):
@@ -1200,6 +1221,7 @@ def main() -> None:
            "truth_in_union": _tin, "keys_in_lib": _hit,
            "sword_on": bool(_sword_level),
            "sword_level": int(_sword_level),
+           "sword_only": bool(_sword_only),
            "sword_cand0": int(_sword_c[0]),
            "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
            "sword_stages": [int(v) for v in _sword_c],
