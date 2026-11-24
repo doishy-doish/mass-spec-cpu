@@ -351,7 +351,13 @@ def score_entropy(rel_ints) -> float:
 
 def entropy_exp(rel_ints) -> float:
     """Dynamic weight exponent: 0.25+0.25S for S<3 else 1.0. Mirrors Rust."""
-    s = score_entropy(rel_ints)
+    try:
+        xs = [float(x) for x in (rel_ints or [])]
+    except Exception:
+        return 1.0
+    if not (sum(xs) > 0):
+        return 1.0  # empty/zero -> linear fallback (Rust parity)
+    s = score_entropy(xs)
     return 0.25 + 0.25 * s if s < 3.0 else 1.0
 
 
