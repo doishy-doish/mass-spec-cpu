@@ -587,6 +587,11 @@ struct EngineParams {
     /// row refs only. None = protocol v2 (preload chunks) as before.
     #[serde(default)]
     store: Option<String>,
+    /// WIN-FIRST Phase 1: trained spectrum->Morgan MLP weights file
+    /// (data/fp_mlp.bin layout, TRAIN_PLAN). None = fp channel stays
+    /// quarantined at 0.0 (safe default until weights land).
+    #[serde(default)]
+    fp_weights: Option<String>,
 }
 
 impl EngineParams {
@@ -609,8 +614,118 @@ impl EngineParams {
             funnel_off: 0.0,
             lossgate: 0.0,
             store: None,
+            fp_weights: None,
         }
     }
+}
+
+/// WIN-FIRST Phase 1: trained spectrum->Morgan MLP (TRAIN_PLAN).
+/// Bins must match scripts/train_fp.py featurize EXACTLY:
+/// bins 0..1535 Da @1Da of max cleaned weight (clean stores sqrt of normalized
+/// intensity — train_fp.py applies the same single sqrt), feat[1536]=prec/2000.
+const FP_NBIN: usize = 1536;
+const FP_INDIM: usize = 1537;
+const FP_NWORDS: usize = 32;
+
+struct FpModel {
+    hid: usize,
+    w1: Vec<f32>,
+    b1: Vec<f32>,
+    w2: Vec<f32>,
+    b2: Vec<f32>,
+}
+
+fn bin_feats(mz: &[f64], w: &[f64], prec: f64) -> Vec<f32> {
+    let mut x = vec![0f32; FP_INDIM];
+    for (&m, &ww) in mz.iter().zip(w.iter()) {
+        if m >= 0.0 && m < FP_NBIN as f64 && ww > 0.0 {
+            let b = m as usize;
+            let v = ww as f32; // w is already sqrt (clean); train_fp.py sqrts raw once
+            if v > x[b] {
+                x[b] = v;
+            }
+        }
+    }
+    x[FP_NBIN] = (prec as f32) / 2000.0;
+    x
+}
+
+fn load_fp_model(path: &str) -> Option<FpModel> {
+    let b = std::fs::read(path).ok()?;
+    if b.len() < 16 {
+        return None;
+    }
+    let u = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+    if u(0) != 0x314D5046 || u(4) != FP_INDIM {
+        return None;
+    }
+    let (hid, out) = (u(8), u(12));
+    if out != 2048 || hid == 0 || hid > 4096 {
+        return None;
+    }
+    let f = |off: usize, n: usize| -> Option<Vec<f32>> {
+        let end = off.checked_add(n.checked_mul(4)?)?;
+        b.get(off..end).map(|s| {
+            s.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        })
+    };
+    let mut off = 16;
+    let w1 = f(off, FP_INDIM * hid)?;
+    off += FP_INDIM * hid * 4;
+    let b1 = f(off, hid)?;
+    off += hid * 4;
+    let w2 = f(off, hid * 2048)?;
+    off += hid * 2048 * 4;
+    let b2 = f(off, 2048)?;
+    Some(FpModel { hid, w1, b1, w2, b2 })
+}
+
+fn fp_forward(m: &FpModel, x: &[f32]) -> [u64; FP_NWORDS] {
+    let mut h = vec![0f32; m.hid];
+    for j in 0..m.hid {
+        let mut s = m.b1[j];
+        for i in 0..x.len().min(FP_INDIM) {
+            s += x[i] * m.w1[i * m.hid + j];
+        }
+        h[j] = if s > 0.0 { s } else { 0.0 };
+    }
+    let mut out = [0u64; FP_NWORDS];
+    for k in 0..2048 {
+        let mut s = m.b2[k];
+        for j in 0..m.hid {
+            s += h[j] * m.w2[j * 2048 + k];
+        }
+        if 1.0 / (1.0 + (-s).exp()) >= 0.5 {
+            out[k / 64] |= 1u64 << (k % 64);
+        }
+    }
+    out
+}
+
+/// dump-fp: stdin {"keys":[],"smiles":[]} -> stdout {"bits":{key:hex512},"n":N}.
+/// Labels for train_fp.py — same rust-chem Morgan code that scores candidates.
+fn dump_fp_main() {
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).expect("dump-fp: read stdin");
+    #[derive(serde::Deserialize)]
+    struct In {
+        keys: Vec<String>,
+        smiles: Vec<String>,
+    }
+    let inp: In = serde_json::from_str(&buf).expect("dump-fp: parse");
+    let mut bits: HashMap<String, String> = HashMap::with_capacity(inp.keys.len());
+    for (k, s) in inp.keys.iter().zip(inp.smiles.iter()) {
+        let w = chem::morgan_bits_2048(s);
+        let mut hx = String::with_capacity(512);
+        for word in w {
+            hx.push_str(&format!("{:016x}", word));
+        }
+        bits.insert(k.clone(), hx);
+    }
+    let n = bits.len();
+    println!("{}", serde_json::json!({"bits": bits, "n": n}));
 }
 
 #[derive(Deserialize)]
@@ -1350,8 +1465,22 @@ fn fuse_rank(
             .collect();
         out.insert(name.to_string(), kv);
     }
-    // quarantined fp: empty list, never ranked.
-    out.insert("fp".to_string(), Vec::new());
+    // fp: fused IFF weights are loaded (trained MLP); otherwise quarantined
+    // empty (cross-domain hash noise — see fp_score). No-weights default = safe.
+    if fw.fp_weights.is_some() {
+        if let Some(fp) = cols.get("fp") {
+            let kv: Vec<String> = order_desc(fp)
+                .into_iter()
+                .take(TOP_K_OUT)
+                .map(|i| keys[i].clone())
+                .collect();
+            out.insert("fp".to_string(), kv);
+        } else {
+            out.insert("fp".to_string(), Vec::new());
+        }
+    } else {
+        out.insert("fp".to_string(), Vec::new());
+    }
     out
 }
 
@@ -1433,6 +1562,7 @@ fn funnel_topk(ordered_keys: &[String], k: usize) -> Vec<String> {
 fn fuse_molecule_rrf(
     per_spec: &[HashMap<String, Vec<f64>>],
     keys: &[String],
+    fp_live: bool,
 ) -> HashMap<String, Vec<String>> {
     let mut out = HashMap::new();
     if per_spec.is_empty() || keys.is_empty() {
@@ -1443,11 +1573,11 @@ fn fuse_molecule_rrf(
     }
     let n = keys.len();
     let nan = vec![f64::NAN; n];
-    // fp quarantined (cross-domain Tanimoto noise): empty, never fused.
-    // Every other variant (lib-family restored + computed) fuses here.
+    // fp fused IFF weights are loaded (trained MLP); otherwise quarantined
+    // empty. Every other variant (lib-family restored + computed) fuses here.
     const DEAD: [&str; 1] = ["fp"];
     for v in VARIANTS {
-        if DEAD.contains(&v) {
+        if !fp_live && DEAD.contains(&v) {
             out.insert(v.to_string(), Vec::new());
             continue;
         }
@@ -1515,6 +1645,17 @@ fn sengine(params: EngineParams) {
         slim_pos = pos;
         slim_store = Some(st);
     }
+    // WIN-FIRST Phase 1: trained fp MLP. None = quarantined zeros (safe default).
+    let fp_model: Option<FpModel> = params.fp_weights.as_ref().and_then(|p| {
+        let m = load_fp_model(p);
+        eprintln!(
+            "sengine: fp model {} ({})",
+            if m.is_some() { "loaded" } else { "MISSING-or-corrupt, fp=0" },
+            p
+        );
+        m
+    });
+    let fp_live = fp_model.is_some();
     for line in lines {
         let line = line.expect("sengine: read");
         if line.trim().is_empty() {
@@ -1653,6 +1794,11 @@ fn sengine(params: EngineParams) {
                 let qloss = loss_set(&qc.mz, qc.prec);
                 let qn = qloss.len().max(1) as f64;
                 let qnm: Option<f64> = qnms.get(si).copied().flatten();
+                // WIN-FIRST Phase 1: trained fp prediction for this spectrum.
+                // None (no weights) = quarantined zeros.
+                let qfp: Option<[u64; FP_NWORDS]> = fp_model
+                    .as_ref()
+                    .map(|m| fp_forward(m, &bin_feats(&qc.mz, &qc.w, qc.prec)));
                 let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_first.len());
                 for (k, s, fp) in &pool_first {
                     pool.push((k.clone(), s.clone(), (s.prec - qc.prec).abs(), *fp));
@@ -1782,9 +1928,10 @@ fn sengine(params: EngineParams) {
                 cols.insert("ent".to_string(), vent);
                 cols.insert("gate".to_string(), vgate.clone()); // cloned: COMPUTED block below reuses vgate
                 // S2 cleavage + Q6 entw + hand-set stumps (computed, additive).
-                // fp quarantined: 0.0, never fused (DEAD).
+                // fp LIVE when weights are loaded (trained MLP), else zeros.
                 let (_qent_s, qent_exp) = query_entropy_info(&qc.w);
                 let mut vcleav = Vec::with_capacity(cands.len());
+                let mut vfp = Vec::with_capacity(cands.len());
                 let mut ventw = Vec::with_capacity(cands.len());
                 let mut vlgbma = Vec::with_capacity(cands.len());
                 let mut vlgbmb = Vec::with_capacity(cands.len());
@@ -1792,15 +1939,21 @@ fn sengine(params: EngineParams) {
                 for (ci, c) in cands.iter().enumerate() {
                     let smi = table.get(&c.key).map(|e| e.smiles.as_str()).unwrap_or("");
                     let cs = cleavage_score(&qc.mz, &qc.w, smi);
+                    let fs = match (&qfp, c.fp) {
+                        (Some(q), Some(cf)) => chem_tanimoto(q, &cf),
+                        _ => 0.0,
+                    };
                     let es = entropy_grade(vgate[ci], qent_exp);
                     vcleav.push(cs);
+                    vfp.push(fs);
                     ventw.push(es);
-                    let (la, lb, lc) = lgbm_scores(vmass[ci], vgate[ci], cs, 0.0, es);
+                    let (la, lb, lc) = lgbm_scores(vmass[ci], vgate[ci], cs, fs, es);
                     vlgbma.push(la);
                     vlgbmb.push(lb);
                     vlgbmc.push(lc);
                 }
                 cols.insert("cleav".to_string(), vcleav);
+                cols.insert("fp".to_string(), vfp);
                 cols.insert("entw".to_string(), ventw);
                 cols.insert("lgbma".to_string(), vlgbma);
                 cols.insert("lgbmb".to_string(), vlgbmb);
@@ -1820,7 +1973,7 @@ fn sengine(params: EngineParams) {
                 let _ = qis.get(si);
             }
             let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
-            let mut ranked = fuse_molecule_rrf(&per_spec, &keys);
+            let mut ranked = fuse_molecule_rrf(&per_spec, &keys, fp_live);
             if params.mass_replace > 0.5 {
                 // molecule qnm = median of available per-spectrum qnms.
                 let mut qvs: Vec<f64> = qnms.iter().filter_map(|v| *v).filter(|v| *v > 0.0).collect();
@@ -2079,9 +2232,14 @@ fn sengine(params: EngineParams) {
         cols.insert("ent".to_string(), vent);
         cols.insert("gate".to_string(), vgate.clone()); // cloned: COMPUTED block below reuses vgate
         // S2 cleavage + Q6 entw + hand-set stumps (computed, additive).
-        // fp quarantined: 0.0, never fused (DEAD).
+        // fp LIVE when weights are loaded (trained MLP), else zeros.
+        // WIN-FIRST Phase 1: trained fp prediction for this query.
+        let qfp: Option<[u64; FP_NWORDS]> = fp_model
+            .as_ref()
+            .map(|m| fp_forward(m, &bin_feats(&qc.mz, &qc.w, qc.prec)));
         let (_qent_s, qent_exp) = query_entropy_info(&qc.w);
         let mut vcleav = Vec::with_capacity(cands.len());
+        let mut vfp = Vec::with_capacity(cands.len());
         let mut ventw = Vec::with_capacity(cands.len());
         let mut vlgbma = Vec::with_capacity(cands.len());
         let mut vlgbmb = Vec::with_capacity(cands.len());
@@ -2089,15 +2247,21 @@ fn sengine(params: EngineParams) {
         for (ci, c) in cands.iter().enumerate() {
             let smi = table.get(&c.key).map(|e| e.smiles.as_str()).unwrap_or("");
             let cs = cleavage_score(&qc.mz, &qc.w, smi);
+            let fs = match (&qfp, c.fp) {
+                (Some(q), Some(cf)) => chem_tanimoto(q, &cf),
+                _ => 0.0,
+            };
             let es = entropy_grade(vgate[ci], qent_exp);
             vcleav.push(cs);
+            vfp.push(fs);
             ventw.push(es);
-            let (la, lb, lc) = lgbm_scores(vmass[ci], vgate[ci], cs, 0.0, es);
+            let (la, lb, lc) = lgbm_scores(vmass[ci], vgate[ci], cs, fs, es);
             vlgbma.push(la);
             vlgbmb.push(lb);
             vlgbmc.push(lc);
         }
         cols.insert("cleav".to_string(), vcleav);
+        cols.insert("fp".to_string(), vfp);
         cols.insert("entw".to_string(), ventw);
         cols.insert("lgbma".to_string(), vlgbma);
         cols.insert("lgbmb".to_string(), vlgbmb);
@@ -2210,6 +2374,10 @@ fn main() {
         structs_main();
         return;
     }
+    if args.iter().any(|a| a == "dump-fp") {
+        dump_fp_main();
+        return;
+    }
     if args.iter().any(|a| a == "sengine") {
         let stdin = std::io::stdin();
         let mut buf = String::new();
@@ -2253,7 +2421,7 @@ fn main() {
         }
         return;
     }
-    eprintln!("usage: binvec <structs|sengine|slimcheck --store DIR [--row I]>");
+    eprintln!("usage: binvec <structs|sengine|dump-fp|slimcheck --store DIR [--row I]>");
     std::process::exit(2);
 }
 
@@ -2529,7 +2697,9 @@ mod engine_tests {
     #[test]
     fn weighted_genome_moves_rankings() {
         // genome: per-channel z + RRF weights, cascade/router gates (defaults neutral).
-        let lib = vec![0.9, 0.5, 0.0];
+        // lib max 0.8 stays below the MONEY GATE (0.9) so the cascade-gate leg
+        // flip is exercised; 0.9 would hit-lock cascade to lib on both legs.
+        let lib = vec![0.8, 0.5, 0.0];
         let analog = vec![0.2, 0.8, 0.1];
         let frag = vec![0.3, 0.3, 0.9];
         let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -2660,7 +2830,7 @@ mod engine_tests {
         cols.insert("libce".to_string(), vec![0.9, 0.5, 0.0]);
         cols.insert("ent".to_string(), vec![0.9, 0.5, 0.0]);
         cols.insert("gate".to_string(), vec![1.0, 1.0, 1.0]);
-        let fused = fuse_molecule_rrf(&[cols], &keys);
+        let fused = fuse_molecule_rrf(&[cols], &keys, false);
         // lib single: a(0.9) b(0.5) c(0.0) -> a,b,c.
         assert_eq!(fused["lib"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
         // S=2 agreeing spectra keep the winner: both rank a first.
@@ -2672,7 +2842,7 @@ mod engine_tests {
         for v in VARIANTS {
             c3.insert(v.to_string(), vec![0.8, 0.2, 0.0]);
         }
-        let fused2 = fuse_molecule_rrf(&[c2, c3], &keys);
+        let fused2 = fuse_molecule_rrf(&[c2, c3], &keys, false);
         assert_eq!(fused2["lib"][0], "a");
         // fp quarantined: empty, never fused.
         assert!(fused["fp"].is_empty());
@@ -2682,7 +2852,7 @@ mod engine_tests {
         for v in VARIANTS {
             cn.insert(v.to_string(), vec![f64::NAN; 3]);
         }
-        let fusedn = fuse_molecule_rrf(&[cn], &keys);
+        let fusedn = fuse_molecule_rrf(&[cn], &keys, false);
         assert_eq!(fusedn["lib"].len(), 3);
     }
 
@@ -2705,5 +2875,37 @@ mod engine_tests {
         let ord_b = entropy_router_order(&mass, &gate, &mass, &gate, &gate, 0.9);
         assert_eq!(ord_s.len(), 3);
         assert_eq!(ord_b.len(), 3);
+    }
+
+    #[test]
+    fn fp_bins_match_train_features() {
+        // bin_feats == train_fp.py featurize: max cleaned-w per 1Da bin.
+        // (clean stores sqrt; both sides apply exactly one sqrt.)
+        let x = bin_feats(&[100.0, 100.4, 2000.0], &[1.0, 0.25, 1.0], 1000.0);
+        assert_eq!(x.len(), FP_INDIM);
+        assert!((x[100] - 1.0).abs() < 1e-6); // max w at mz 100
+        assert!(x[0] == 0.0);
+        assert!(x[FP_NBIN - 1] == 0.0); // mz 2000 out of range
+        assert!((x[FP_NBIN] - 0.5).abs() < 1e-9); // 1000/2000
+    }
+
+    #[test]
+    fn fp_forward_toy_and_loader_rejects_garbage() {
+        // toy: in=FP_INDIM, hid=1, out=2048: h=relu(x0), y=sigmoid(+-h).
+        let mut w1 = vec![0f32; FP_INDIM];
+        w1[0] = 1.0;
+        let mut w2 = vec![0f32; 2048];
+        w2[0] = 1.0;
+        w2[1] = -1.0;
+        let m = FpModel { hid: 1, w1, b1: vec![0.0], w2, b2: vec![0f32; 2048] };
+        let mut x = vec![0f32; FP_INDIM];
+        x[0] = 2.0;
+        let out = fp_forward(&m, &x);
+        // h=relu(2)=2; y0=sigmoid(2)>0.5 -> bit0 set; y1=sigmoid(-2)<0.5 clear.
+        assert_eq!(out[0] & 1, 1);
+        assert_eq!((out[0] >> 1) & 1, 0);
+        assert!(out[1..].iter().all(|&w| w == 0));
+        // loader rejects missing files and bad magic.
+        assert!(load_fp_model("/nonexistent/fp_mlp.bin").is_none());
     }
 }
