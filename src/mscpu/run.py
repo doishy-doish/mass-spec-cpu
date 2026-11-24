@@ -39,7 +39,7 @@ FUSION_DEFAULTS = {"wl": 1.0, "wa": 1.0, "wf": 1.0, "rl": 1.0, "ra": 1.0,
                    "rf": 1.0, "casc_z": 3.0, "rout_lib": 0.5,
                    "rout_bin": 0.4, "rout_binw": 0.4,
                    "mass_replace": 0.0, "recall_topk": 0.0,
-                   "funnel_off": 0.0, "lossgate": 0.0}
+                   "funnel_off": 0.0, "lossgate": 0.0, "dump_scores": 0.0}
 
 
 TRAIN_COLS = ["inchikey14", "normalized_smiles", "precursor_mz",
@@ -755,6 +755,24 @@ def score_one(sel, engine):
         return None
     truth = str(_SE["qkey"][qi])
     row, ranked_z, swap = assemble_row(out, truth, qi, V_)
+    # LGBM pairs: one compact record per query (keys + labels + channel
+    # score lists in cand_keys order). TTA multi-attempt path has no cols
+    # (ranked-list fusion only) so those queries contribute nothing — noted.
+    try:
+        _dp = _SE.get("dump_pairs")
+        if _dp is not None:
+            _sc = out.get("scores") or {}
+            _ck = [str(_k) for _k in cand_keys]
+            _rec = {"qi": int(qi), "keys": _ck,
+                    "y": [1 if _k == truth else 0 for _k in _ck], "s": {}}
+            for _v in V_:
+                _col = _sc.get(_v)
+                if isinstance(_col, list) and len(_col) == len(_ck):
+                    _rec["s"][_v] = [float(_x) for _x in _col]
+            if _rec["s"]:
+                _dp.append(_rec)
+    except Exception:
+        pass
     # I6 funnel recall probe: truth in echoed prefilter top-K? (None = probe off)
     try:
         _ptk = out.get("prefilter_topk")
@@ -811,6 +829,8 @@ def main() -> None:
                     help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
     ap.add_argument("--pool-check", type=int, default=0,
                     help="1 = E2-pool parity: engine rebuilds neutral window + analog pool per query, Python compares key-for-key (expects 1.0000; needs slim store, else nulls)")
+    ap.add_argument("--dump-scores", type=int, default=0,
+                    help="1 = collect per-candidate per-channel pairs for LightGBM OOF training (suffix -dump sets this; no new workflow inputs, M235)")
     ap.add_argument("--sword-prec", type=int, default=0, choices=[0, 1, 2, 3, 11, 12, 13],
                     help="SWORD pure-cut level, cumulative and sequential: 0=off, 1=+prec-ppm, 2=+CE-band, 3=+adduct-exact. Isolation arms (non-cumulative): 11=prec-only, 12=CE-only, 13=adduct-only. Each stage recall-locked (empty->uncut, unknown->kept)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
@@ -834,6 +854,8 @@ def main() -> None:
     a = ap.parse_args()
     if "poolcheck" in (a.out_suffix or ""):
         a.pool_check = 1  # input-cap: workflow_dispatch allows max 25 inputs; bench flag rides the suffix
+    if "-dump" in (a.out_suffix or ""):
+        a.dump_scores = 1  # LightGBM pairs ride the suffix (no new workflow inputs, M235)
     # 25-input cap: Q3b/Q7 flags ride the suffix (no new workflow inputs, M235).
     if "molrrf" in (a.out_suffix or ""):
         try:
@@ -915,6 +937,10 @@ def main() -> None:
     # TRUE-CLASS2 (-t2 in suffix, class2 only): strip holds on rows, held
     # keys preload metadata-only (M254; slim path refused fail-fast below).
     _t2 = "-t2" in str(getattr(a, "out_suffix", "") or "")
+    # LGBM pairs (-dump in suffix): engine emits per-cand channel scores,
+    # collected per query for OOF ranker training. Additive, probe-neutral.
+    _dump = "-dump" in str(getattr(a, "out_suffix", "") or "") or bool(getattr(a, "dump_scores", 0))
+    _SE["dump_pairs"] = [] if _dump else None
     if a.mask == "class2":
         library, queries, _held = V.split_class2(T, pool, a.n, a.seed, phonebook=_pb)
     elif a.mask == "class3":
@@ -1039,8 +1065,10 @@ def main() -> None:
     else:
         queries = queries[a.shard::a.shards]
 
-    # analog-pool lookup array: precursor-sorted first-spectrum per library key
-    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items()]
+    # analog-pool lookup array: precursor-sorted first-spectrum per library key.
+    # M255: true-class2 metadata keys map to [] (no spectra) — skipped here;
+    # the pool is spectra-only by definition, truth ranks via cands.
+    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items() if js]
     _prec_pairs.sort(key=lambda t: t[0])
     lib_precs = [p for p, _ in _prec_pairs]
     lib_pkeys = [k for _, k in _prec_pairs]
@@ -1088,7 +1116,8 @@ def main() -> None:
               "mass_replace": 1.0 if a.mass_replace else 0.0,
               "recall_topk": float(a.recall_topk or 0.0),
               "funnel_off": 1.0 if a.funnel_off else 0.0,
-              "lossgate": 1.0 if a.loss_gate else 0.0}
+              "lossgate": 1.0 if a.loss_gate else 0.0,
+              "dump_scores": 1.0 if _dump else 0.0}
     # M211: select FIRST from small arrays, preload ONLY the union of keys
     # queries touch, slim T BEFORE spawning the engine. Two full in-memory
     # copies (parent tables + engine raw table) exceed the 16GB runner —
@@ -1223,7 +1252,11 @@ def main() -> None:
                 _hit += 1
     # SWORD-1b: candidate cut applied parent-side before union (see above).
     _truths = [str(_SE["qkey"][int(_qi)]) for _, _qi, _ in tasks]
-    _tin = sum(1 for _t in _truths if _t in _subkeys)
+    # M255b: tin counts SPECTRA (keys with >=1 library row), not preload
+    # candidacy — metadata-only true-class2 keys ([]) must not count, or the
+    # -t2 probe's tin==0 gate reads a correct run as a leak. Strip arms have
+    # no [] entries, so their semantics are byte-identical.
+    _tin = sum(1 for _t in _truths if sub.get(_t))
     print("coverage truth_in_union=" + str(_tin) + "/" + str(len(_truths))
           + " keys_in_lib=" + str(_hit) + "/" + str(_ncand + _npool)
           + " dropped=" + str(len(union) - len(sub)), flush=True)
@@ -1545,6 +1578,8 @@ def main() -> None:
             "sword_only": bool(_sword_only),
             "phonebook": bool(_pb),
             "true2": bool(_t2 and a.mask == "class2"),
+            "dump": bool(_dump),
+            "pairs": (_SE.get("dump_pairs") if _dump else None),
             "sword_cand0": int(_sword_c[0]),
             "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
             "sword_stages": [int(v) for v in _sword_c],
