@@ -75,6 +75,9 @@ on:
       erun:
         description: "E1 engine-owned store: engine resolves spectra from slim (0/1; needs slim cache, else falls back)"
         default: "0"
+      sword-prec:
+        description: "SWORD-1 pure prec-ppm analog-pool cut at 8.5ppm (0/1; recall-locked fallback)"
+        default: "0"
       loss-gate:
         description: "R2 diagnostic-loss demotion: sink candidates failing the loss/subformula gate (0/1)"
         default: "0"
@@ -166,7 +169,7 @@ jobs:
           key: slim-store-v1
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --formula-ppm "${{ inputs.formula-ppm }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --formula-ppm "${{ inputs.formula-ppm }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --sword-prec "${{ inputs.sword-prec }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: smart probe (GREEN / RED / INFRA — never ships blind, never cries code-bug on host death)
         if: ${{ always() && inputs.task == 'validate' }}
         env:
