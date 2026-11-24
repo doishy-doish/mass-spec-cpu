@@ -213,7 +213,7 @@ jobs:
           # PROBE-V2: crash-aware classification. A committed crash file turns a
           # generic INFRA into a mechanism; a missing engine binary is RED
           # (build/config, actionable) — never host death.
-          crash_path = f"results/crash{SUFFIX}.txt"
+          crash_path = f"results/crash{suffix}.txt"
           crash_txt = None
           try:
               if os.path.exists(crash_path):
