@@ -1,0 +1,4 @@
+RED
+phonebook arm: out phonebook flag missing — arm never engaged
+phonebook arm: truth_in_union==0 — exclusion still active, arm measured nothing
+phonebook arm: mrr_lib 0.0 <= 0.5 — restored lib not retrieving
