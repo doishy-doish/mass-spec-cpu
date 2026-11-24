@@ -114,19 +114,6 @@ jobs:
           cd rust-bitvec && cargo build --release && cargo test --release
           cd ../rust-chem && cargo build --release && cargo test --release
           test -x "$GITHUB_WORKSPACE/rust-bitvec/target/release/binvec" || { echo "ENGINE BINARY MISSING"; ls -la "$GITHUB_WORKSPACE/rust-bitvec/target/release/" | head -20; exit 1; }
-      - name: build diagnostics TEMP-DIAG-REVERT-ME
-        if: ${{ always() }}
-        run: |
-          mkdir -p results
-          echo "=== cargo ===" > results/build-diag.txt
-          (which cargo; cargo --version) >> results/build-diag.txt 2>&1
-          echo "=== release dir ===" >> results/build-diag.txt
-          ls -la rust-bitvec/target/release/ >> results/build-diag.txt 2>&1
-          echo "=== deps head ===" >> results/build-diag.txt
-          ls rust-bitvec/target/release/deps/ 2>> results/build-diag.txt | head -30 >> results/build-diag.txt
-          echo "=== rebuild attempt tail ===" >> results/build-diag.txt
-          (cd rust-bitvec && cargo build --release 2>&1 | tail -25) >> results/build-diag.txt 2>&1
-          echo done >> results/build-diag.txt
       - name: restore data cache
         if: ${{ inputs.task != 'gates' }}
         id: datacache
