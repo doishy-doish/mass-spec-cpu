@@ -323,3 +323,45 @@ def rank_replace_list(ranked_list, ppm_of, center=V8_CENTER, lead_off=V8_REPLACE
         k = lst.pop(best_i)
         lst.insert(0, k)
     return lst
+
+
+# ---------------------------------------------------------------------------
+# (7) entropy router (Q6/Q7 computed signal — mirrors Rust spectral_entropy_info)
+# ---------------------------------------------------------------------------
+
+def score_entropy(rel_ints) -> float:
+    """Spectral entropy in nats over relative intensities (Li & Fiehn shape).
+    Pure, stdlib only. Empty/zero -> 0.0 (no information).
+    """
+    try:
+        xs = [float(x) for x in (rel_ints or [])]
+    except Exception:
+        return 0.0
+    s = sum(xs)
+    if not (s > 0):
+        return 0.0
+    import math as _m
+    ent = 0.0
+    for x in xs:
+        if x > 0:
+            p = x / s
+            ent -= p * _m.log(p)
+    return float(ent)
+
+
+def entropy_exp(rel_ints) -> float:
+    """Dynamic weight exponent: 0.25+0.25S for S<3 else 1.0. Mirrors Rust."""
+    s = score_entropy(rel_ints)
+    return 0.25 + 0.25 * s if s < 3.0 else 1.0
+
+
+def entropy_grade(gate: float, exp: float) -> float:
+    """Q6 grade: gate * (0.5+0.5*exp). Mirrors Rust entropy_grade."""
+    try:
+        g = float(gate)
+        e = float(exp)
+    except Exception:
+        return 0.0
+    if g != g or e != e:
+        return 0.0
+    return g * (0.5 + 0.5 * e)
