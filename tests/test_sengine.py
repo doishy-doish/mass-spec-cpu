@@ -196,6 +196,18 @@ def test_two_phase_select_then_score_with_stub_engine():
     assert swap is True
 
 
+def test_mol_group_and_tta_helpers():
+    sel = [(0, 10, 2, ["k1"], ["k2"], 201.0, 1.0),
+           (1, 11, 2, ["k1"], ["k2"], 201.5, 1.0),
+           None]
+    groups = R.mol_group_by_key(sel, {10: "mk", 11: "mk"})
+    assert set(groups) == {"mk"} and len(groups["mk"]) == 2
+    assert R.mol_group_by_key([None], {}) == {}
+    qnms = R.tta_qnms(10, {10: 200.0}, "[M+H]+", 201.007)
+    assert qnms and qnms[0][0] == "self"
+    assert R.tta_qnms(99, {}, "[M+H]+", 201.0) == []
+
+
 def test_sword_cut_cands_window_with_recall_fallback():
     k2p = {"k1": 200.0, "k2": 200.0005, "k3": 201.0}
     kept, n0, n1, fb = R.sword_cut_cands(["k1", "k2", "k3"], k2p, 200.0)
