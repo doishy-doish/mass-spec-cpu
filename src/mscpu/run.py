@@ -26,6 +26,7 @@ import numpy as np
 from . import metric as M
 from . import validation as V
 from . import input_plugs as IP
+from . import quality as Q
 
 VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure", "libce", "ent", "gate",
             "cleav", "fp", "entw", "lgbma", "lgbmb", "lgbmc"]
@@ -1243,6 +1244,14 @@ def main() -> None:
           flush=True)  # HEARTBEAT
     # slim the parent: the engine owns the touched spectra now; the parent
     # keeps query spectra + small lookup arrays only.
+    # TANIMOTO-LENS: keep SMILES for the touched subset (ranked keys are a
+    # subset of sub) + truth keys (held truths are NOT in sub). Strings only;
+    # the GBs (spectra arrays) still drop below. Test-side quality only.
+    _smi_sub = {str(_k): str(key2smi.get(_k, "")) for _k in sub}
+    try:
+        _smi_sub.update({str(_t): str(key2smi.get(_t, "")) for _t in set(_truths)})
+    except Exception:
+        pass
     del sub
     del union
     del lib_by_key
@@ -1426,6 +1435,44 @@ def main() -> None:
 
     def _avg(x):
         return float(np.mean(x)) if x else 0.0
+
+    # TANIMOTO-LENS (test-side only, never retrieval): per-query Tanimoto of
+    # z rank-1..25 SMILES vs truth SMILES, via quality.py (same Morgan bits
+    # the engine scores). Means only in JSON. Cost ~µs-molecule (measured
+    # 1.5µs fp + 7.4µs Tanimoto per pair in mirror harness).
+    _tq_top1 = _tq_best = 0.0
+    _tq_hit08 = _tq_n = 0
+    _tq_cache: dict = {}
+
+    def _tq_bits(_s):
+        _b = _tq_cache.get(_s)
+        if _b is None:
+            try:
+                _b = Q.morgan_bits(_s)
+            except Exception:
+                _b = [0] * 32
+            _tq_cache[_s] = _b
+        return _b
+
+    for _qi2, _row2, _plen2, _ranked2, _line2, _swap2 in results:
+        try:
+            _t = str((_SE.get("qkey") or {}).get(int(_qi2), ""))
+            _ts = _smi_sub.get(_t, "") if isinstance(_smi_sub, dict) else ""
+            if not _ts or not _ranked2:
+                continue
+            _tb = _tq_bits(_ts)
+            _trow = [Q.tanimoto(_tq_bits(_smi_sub.get(str(_k), "")), _tb)
+                     for _k in list(_ranked2)[:25]]
+            if not _trow:
+                continue
+            _tq_top1 += _trow[0]
+            _bb = max(_trow)
+            _tq_best += _bb
+            if _bb >= 0.8:
+                _tq_hit08 += 1
+            _tq_n += 1
+        except Exception:
+            continue
     out = {"mask": a.mask, "engine": "rust", "shard": a.shard, "shards": a.shards, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
            "mrr_lib": _avg(rrs["lib"]), "mrr_analog": _avg(rrs["analog"]),
            "mrr_frag": _avg(rrs["frag"]), "mrr_rrf": _avg(rrs["rrf"]),
@@ -1468,7 +1515,11 @@ def main() -> None:
             "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
             "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps],
             "qhit_lib": "".join("1" if float(x) > 0 else "0" for x in rrs["lib"]),
-            "qhit_z": "".join("1" if float(x) > 0 else "0" for x in rrs["z"])}
+            "qhit_z": "".join("1" if float(x) > 0 else "0" for x in rrs["z"]),
+            "tanimoto_top1": (_tq_top1 / _tq_n) if _tq_n else 0.0,
+            "tanimoto_best": (_tq_best / _tq_n) if _tq_n else 0.0,
+            "tanimoto_hit08": (_tq_hit08 / _tq_n) if _tq_n else 0.0,
+            "tanimoto_n": int(_tq_n)}
     with open(out_path, "w") as f:
         json.dump(out, f)
     try:
