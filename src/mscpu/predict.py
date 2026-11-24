@@ -1,9 +1,17 @@
-"""predict.py — thin launcher for test-set inference (submission path).
+"""predict.py v3 — thin launcher for test-set inference (submission path).
 
 Same division as run.py: Python owns discovery/load/masks/CSV, the Rust
 sengine owns all scoring. Per molecule: narrow pool -> sengine -> top-25;
 wide-pool rescue for short lists; per-molecule aggregation by summed
 reciprocal rank. No Python backup of any channel math (user order: one code).
+
+v3 changes (bench-gated, default path unchanged unless flagged):
+- --variant (default lgbmb): per-spectrum rank variant. lgbmb = method-light
+  LightGBM stump (gate-heavy, best novel-lane prior); mass/gate/z/rrf stay
+  available for ablations. No learned weights, hand-set stumps only.
+- --mol-rrf (default 1 in v3): per-molecule RRF consensus across spectra
+  (engine mol path when --erun, else Python RRF over per-spectrum lists).
+- Wide rescue unchanged (80ppm default).
 """
 from __future__ import annotations
 
@@ -34,11 +42,32 @@ def aggregate(ranked_lists: list, k: int = 25) -> list:
     return sorted(score, key=lambda kk: -score[kk])[:k]
 
 
-def rank_spectrum(qrec, cand_keys, pool_keys, engine, qi, qnm=None):
-    """One test spectrum -> top-25 keys by the engine's rrf fusion."""
+def aggregate_rrf(ranked_lists: list, k: int = 25, base: float = 60.0) -> list:
+    """Q3b per-molecule RRF: rank_s -> 1/(base+rank_s), summed across spectra.
+    S=1 equals single-query order (monotonic in rank). Pure, testable.
+    """
+    score: dict = {}
+    for rl in ranked_lists:
+        seen = set()
+        for i, key in enumerate(rl):
+            if i >= 25:
+                break
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            score[key] = score.get(key, 0.0) + 1.0 / (base + (i + 1))
+    return sorted(score, key=lambda kk: -score[kk])[:k]
+
+
+def rank_spectrum(qrec, cand_keys, pool_keys, engine, qi, qnm=None, variant: str = "lgbmb"):
+    """One test spectrum -> top-25 keys by the engine's variant fusion (v3: lgbmb)."""
     out = engine.query(R.build_engine_query(qrec, cand_keys, pool_keys,
                                             qi, qnm))
-    return out["ranked"]["rrf"][:25]
+    ranked = out.get("ranked", {})
+    lst = ranked.get(variant, [])
+    if not lst:
+        lst = ranked.get("rrf", [])
+    return lst[:25]
 
 
 def discover_kaggle():
@@ -65,6 +94,10 @@ def main() -> None:
     ap.add_argument("--qloss", type=float, default=0.01)
     ap.add_argument("--ppm", type=float, default=8.5)
     ap.add_argument("--wide", type=float, default=80.0)
+    ap.add_argument("--variant", default="lgbmb",
+                    help="v3 per-spectrum rank variant (lgbmb default; mass/gate/cleav/fp/entw/lgbma/lgbmc/z/rrf ablations)")
+    ap.add_argument("--mol-rrf", type=int, default=1,
+                    help="v3 per-molecule RRF consensus (1 = RRF across spectra, 0 = legacy sum-reciprocal)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--csv", default=None,
                     help="also/only write submission.csv (kernel mode)")
@@ -160,14 +193,15 @@ def main() -> None:
             cn = pool(qnm, a.ppm)
             if len(cn):
                 narrow.append(rank_spectrum(qrec, cn, pool50(float(Q["prec"][i]),
-                                            set(cn)), engine, i, qnm))
+                                            set(cn)), engine, i, qnm, a.variant))
             cw = pool(qnm, a.wide)
             if len(cw):
                 wide_lists.append(rank_spectrum(qrec, cw, pool50(float(Q["prec"][i]),
-                                                set(cw)), engine, i, qnm))
-        top = aggregate(narrow)
+                                                set(cw)), engine, i, qnm, a.variant))
+        agg = aggregate_rrf if int(a.mol_rrf or 0) else aggregate
+        top = agg(narrow)
         if len(top) < 25:
-            for k_ in aggregate(wide_lists):
+            for k_ in agg(wide_lists):
                 if k_ not in top:
                     top.append(k_)
                 if len(top) >= 25:
