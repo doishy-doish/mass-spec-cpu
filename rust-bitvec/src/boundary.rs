@@ -206,7 +206,11 @@ pub fn analog_window(
             near.push(((lib_precs[i] - prec_q).abs(), i));
         }
     }
-    near.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("boundary: non-finite dist"));
+    near.sort_by(|a, b| {
+        // E2-pool: Equal-fallback, never panic — mirrors Python's stable sort,
+        // where NaN comparisons are all-false (treated as equal, input order kept).
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    });
     near.into_iter()
         .take(cap)
         .map(|(_, i)| lib_pkeys[i].clone())
@@ -431,6 +435,26 @@ mod boundary_tests {
 
     fn set(v: &[&str]) -> HashSet<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn pool_parity_composition_excludes_caps() {
+        // mirrors run.py select_task: neutral window -> candidates (NaN key
+        // never matches); prec +-50 excluding candidates, nearest-first.
+        let masses = vec![100.0, 200.0, 200.0, 300.0, f64::NAN];
+        let keys = s(&["a", "b", "c", "d", "e"]);
+        let (lo, hi, ck) = ppm_window(&masses, &keys, 200.0, 100.0);
+        assert_eq!((lo, hi), (1, 3));
+        assert_eq!(ck, s(&["b", "c"]));
+        let cs: HashSet<String> = ck.into_iter().collect();
+        let got = analog_window(
+            &[150.0, 190.0, 205.0, 260.0, 400.0],
+            &s(&["a", "b", "c", "d", "e"]),
+            200.0,
+            &cs,
+            1500,
+        );
+        assert_eq!(got, s(&["c", "a"]));
     }
 
     #[test]
