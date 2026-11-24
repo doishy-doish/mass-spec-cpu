@@ -80,3 +80,15 @@ def test_phonebook_arm_same_queries_full_library():
     # default keeps the strip
     libkeys0 = set(str(T["key14"][i]) for i in lib0)
     assert not (set(held0) & libkeys0)
+
+
+def test_true_class2_metadata_keys():
+    from mscpu.validation import with_metadata_keys
+    lib_by_key = {"k1": [0, 1], "k2": [2]}
+    out = with_metadata_keys(lib_by_key, ["k2", "k9"])
+    assert out is lib_by_key  # in-place
+    assert out["k2"] == [2]  # spectra kept where present
+    assert out["k9"] == []  # held truth preloads metadata-only
+    assert out["k1"] == [0, 1]  # untouched keys identical
+    assert with_metadata_keys({}, None) == {}
+    assert with_metadata_keys({}, []) == {}
