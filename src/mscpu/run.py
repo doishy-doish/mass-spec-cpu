@@ -912,6 +912,9 @@ def main() -> None:
     # PHONEBOOK-ARM (-pb in suffix): lift key-exclusion for this run only —
     # same queries (RNG untouched), full library. Default keeps the strip.
     _pb = "-pb" in str(getattr(a, "out_suffix", "") or "")
+    # TRUE-CLASS2 (-t2 in suffix, class2 only): strip holds on rows, held
+    # keys preload metadata-only (M254; slim path refused fail-fast below).
+    _t2 = "-t2" in str(getattr(a, "out_suffix", "") or "")
     if a.mask == "class2":
         library, queries, _held = V.split_class2(T, pool, a.n, a.seed, phonebook=_pb)
     elif a.mask == "class3":
@@ -1005,6 +1008,14 @@ def main() -> None:
         # I6: first-occurrence instrument per key + per-query instrument (pool re-rank only).
         key2inst = {str(codes[inv[i]]): str(T["instrument"][int(i)]) for i in fidx}
 
+    # TRUE-CLASS2 (-t2): held keys preload as metadata-only candidates
+    # (specs=[], neutral+SMILES kept) — strip holds on rows, tin stays 0.
+    # M254: slim path fills spectra for any touched key (ensure_key), which
+    # would leak held spectra — refuse fail-fast, never run leaky.
+    if _t2 and a.mask == "class2":
+        if S is not None:
+            raise SystemExit("true-class2 (-t2) refused on slim path (M254: held-row filter owed) — parquet path only")
+        V.with_metadata_keys(lib_by_key, _held)
     # SNAKE-DRAFT: balance shards by ppm pool size (slowest shard = fleet wall)
     if a.shards > 1 and len(queries) > 1:
         qcosts = []
@@ -1533,6 +1544,7 @@ def main() -> None:
             "sword_level": int(_sword_level),
             "sword_only": bool(_sword_only),
             "phonebook": bool(_pb),
+            "true2": bool(_t2 and a.mask == "class2"),
             "sword_cand0": int(_sword_c[0]),
             "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
             "sword_stages": [int(v) for v in _sword_c],
