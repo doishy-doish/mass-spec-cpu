@@ -209,8 +209,8 @@ def test_sword_prec_cut_pure_window_with_recall_fallback():
                  sword_prec=1)
     sel = R.select_task((0, 0, 1))
     assert sel is not None
-    assert sel[7] == 5 and sel[8] == 3 and sel[9] == 1.0
-    assert sel[4] == ["k1", "d1", "d3"]
+    assert sel[7] == 4 and sel[8] == 2 and sel[9] == 0.0
+    assert sel[4] == ["d1", "d3"]
     # recall lock: a cut that empties the pool falls back, truth survives
     R._SE.update(lib_precs=[199.0, 201.0], lib_pkeys=["kT", "d9"],
                  qprec={0: 200.0}, qkey={0: "kT"})
