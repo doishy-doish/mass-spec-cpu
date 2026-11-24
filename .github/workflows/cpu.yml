@@ -312,7 +312,7 @@ jobs:
               need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
           if red:
               emit("RED", red)
-          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}" + (f" sword=on cand={out.get('sword_cand0')}/{out.get('sword_cand1')} fb={out.get('sword_fb_rate')}" if out.get("sword_on") else "")])
+          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}" + (f" sword=on cand={out.get('sword_cand0')}/{out.get('sword_cand1')} fb={out.get('sword_fb_rate')}" if out.get("sword_on") else "") + f" qhit_lib={out.get('qhit_lib')} qhit_z={out.get('qhit_z')}"])
           PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
