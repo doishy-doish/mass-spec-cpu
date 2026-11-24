@@ -116,7 +116,7 @@ jobs:
           (cd rust-bitvec && cargo build --release > /tmp/bcapture/binvec-build.log 2>&1); B1=$?
           tail -3 /tmp/bcapture/binvec-build.log
           (cd rust-bitvec && cargo test --release > /tmp/bcapture/binvec-test.log 2>&1); T1=$?
-          tail -3 /tmp/bcapture/binvec-test.log
+          tail -5 /tmp/bcapture/binvec-test.log
           (cd rust-chem && cargo build --release > /tmp/bcapture/chem-build.log 2>&1); B2=$?
           tail -3 /tmp/bcapture/chem-build.log
           (cd rust-chem && cargo test --release > /tmp/bcapture/chem-test.log 2>&1); T2=$?
@@ -124,10 +124,17 @@ jobs:
           if [ $B1 -ne 0 ] || [ $T1 -ne 0 ] || [ $B2 -ne 0 ] || [ $T2 -ne 0 ]; then
             echo "===== binvec-build errors ====="
             grep -B2 -A18 "^error" /tmp/bcapture/binvec-build.log | head -80
-            echo "===== binvec-test errors ====="
-            grep -B2 -A18 "^error" /tmp/bcapture/binvec-test.log | head -40
-            cp /tmp/bcapture/*.log results/
-            echo "BUILD FAILED B1=$B1 T1=$T1 B2=$B2 T2=$T2 (full logs committed to results/)"
+            echo "===== binvec-test failures ====="
+            grep -E "^(test |failures:|---- .* stdout|thread .* panicked|assertion.*failed|left.*right)" /tmp/bcapture/binvec-test.log | head -80
+            grep -B2 -A15 "^failures:" /tmp/bcapture/binvec-test.log | head -80
+            grep -B5 -A25 "panicked" /tmp/bcapture/binvec-test.log | head -120
+            echo "===== chem-build errors ====="
+            grep -B2 -A18 "^error" /tmp/bcapture/chem-build.log | head -40
+            echo "===== chem-test failures ====="
+            grep -E "^(test |failures:|---- .* stdout|thread .* panicked)" /tmp/bcapture/chem-test.log | head -40
+            mkdir -p results
+            cp /tmp/bcapture/*.log results/ || true
+            echo "BUILD FAILED B1=$B1 T1=$T1 B2=$B2 T2=$T2 (logs echoed above + copied to results/)"
             exit 1
           fi
           test -x "$GITHUB_WORKSPACE/rust-bitvec/target/release/binvec" || { echo "ENGINE BINARY MISSING"; ls -la "$GITHUB_WORKSPACE/rust-bitvec/target/release/" | head -20; exit 1; }
