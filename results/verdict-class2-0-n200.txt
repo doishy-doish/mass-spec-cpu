@@ -1,0 +1,4 @@
+INFRA
+no output file (looked for results/class2-0-n200.json)
+sidecar started=True precompute=False sigterm=False
+host died before JSON existed — retry with backoff, do NOT revert code
