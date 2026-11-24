@@ -581,6 +581,11 @@ struct EngineParams {
     /// 0 = off (bit-identical lists), 1 = on.
     #[serde(default = "def0")]
     lossgate: f64,
+    /// LGBM pairs: emit per-candidate per-channel scores in the reply
+    /// (channel -> per-cand floats in cand_keys order) for OOF ranker
+    /// training. Observation only — never touches scoring. 0 = off.
+    #[serde(default = "def0")]
+    dump_scores: f64,
     /// E1: engine-owned store. Slim dir path; when set, the engine loads it
     /// at startup and resolves library + query spectra from it on demand —
     /// no preload chunks, no per-query spectra JSON. Python sends keys +
@@ -817,6 +822,11 @@ struct EngineReply {
     /// None unless recall_topk > 0. Python scores truth retention offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefilter_topk: Option<Vec<String>>,
+    /// LGBM pairs: per-candidate channel scores, present only when
+    /// params.dump_scores > 0.5. Keys = channel, values = per-cand floats
+    /// in the query's cand_keys order. Zero extra math (cols clone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scores: Option<HashMap<String, Vec<f64>>>,
     /// per-query stage timings ms (measure-first: worker stderr is DEVNULLed
     /// by the launcher, so timings ride home in the reply and land in logs
     /// via the Python heartbeat line). 8 stages: parse,qprep,cands,pool,
@@ -2338,6 +2348,8 @@ fn sengine(params: EngineParams) {
             &neutrals,
         );
         let t_fuse = t0.elapsed();
+        // LGBM pairs: reuse the already-computed per-cand channel cols.
+        let dump_scores = if params.dump_scores > 0.5 { Some(cols.clone()) } else { None };
         writeln!(
             h,
             "{}",
@@ -2346,6 +2358,7 @@ fn sengine(params: EngineParams) {
                 pools: pool_idx.len(),
                 mass_swap,
                 prefilter_topk,
+                scores: dump_scores,
                 // 8 stages, all known before serialization (ser+io stay on the
                 // stderr line only). Order: parse,qprep,cands,pool,funnel,
                 // analog,chan,fuse.
@@ -2796,6 +2809,19 @@ mod engine_tests {
         assert_eq!(funnel_topk(&keys, 2), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(funnel_topk(&keys, 0), Vec::<String>::new());
         assert_eq!(funnel_topk(&keys, 99).len(), 3);
+    }
+
+    #[test]
+    fn reply_scores_present_only_when_dumped() {
+        // scores=None serializes without the key (normal runs pay nothing);
+        // Some round-trips channel -> per-cand floats for OOF training.
+        let mut ch: HashMap<String, Vec<f64>> = HashMap::new();
+        ch.insert("mass".to_string(), vec![0.9, 0.1]);
+        let r = EngineReply { ranked: HashMap::new(), pools: 0, mass_swap: false, prefilter_topk: None, timing: vec![], scores: Some(ch) };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"scores\":{\"mass\":[0.9,0.1]}"), "scores must round-trip, got {}", s);
+        let r2 = EngineReply { ranked: HashMap::new(), pools: 0, mass_swap: false, prefilter_topk: None, timing: vec![], scores: None };
+        assert!(!serde_json::to_string(&r2).unwrap().contains("scores"), "scores=None must be skipped");
     }
 
     #[test]
