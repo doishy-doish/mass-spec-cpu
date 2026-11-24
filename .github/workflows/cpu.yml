@@ -310,9 +310,14 @@ jobs:
           # n-aware (M205): at n<25 the lane means are noise-dominated (n=10 analog
           # 0.087 vs 0.17 banked) — hard checks above still gate, lane gates need n.
           if n >= 25:
-              if mask == "class2":
+              _pb = "-pb" in (os.environ.get("SUFFIX","") or "")
+              if mask == "class2" and not _pb:
                   need(out.get("truth_in_union", -1) == 0, f"class2 phonebook: truth_in_union={out.get('truth_in_union')} — held spectra in library (strip broken)")
                   need(out.get("mrr_lib",1) < 0.2, f"class2 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
+              elif mask == "class2" and _pb:
+                  need(out.get("phonebook", False) == True, "phonebook arm: out phonebook flag missing — arm never engaged")
+                  need(out.get("truth_in_union", -1) > 0, "phonebook arm: truth_in_union==0 — exclusion still active, arm measured nothing")
+                  need(out.get("mrr_lib", 0) > 0.5, f"phonebook arm: mrr_lib {out.get('mrr_lib')} <= 0.5 — restored lib not retrieving")
               elif mask == "class3":
                   # M218: exact-key MRR on full-holdout novelty is 0 by
                   # construction (furnace ended full-library scanning; the
