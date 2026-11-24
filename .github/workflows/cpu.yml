@@ -287,8 +287,8 @@ jobs:
           # 0.087 vs 0.17 banked) — hard checks above still gate, lane gates need n.
           if n >= 25:
               if mask == "class2":
-                  need(out.get("mrr_lib",0) > 0.5, f"class2 mrr_lib {out.get('mrr_lib')} <= 0.5 — easy-lane retrieval broken")
-                  need(out.get("mrr_analog",0) > 0.1, f"class2 mrr_analog {out.get('mrr_analog')} <= 0.1 — analog pool broken")
+                  need(out.get("truth_in_union", -1) == 0, f"class2 phonebook: truth_in_union={out.get('truth_in_union')} — held spectra in library (strip broken)")
+                  need(out.get("mrr_lib",1) < 0.2, f"class2 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
               elif mask == "class3":
                   # M218: exact-key MRR on full-holdout novelty is 0 by
                   # construction (furnace ended full-library scanning; the
