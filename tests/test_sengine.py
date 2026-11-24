@@ -205,6 +205,30 @@ def test_sword_cut_cands_window_with_recall_fallback():
     assert R.sword_cut_cands(["kx"], k2p, 200.0)[0] == ["kx"]
 
 
+def test_ce_band_thresholds_mirror_stub():
+    assert (R.ce_band(20), R.ce_band(25), R.ce_band(25.1), R.ce_band(40),
+            R.ce_band(50), R.ce_band(60)) == (0, 0, 1, 1, 1, 2)
+    assert R.ce_band(None) is None
+    assert R.ce_band(float("nan")) is None
+
+
+def test_sword_cut_ce_same_band_with_recall_fallback():
+    k2c = {"k1": 20.0, "k2": 40.0, "k3": 60.0}
+    kept, n0, n1, fb = R.sword_cut_ce(["k1", "k2", "k3"], k2c, 21.0)
+    assert (kept, n0, n1, fb) == (["k1"], 3, 1, 0.0)
+    assert R.sword_cut_ce(["k1", "k2"], k2c, None)[0] == ["k1", "k2"]
+    assert R.sword_cut_ce(["kx", "k2"], k2c, 21.0) == (["kx"], 2, 1, 0.0)
+    assert R.sword_cut_ce(["k2"], k2c, 21.0) == (["k2"], 1, 1, 1.0)
+
+
+def test_sword_cut_adduct_exact_with_recall_fallback():
+    k2a = {"k1": "[M+H]+", "k2": "[M+Na]+"}
+    assert R.sword_cut_adduct(["k1", "k2", "k3"], k2a, "[M+H]+") == (["k1", "k3"], 3, 2, 0.0)
+    assert R.sword_cut_adduct(["k1", "k2"], k2a, None)[0] == ["k1", "k2"]
+    assert R.sword_cut_adduct(["k1", "k2"], k2a, "None")[0] == ["k1", "k2"]
+    assert R.sword_cut_adduct(["k2"], k2a, "[M+H]+") == (["k2"], 1, 1, 1.0)
+
+
 def test_load_table_stub_parquet(tmp_path):
     """Loader stub: tiny real parquet in, table dict out (exercises pyarrow path)."""
     import pyarrow as pa

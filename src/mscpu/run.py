@@ -506,6 +506,64 @@ def sword_cut_cands(cand_keys, key2prec, qprec, ppm=8.5) -> tuple:
     return cand_keys, n0, n0, 1.0
 
 
+def ce_band(ce):
+    """CE band mirror of the JS stubs (pure_derived_stub.js / r2_stub.js):
+
+    <=25.0 -> 0, <=50.0 -> 1, else 2. None/NaN -> None (unknown, never cut).
+    Pure: arithmetic on a system-direct value, no tables, unit-testable.
+    """
+    try:
+        f = float(ce)
+    except (TypeError, ValueError):
+        return None
+    if f != f:
+        return None
+    if f <= 25.0:
+        return 0
+    if f <= 50.0:
+        return 1
+    return 2
+
+
+def sword_cut_ce(cand_keys, key2ce, qce) -> tuple:
+    """SWORD pure cut 2: same-CE-band candidate cut (recall-locked).
+
+    Returns (kept, n0, n1, fb). Unknown query CE -> no-op; unknown key CE
+    kept, never cut (same recall-safety rule as unknown-prec); empty-after
+    falls back to uncut. Pure: no _SE, no engine — unit-testable.
+    """
+    cand_keys = list(cand_keys)
+    n0 = len(cand_keys)
+    qb = ce_band(qce)
+    if qb is None:
+        return cand_keys, n0, n0, None
+    kept = [k for k in cand_keys
+            if (key2ce.get(str(k)) is None
+                or ce_band(key2ce[str(k)]) == qb)]
+    if kept:
+        return kept, n0, len(kept), 0.0
+    return cand_keys, n0, n0, 1.0
+
+
+def sword_cut_adduct(cand_keys, key2adduct, qadduct) -> tuple:
+    """SWORD pure cut 3: exact-adduct string match (recall-locked).
+
+    Returns (kept, n0, n1, fb). Missing query adduct (None/""/"None" from
+    the str() coercion) -> no-op; unknown key adduct kept, never cut;
+    empty-after falls back to uncut. Zero mass math. Unit-testable.
+    """
+    cand_keys = list(cand_keys)
+    n0 = len(cand_keys)
+    if qadduct is None or qadduct == "" or qadduct == "None":
+        return cand_keys, n0, n0, None
+    kept = [k for k in cand_keys
+            if (key2adduct.get(str(k)) is None
+                or key2adduct[str(k)] == qadduct)]
+    if kept:
+        return kept, n0, len(kept), 0.0
+    return cand_keys, n0, n0, 1.0
+
+
 def select_task(task):
     """One query's key selection (engine-free; runs in forked workers).
 
@@ -667,8 +725,8 @@ def main() -> None:
                     help="1 = disable Jaccard prefilter (I6 A/B: donor-retention question)")
     ap.add_argument("--loss-gate", type=int, default=0,
                     help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
-    ap.add_argument("--sword-prec", type=int, default=0,
-                    help="1 = SWORD-1b pure prec-ppm candidate cut at 8.5ppm (recall-locked fallback)")
+    ap.add_argument("--sword-prec", type=int, default=0, choices=[0, 1, 2, 3],
+                    help="SWORD pure-cut level, cumulative and sequential: 0=off, 1=+prec-ppm, 2=+CE-band, 3=+adduct-exact. Each stage recall-locked (empty->uncut, unknown->kept)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -880,7 +938,33 @@ def main() -> None:
     for _kk, _pp in zip(_k14s, _kprs):
         if _kk not in key2prec and _pp == _pp:
             key2prec[_kk] = _pp
-    del _k14s, _kprs
+    # SWORD pure cuts 2-3: first-occurrence adduct + CE per key (same
+    # first-occurrence convention as key2prec/key2inst). Missing adducts
+    # (""/"None" from the str() coercion) and None/NaN CEs are skipped so
+    # unknown keys are never cut. CE source: slim store when present (the
+    # as_table T carries ce=None), else the parquet T["ce"] list.
+    _ad_src = T["adduct"]
+    _ad_list = [str(x) for x in (list(_ad_src) if isinstance(_ad_src, list)
+                                 else list(_ad_src.tolist()))]
+    key2adduct = {}
+    for _kk, _ad in zip(_k14s, _ad_list):
+        if _kk not in key2adduct and _ad not in ("", "None"):
+            key2adduct[_kk] = _ad
+    if S is not None:
+        _ce_list = [float(v) for v in S["ce"].tolist()]
+    else:
+        _ce_list = list(T["ce"])
+    key2ce = {}
+    for _kk, _cv in zip(_k14s, _ce_list):
+        try:
+            _cf = float(_cv)
+        except (TypeError, ValueError):
+            continue
+        if _cf != _cf:
+            continue
+        if _kk not in key2ce:
+            key2ce[_kk] = _cf
+    del _k14s, _kprs, _ad_list, _ce_list
     fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw,
@@ -935,30 +1019,63 @@ def main() -> None:
         selected = [select_task(t) for t in tasks]
     # SWORD-1b: pure prec-ppm candidate cut (parent-side: needs key2prec).
     # Analog pool untouched (SWORD-1 pool cut killed analog 0.17->0.08).
-    _sword_c0 = _sword_c1 = 0
+    # SWORD pure chain: cumulative levels, sequential, mass first. Level 1 =
+    # prec-ppm (s2-benched single cut), 2 = +CE-band, 3 = +adduct-exact.
+    # Per-query fb = 1.0 if any applied stage fell back, else 0.0; stage
+    # counts accumulate in _sword_c[0..3] (pre + post each stage).
+    _sword_level = int(a.sword_prec or 0)
+    _sword_c = [0, 0, 0, 0]
     _sword_fb = 0.0
     _sword_fn = 0
-    if a.sword_prec:
+    if _sword_level:
         _cut_sel = []
         _qp = _SE.get("qprec") or {}
+        _qc = _SE.get("qce") or {}
+        _T_ad = T["adduct"]
+        _T_ad_list = (list(_T_ad) if isinstance(_T_ad, list)
+                       else list(_T_ad.tolist()))
         for _s in selected:
             if _s is None or len(_s) <= 3:
                 _cut_sel.append(_s)
                 continue
-            _qq = _qp.get(_s[1])
-            if _qq is None:
-                _cut_sel.append(_s)
-                continue
-            _kc, _n0, _n1, _fb = sword_cut_cands(_s[3], key2prec, float(_qq))
-            _sword_c0 += _n0
-            _sword_c1 += _n1
+            _kc = list(_s[3])
+            _stages = [len(_kc)]
+            _fb = 0.0
+            if _sword_level >= 1:
+                _qq = _qp.get(_s[1])
+                if _qq is not None:
+                    _kc, _, _n1, _f1 = sword_cut_cands(_kc, key2prec, float(_qq))
+                    if _f1:
+                        _fb = 1.0
+                _stages.append(len(_kc))
+            if _sword_level >= 2:
+                _qce = _qc.get(_s[1])
+                if _qce is not None:
+                    _kc, _, _n2, _f2 = sword_cut_ce(_kc, key2ce, _qce)
+                    if _f2:
+                        _fb = 1.0
+                _stages.append(len(_kc))
+            if _sword_level >= 3:
+                try:
+                    _qad = str(_T_ad_list[int(_s[1])])
+                except (IndexError, TypeError, ValueError):
+                    _qad = "None"
+                if _qad not in ("", "None"):
+                    _kc, _, _n3, _f3 = sword_cut_adduct(_kc, key2adduct, _qad)
+                    if _f3:
+                        _fb = 1.0
+                _stages.append(len(_kc))
+            while len(_stages) < 4:
+                _stages.append(_stages[-1])
+            for _i, _v in enumerate(_stages):
+                _sword_c[_i] += int(_v)
             _sword_fn += 1
-            if _fb is not None:
-                _sword_fb += _fb
+            _sword_fb += _fb
             _sl = list(_s)
             _sl[3] = _kc
             _cut_sel.append(tuple(_sl))
         selected = _cut_sel
+        del _T_ad_list
     union = union_selected_keys(selected)
     sub = subset_lib(lib_by_key, union)
     # M217: silent-skip coverage heartbeat. The engine SKIPS keys absent from
@@ -1081,9 +1198,11 @@ def main() -> None:
            "qpeak": a.qpeak, "qloss": a.qloss,
            "mass_swap_rate": _avg(swaps),
            "truth_in_union": _tin, "keys_in_lib": _hit,
-           "sword_on": bool(a.sword_prec),
-           "sword_cand0": _sword_c0,
-           "sword_cand1": _sword_c1,
+           "sword_on": bool(_sword_level),
+           "sword_level": int(_sword_level),
+           "sword_cand0": int(_sword_c[0]),
+           "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
+           "sword_stages": [int(v) for v in _sword_c],
            "sword_fb_rate": (_sword_fb / _sword_fn) if _sword_fn else None,
            "keys_total": _ncand + _npool, "n_truths": len(_truths),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
