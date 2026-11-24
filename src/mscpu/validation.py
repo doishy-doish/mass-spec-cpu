@@ -51,8 +51,12 @@ def split_class2(T: dict, pool_idx, n_queries: int = 400, seed: int = 0,
         if k in held and k not in seen:
             seen.add(k)
             qrows.append(int(i))
-    qset = set(qrows)
-    library = [i for i in range(len(allk)) if i not in qset]
+    # PHONEBOOK-STRIP (user order 2026-11-24): held keys leave the library
+    # entirely — every spectrum of a test molecule, not just the query rows.
+    # held/qrows use the identical RNG stream as before, so the query set is
+    # unchanged; only library composition changes (tin -> 0, exact MRRs -> 0).
+    heldset = set(held)
+    library = [i for i in range(len(allk)) if str(allk[i]) not in heldset]
     return library, qrows, sorted(held)
 
 
@@ -80,6 +84,10 @@ def split_cross_instrument(T: dict, pool_idx, n_struct: int = 400, seed: int = 0
     held = set(rng.choice(keys, size=min(n_struct, len(keys)),
                           replace=False).tolist())
     qrows = [int(i) for i in pool_idx if str(allk[int(i)]) in held]
-    qset = set(qrows)
-    library = [i for i in range(len(allk)) if i not in qset]
+    # PHONEBOOK-STRIP (user order 2026-11-24): held keys leave the library
+    # entirely — every spectrum of a test molecule, not just the query rows.
+    # held/qrows use the identical RNG stream as before, so the query set is
+    # unchanged; only library composition changes (tin -> 0, exact MRRs -> 0).
+    heldset = set(held)
+    library = [i for i in range(len(allk)) if str(allk[i]) not in heldset]
     return library, qrows, sorted(held)
