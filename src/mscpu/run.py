@@ -776,6 +776,8 @@ def main() -> None:
                          "from slim itself (params.store); zero preload chunks, "
                          "zero per-query spectra JSON. Off = protocol v2.")
     a = ap.parse_args()
+    if "poolcheck" in (a.out_suffix or ""):
+        a.pool_check = 1  # input-cap: workflow_dispatch allows max 25 inputs; bench flag rides the suffix
     signal.signal(signal.SIGTERM, _sigterm_loud)
     import atexit as _atexit
     _atexit.register(_cleanup_engine)
