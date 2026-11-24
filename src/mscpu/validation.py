@@ -67,6 +67,24 @@ def split_class2(T: dict, pool_idx, n_queries: int = 400, seed: int = 0,
     return library, qrows, sorted(held)
 
 
+def with_metadata_keys(lib_by_key: dict, held) -> dict:
+    """True-class2 preload: held keys stay candidates with NO spectra.
+
+    Library ROWS are untouched (strip holds — tin stays 0); this only adds
+    held keys mapped to [] so preload chunks emit them as metadata-only
+    (specs=[], neutral+SMILES kept). The engine already scores empty-spec
+    keys gracefully (lib-family 0.0, mass/cleav/fp/gate off neutral+SMILES)
+    and ranks cands — so computed channels can rank the true structure with
+    no spectra: the actual unseen exact-MRR measurement. M254: slim path
+    cannot use this (ensure_key fills spectra from the store for any touched
+    key) — run.py refuses -t2 when S is not None, fail fast never leak.
+    Pure in-place, returns the same dict.
+    """
+    for k in held or []:
+        lib_by_key.setdefault(str(k), [])
+    return lib_by_key
+
+
 def split_class3(T: dict, pool_idx, n_struct: int = 400, seed: int = 0,
                  phonebook: bool = False):
     """Every spectrum of held structures leaves the library."""
