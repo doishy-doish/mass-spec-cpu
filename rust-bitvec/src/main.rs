@@ -603,7 +603,6 @@ impl EngineParams {
             recall_topk: 0.0,
             funnel_off: 0.0,
             lossgate: 0.0,
-            store: None,
         }
     }
 }
