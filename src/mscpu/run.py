@@ -501,6 +501,21 @@ def sword_stage_applies(raw_level, stage) -> bool:
     return _raw >= int(stage)
 
 
+def pool_parity(exp_cand, exp_pool, got) -> tuple:
+    """E2-pool parity: engine lists vs Python select_task lists.
+
+    got = parsed pool_check reply (None or dict). Returns (ok, why):
+    null = no store / no engine answer; cand/pool = first divergence.
+    """
+    if not isinstance(got, dict):
+        return (False, "null")
+    if exp_cand != list(got.get("cand_keys") or []):
+        return (False, "cand")
+    if exp_pool != list(got.get("pool_keys") or []):
+        return (False, "pool")
+    return (True, "")
+
+
 def sword_cut_cands(cand_keys, key2prec, qprec, ppm=8.5) -> tuple:
     """SWORD-1b: pure prec-ppm window over candidate keys (given value 8.5ppm).
 
@@ -742,6 +757,8 @@ def main() -> None:
                     help="1 = disable Jaccard prefilter (I6 A/B: donor-retention question)")
     ap.add_argument("--loss-gate", type=int, default=0,
                     help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
+    ap.add_argument("--pool-check", type=int, default=0,
+                    help="1 = E2-pool parity: engine rebuilds neutral window + analog pool per query, Python compares key-for-key (expects 1.0000; needs slim store, else nulls)")
     ap.add_argument("--sword-prec", type=int, default=0, choices=[0, 1, 2, 3, 11, 12, 13],
                     help="SWORD pure-cut level, cumulative and sequential: 0=off, 1=+prec-ppm, 2=+CE-band, 3=+adduct-exact. Isolation arms (non-cumulative): 11=prec-only, 12=CE-only, 13=adduct-only. Each stage recall-locked (empty->uncut, unknown->kept)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
@@ -824,11 +841,11 @@ def main() -> None:
             pass
     pool = V.query_pool(T).tolist()
     if a.mask == "class2":
-        library, queries, _ = V.split_class2(T, pool, a.n, a.seed)
+        library, queries, _held = V.split_class2(T, pool, a.n, a.seed)
     elif a.mask == "class3":
-        library, queries, _ = V.split_class3(T, pool, a.n, a.seed)
+        library, queries, _held = V.split_class3(T, pool, a.n, a.seed)
     else:
-        library, queries, _ = V.split_cross_instrument(T, pool, a.n, a.seed)
+        library, queries, _held = V.split_cross_instrument(T, pool, a.n, a.seed)
     # one structs round trip: neutrals for the pool + qnm per query.
     # Slim path: neutrals ship IN the store (builder ran structs once), so
     # the per-run call is qnm-only (empty ktable, tiny payload). Same qnm
@@ -1046,6 +1063,8 @@ def main() -> None:
     # sword_cand1 = post-that-stage count and fb/stages stay comparable.
     _sword_level = _sword_only or _sword_raw
     _sword_c = [0, 0, 0, 0]
+    # E2-pool parity: pre-sword snapshot (engine mirror has no cuts).
+    _sel_pre = list(selected) if a.pool_check else []
     _sword_fb = 0.0
     _sword_fn = 0
     if _sword_level:
@@ -1172,6 +1191,36 @@ def main() -> None:
         pass
     results = []
     _hb_every = max(1, len(selected) // 10)
+    # E2-pool parity: engine rebuilds each pre-sword selection; exact match
+    # expected (1.0000). Needs slim store (erun path); else nulls, logged.
+    _pc_hit = _pc_n = _pc_null = 0
+    _pc_mis = []
+    if a.pool_check and _sel_pre:
+        _pc_qrows = [int(qi) for qi in queries]
+        _pc_held = [str(k) for k in _held]
+        for _s in _sel_pre:
+            if _s is None or len(_s) <= 3:
+                continue
+            _pm = {"pool_check": {"qnm": _SE["qnm"].get(int(_s[1])),
+                                  "prec_q": float(_s[5]),
+                                  "ppm": float(a.ppm or 8.5),
+                                  "mask": str(a.mask),
+                                  "qrows": _pc_qrows, "held": _pc_held}}
+            try:
+                _pr = engine.query(_pm).get("pool_check")
+            except Exception:
+                _pr = None
+            _ok, _why = pool_parity(list(_s[3]), list(_s[4]), _pr)
+            _pc_n += 1
+            if _pr is None:
+                _pc_null += 1
+            elif _ok:
+                _pc_hit += 1
+            else:
+                _pc_mis.append((int(_s[1]), _why))
+        print("pool-parity hit=" + str(_pc_hit) + "/" + str(_pc_n)
+              + " null=" + str(_pc_null) + " mis=" + str(_pc_mis[:8]),
+              flush=True)
     for sel in selected:
         if sel is None:
             continue
@@ -1226,6 +1275,8 @@ def main() -> None:
            "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
            "sword_stages": [int(v) for v in _sword_c],
            "sword_fb_rate": (_sword_fb / _sword_fn) if _sword_fn else None,
+           "pool_parity_rate": (_pc_hit / _pc_n if _pc_n else None),
+           "pool_parity_n": int(_pc_n), "pool_parity_nulls": int(_pc_null),
            "keys_total": _ncand + _npool, "n_truths": len(_truths),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
