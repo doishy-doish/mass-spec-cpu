@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/runner/work/mass-spec-cpu/mass-spec-cpu/src/mscpu/run.py", line 1595, in <module>
+    main()
+  File "/home/runner/work/mass-spec-cpu/mass-spec-cpu/src/mscpu/run.py", line 1043, in main
+    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items()]
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/mass-spec-cpu/mass-spec-cpu/src/mscpu/run.py", line 1043, in <listcomp>
+    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items()]
+                                    ~~^^^
+IndexError: list index out of range

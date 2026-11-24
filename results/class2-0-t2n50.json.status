@@ -1,0 +1,3 @@
+STARTED mask=class2 shard=0
+ENGINE-UP ok=True size=1752096 path=rust-bitvec/target/release/binvec
+LOAD-DONE rows=2539608

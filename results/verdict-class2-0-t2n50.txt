@@ -1,0 +1,10 @@
+INFRA
+no output file (looked for results/class2-0-t2n50.json)
+sidecar started=True precompute=False sigterm=False
+crash hook fired before JSON existed
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/mass-spec-cpu/mass-spec-cpu/src/mscpu/run.py", line 1043, in <listcomp>
+    _prec_pairs = [(float(T["prec"][js[0]]), k) for k, js in lib_by_key.items()]
+                                    ~~^^^
+IndexError: list index out of range
+retry with backoff, do NOT revert code
