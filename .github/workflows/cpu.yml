@@ -210,13 +210,36 @@ jobs:
                       status_txt = sf.read()
           except Exception:
               status_txt = None
+          # PROBE-V2: crash-aware classification. A committed crash file turns a
+          # generic INFRA into a mechanism; a missing engine binary is RED
+          # (build/config, actionable) — never host death.
+          crash_path = f"results/crash{SUFFIX}.txt"
+          crash_txt = None
+          try:
+              if os.path.exists(crash_path):
+                  with open(crash_path) as cf:
+                      crash_txt = cf.read()
+          except Exception:
+              crash_txt = None
+          crash_tail = (crash_txt or "").strip().splitlines()[-5:] if crash_txt else []
+          binmiss = bool(status_txt and ("BINARY-MISSING" in status_txt or "ENGINE-UP ok=False" in status_txt))
+          qprog = [l for l in (status_txt or "").splitlines() if l.startswith("QUERY")]
+          lastq = qprog[-1] if qprog else None
           if fp is None:
               started = bool(status_txt and "STARTED" in status_txt)
               pre = bool(status_txt and "PRECOMPUTE-DONE" in status_txt)
               sigterm = bool(status_txt and "SIGTERM" in status_txt)
-              emit("INFRA", [f"no output file (looked for {path})",
-                             f"sidecar started={started} precompute={pre} sigterm={sigterm}",
-                             "host died before JSON existed — retry with backoff, do NOT revert code"])
+              base = [f"no output file (looked for {path})",
+                      f"sidecar started={started} precompute={pre} sigterm={sigterm}"
+                      + (f" last={lastq}" if lastq else "")]
+              if binmiss or (crash_txt and "FileNotFoundError" in crash_txt and "binvec" in crash_txt):
+                  emit("RED", base + ["engine binary absent — build produced nothing (check cargo cache key + build log)",
+                                      "NOT host death — do NOT retry blindly, fix the build"] + crash_tail)
+              if crash_txt:
+                  emit("INFRA" if not pre else "RED",
+                       base + ["crash hook fired before JSON existed"] + crash_tail
+                       + (["retry with backoff, do NOT revert code"] if not pre else []))
+              emit("INFRA", base + ["host died before JSON existed — retry with backoff, do NOT revert code"])
           print(f"SMART-PROBE checking {fp} (+ {status_path})");
           red = []
           def need(cond, msg):
