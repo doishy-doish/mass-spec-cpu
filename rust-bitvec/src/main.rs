@@ -697,7 +697,9 @@ fn fp_forward(m: &FpModel, x: &[f32]) -> [u64; FP_NWORDS] {
         for j in 0..m.hid {
             s += h[j] * m.w2[j * 2048 + k];
         }
-        if 1.0 / (1.0 + (-s).exp()) >= 0.5 {
+        // strict >0.5 matches train_fp.py (P = predict > 0.5): zero-evidence
+        // (sigmoid(0)=0.5) predicts 0, not 1.
+        if 1.0 / (1.0 + (-s).exp()) > 0.5 {
             out[k / 64] |= 1u64 << (k % 64);
         }
     }
