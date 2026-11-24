@@ -99,3 +99,14 @@ def test_rank_replace_list_mirrors_engine():
     assert IP.rank_replace_list(["b", "a"], ppm) == ["b", "a"]  # leader best
     assert IP.rank_replace_list(["a"], {}) == ["a"]  # no ppms
     assert IP.rank_replace_list([], ppm) == []
+
+
+def test_entropy_helpers_mirror_rust():
+    assert IP.score_entropy([]) == 0.0
+    assert IP.score_entropy([3.0]) == 0.0
+    import math as _m
+    assert abs(IP.score_entropy([1.0, 1.0]) - _m.log(2)) < 1e-12
+    assert abs(IP.entropy_exp([3.0]) - 0.25) < 1e-12
+    assert IP.entropy_exp([]) == 1.0
+    assert abs(IP.entropy_grade(1.0, 1.0) - 1.0) < 1e-12
+    assert IP.entropy_grade(0.0, 0.5) == 0.0
