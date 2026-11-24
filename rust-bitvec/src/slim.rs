@@ -423,45 +423,45 @@ mod slim_tests {
         let int_all = vec![1.0f64, 0.5, 1.0];
         let neutrals = vec![90.0f64, f64::NAN];
         let mut files: HashMap<String, String> = HashMap::new();
-        let mut w = |name: &str, b: Vec<u8>| {
+        fn wfile(dir: &Path, files: &mut HashMap<String, String>, flip_byte: bool, name: &str, b: Vec<u8>) {
             let mut bb = b;
             if flip_byte && name == "prec.f64.zst" {
                 bb[10] ^= 1;
             }
             files.insert(name.to_string(), sha_hex(&bb));
             fs::write(dir.join(name), bb).unwrap();
-        };
-        let mut ri32 = |n: &str, x: &[i32]| {
+        }
+        fn ri32(dir: &Path, files: &mut HashMap<String, String>, flip_byte: bool, n: &str, x: &[i32]) {
             let mut b = Vec::new();
             for v in x {
                 b.extend_from_slice(&v.to_le_bytes());
             }
-            w(n, zenc(&b));
-        };
-        let mut rf64 = |n: &str, x: &[f64]| {
+            wfile(dir, files, flip_byte, n, zenc(&b));
+        }
+        fn rf64(dir: &Path, files: &mut HashMap<String, String>, flip_byte: bool, n: &str, x: &[f64]) {
             let mut b = Vec::new();
             for v in x {
                 b.extend_from_slice(&v.to_le_bytes());
             }
-            w(n, zenc(&b));
-        };
-        ri32("key_idx.int32.zst", &key_idx);
-        rf64("prec.f64.zst", &prec);
-        w("adduct.u8.zst", zenc(&ad));
-        w("inst.u8.zst", zenc(&inst));
+            wfile(dir, files, flip_byte, n, zenc(&b));
+        }
+        ri32(dir, &mut files, flip_byte, "key_idx.int32.zst", &key_idx);
+        rf64(dir, &mut files, flip_byte, "prec.f64.zst", &prec);
+        wfile(dir, &mut files, flip_byte, "adduct.u8.zst", zenc(&ad));
+        wfile(dir, &mut files, flip_byte, "inst.u8.zst", zenc(&inst));
         {
             let mut b = Vec::new();
             for v in &mz_off {
                 b.extend_from_slice(&v.to_le_bytes());
             }
-            w("mz_off.int64.zst", zenc(&b));
+            wfile(dir, &mut files, flip_byte, "mz_off.int64.zst", zenc(&b));
         }
-        w("mz_data.zst", enc_deltas_f64(&mz_all));
-        rf64("int_data.zst", &int_all);
-        rf64("ce.f64.zst", &ce);
-        ri32("key_inst.int32.zst", &[1, 0]);
-        ri32("key_first.int32.zst", &[0, 1]);
-        rf64("neutrals.f64.zst", &neutrals);
+        wfile(dir, &mut files, flip_byte, "mz_data.zst", enc_deltas_f64(&mz_all));
+        rf64(dir, &mut files, flip_byte, "int_data.zst", &int_all);
+        rf64(dir, &mut files, flip_byte, "ce.f64.zst", &ce);
+        ri32(dir, &mut files, flip_byte, "key_inst.int32.zst", &[1, 0]);
+        ri32(dir, &mut files, flip_byte, "key_first.int32.zst", &[0, 1]);
+        rf64(dir, &mut files, flip_byte, "neutrals.f64.zst", &neutrals);
         for (name, obj) in [
             ("keys.json", serde_json::to_string(&keys).unwrap()),
             (
@@ -471,7 +471,7 @@ mod slim_tests {
             ("adducts.json", "[\"[M+H]+\",\"[M+Na]+\"]".to_string()),
             ("instruments.json", "[\"Orbitrap\",\"timsTOF\"]".to_string()),
         ] {
-            w(name, obj.into_bytes());
+            wfile(dir, &mut files, flip_byte, name, obj.into_bytes());
         }
         // NOTE: sha recorded AFTER the flip, so tamper test flips again below.
         let manifest = serde_json::json!({
