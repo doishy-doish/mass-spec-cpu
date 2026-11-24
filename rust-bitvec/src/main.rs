@@ -788,8 +788,8 @@ struct PoolArrays {
 fn build_pool_arrays(
     st: &slim::SlimStore,
     pos: &std::collections::HashMap<String, usize>,
-    mask: &str,
-    qrows: &[usize],
+    _mask: &str,
+    _qrows: &[usize],
     held: &[String],
 ) -> PoolArrays {
     // neutral view: all keys.
@@ -817,9 +817,10 @@ fn build_pool_arrays(
     // stable: equal/NaN keep byte-sorted key order = numpy stable semantics.
     let masses: Vec<f64> = neut.iter().map(|(n, _)| *n).collect();
     let skeys: Vec<String> = neut.into_iter().map(|(_, k)| k).collect();
-    // prec view: library keys only. class2/cross exclude query ROWS;
-    // class3 excludes held KEYS (mirrors validation.split_* exactly).
-    let row_excl: std::collections::HashSet<usize> = qrows.iter().copied().collect();
+    // prec view: library keys only. ALL masks exclude held KEYS
+    // (PHONEBOOK-STRIP 2026-11-24: every spectrum of a test molecule leaves
+    // the library — mirrors validation.split_* exactly; query rows' keys are
+    // in held, so row exclusion is subsumed. qrows stay in the cache key).
     let key_excl: std::collections::HashSet<&str> =
         held.iter().map(|x| x.as_str()).collect();
     let mut first: std::collections::HashMap<usize, (f64, String)> =
@@ -830,11 +831,7 @@ fn build_pool_arrays(
             Some(k) => k,
             None => continue,
         };
-        let excluded = if mask == "class2" || mask == "cross" {
-            row_excl.contains(&r)
-        } else {
-            key_excl.contains(k.as_str())
-        };
+        let excluded = key_excl.contains(k.as_str());
         if excluded {
             continue;
         }
