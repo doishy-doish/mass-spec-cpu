@@ -32,21 +32,28 @@ def load_groups(train_path):
     import pyarrow.parquet as pq
 
     cols = ["inchikey14", "normalized_smiles", "ms2_mzs", "ms2_normalized_intensities", "precursor_mz"]
-    t = pq.read_table(train_path, columns=cols).to_pylist()
+    # Streamed batches (M197 lesson): whole-table to_pylist() doubles peak RSS
+    # (batch dicts + groups dict) and got the runner killed 2x at ~35s into
+    # load. Same groups out, bounded peak. Heartbeat per batch (no silent age).
+    pf = pq.ParquetFile(train_path, memory_map=True)
     groups = {}
-    for r in t:
-        k = r["inchikey14"]
-        if not k:
-            continue
-        g = groups.get(k)
-        if g is None:
-            g = groups[k] = {"smiles": r["normalized_smiles"], "specs": [], "precs": []}
-        mz = r["ms2_mzs"] or []
-        it = r["ms2_normalized_intensities"] or []
-        if len(mz) and len(mz) == len(it):
-            g["specs"].append((np.asarray(mz, dtype=np.float64), np.asarray(it, dtype=np.float64)))
-        if r["precursor_mz"]:
-            g["precs"].append(float(r["precursor_mz"]))
+    seen = 0
+    for batch in pf.iter_batches(batch_size=250_000, columns=cols):
+        for r in batch.to_pylist():
+            k = r["inchikey14"]
+            if not k:
+                continue
+            g = groups.get(k)
+            if g is None:
+                g = groups[k] = {"smiles": r["normalized_smiles"], "specs": [], "precs": []}
+            mz = r["ms2_mzs"] or []
+            it = r["ms2_normalized_intensities"] or []
+            if len(mz) and len(mz) == len(it):
+                g["specs"].append((np.asarray(mz, dtype=np.float64), np.asarray(it, dtype=np.float64)))
+            if r["precursor_mz"]:
+                g["precs"].append(float(r["precursor_mz"]))
+        seen += batch.num_rows
+        print("load groups rows=%d keys=%d" % (seen, len(groups)), flush=True)
     return groups
 
 
