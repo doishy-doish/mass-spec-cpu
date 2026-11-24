@@ -111,6 +111,7 @@ jobs:
       - run: mkdir -p data results
       - name: build rust engine
         run: |
+          set +e
           mkdir -p /tmp/bcapture
           (cd rust-bitvec && cargo build --release > /tmp/bcapture/binvec-build.log 2>&1); B1=$?
           tail -3 /tmp/bcapture/binvec-build.log
