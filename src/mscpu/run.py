@@ -911,7 +911,7 @@ def main() -> None:
     pool = V.query_pool(T).tolist()
     # PHONEBOOK-ARM (-pb in suffix): lift key-exclusion for this run only —
     # same queries (RNG untouched), full library. Default keeps the strip.
-    _pb = "-pb" in str(getattr(a, "suffix", "") or "")
+    _pb = "-pb" in str(getattr(a, "out_suffix", "") or "")
     if a.mask == "class2":
         library, queries, _held = V.split_class2(T, pool, a.n, a.seed, phonebook=_pb)
     elif a.mask == "class3":
