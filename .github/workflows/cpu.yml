@@ -106,13 +106,14 @@ jobs:
             ~/.cargo/git
             rust-bitvec/target
             rust-chem/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-bitvec/Cargo.toml', 'rust-chem/Cargo.toml', 'rust-bitvec/src/**', 'rust-chem/src/**') }}
+          key: cargo-v2-${{ runner.os }}-${{ hashFiles('rust-bitvec/Cargo.toml', 'rust-chem/Cargo.toml', 'rust-bitvec/src/**', 'rust-chem/src/**') }}
       - run: pip install -r requirements.txt
       - run: mkdir -p data results
       - name: build rust engine
         run: |
           cd rust-bitvec && cargo build --release && cargo test --release
           cd ../rust-chem && cargo build --release && cargo test --release
+          test -x "$GITHUB_WORKSPACE/rust-bitvec/target/release/binvec" || { echo "ENGINE BINARY MISSING"; ls -la "$GITHUB_WORKSPACE/rust-bitvec/target/release/" | head -20; exit 1; }
       - name: restore data cache
         if: ${{ inputs.task != 'gates' }}
         id: datacache
