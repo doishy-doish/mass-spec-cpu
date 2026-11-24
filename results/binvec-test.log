@@ -29,94 +29,93 @@ warning: value assigned to `k` is never read
 
 warning: `chem` (lib) generated 3 warnings
    Compiling binvec v0.1.0 (/home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-bitvec)
-error[E0499]: cannot borrow `w` as mutable more than once at a time
-   --> src/slim.rs:441:24
-    |
-434 |         let mut ri32 = |n: &str, x: &[i32]| {
-    |                        -------------------- first mutable borrow occurs here
-...
-439 |             w(n, zenc(&b));
-    |             - first borrow occurs due to use of `w` in closure
-440 |         };
-441 |         let mut rf64 = |n: &str, x: &[f64]| {
-    |                        ^^^^^^^^^^^^^^^^^^^^ second mutable borrow occurs here
-...
-446 |             w(n, zenc(&b));
-    |             - second borrow occurs due to use of `w` in closure
-447 |         };
-448 |         ri32("key_idx.int32.zst", &key_idx);
-    |         ---- first borrow later used here
-
-error[E0499]: cannot borrow `w` as mutable more than once at a time
-   --> src/slim.rs:450:9
-    |
-434 |         let mut ri32 = |n: &str, x: &[i32]| {
-    |                        -------------------- first mutable borrow occurs here
-...
-439 |             w(n, zenc(&b));
-    |             - first borrow occurs due to use of `w` in closure
-...
-450 |         w("adduct.u8.zst", zenc(&ad));
-    |         ^ second mutable borrow occurs here
-...
-462 |         ri32("key_inst.int32.zst", &[1, 0]);
-    |         ---- first borrow later used here
-
-error[E0499]: cannot borrow `w` as mutable more than once at a time
-   --> src/slim.rs:451:9
-    |
-434 |         let mut ri32 = |n: &str, x: &[i32]| {
-    |                        -------------------- first mutable borrow occurs here
-...
-439 |             w(n, zenc(&b));
-    |             - first borrow occurs due to use of `w` in closure
-...
-451 |         w("inst.u8.zst", zenc(&inst));
-    |         ^ second mutable borrow occurs here
-...
-462 |         ri32("key_inst.int32.zst", &[1, 0]);
-    |         ---- first borrow later used here
-
-error[E0499]: cannot borrow `w` as mutable more than once at a time
-   --> src/slim.rs:457:13
-    |
-434 |         let mut ri32 = |n: &str, x: &[i32]| {
-    |                        -------------------- first mutable borrow occurs here
-...
-439 |             w(n, zenc(&b));
-    |             - first borrow occurs due to use of `w` in closure
-...
-457 |             w("mz_off.int64.zst", zenc(&b));
-    |             ^ second mutable borrow occurs here
-...
-462 |         ri32("key_inst.int32.zst", &[1, 0]);
-    |         ---- first borrow later used here
-
-error[E0499]: cannot borrow `w` as mutable more than once at a time
-   --> src/slim.rs:459:9
-    |
-434 |         let mut ri32 = |n: &str, x: &[i32]| {
-    |                        -------------------- first mutable borrow occurs here
-...
-439 |             w(n, zenc(&b));
-    |             - first borrow occurs due to use of `w` in closure
-...
-459 |         w("mz_data.zst", enc_deltas_f64(&mz_all));
-    |         ^ second mutable borrow occurs here
-...
-462 |         ri32("key_inst.int32.zst", &[1, 0]);
-    |         ---- first borrow later used here
-
 warning: variable does not need to be mutable
-    --> src/main.rs:1262:9
+    --> src/main.rs:1381:9
      |
-1262 |     let mut lines = stdin.lock().lines();
+1381 |     let mut lines = stdin.lock().lines();
      |         ----^^^^^
      |         |
      |         help: remove this `mut`
      |
      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
-For more information about this error, try `rustc --explain E0499`.
-warning: `binvec` (bin "binvec" test) generated 1 warning
-error: could not compile `binvec` (bin "binvec" test) due to 5 previous errors; 1 warning emitted
+warning: function `funnel_topk_slices_in_order` is never used
+    --> src/main.rs:2432:8
+     |
+2432 |     fn funnel_topk_slices_in_order() {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `analog_empty_pool_is_zero` is never used
+    --> src/main.rs:2439:8
+     |
+2439 |     fn analog_empty_pool_is_zero() {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `binvec` (bin "binvec" test) generated 3 warnings (run `cargo fix --bin "binvec" -p binvec --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 2.95s
+     Running unittests src/main.rs (target/release/build/binvec/ec8c7627ef0217f5/out/binvec-ec8c7627ef0217f5)
+
+running 43 tests
+test boundary::boundary_tests::codes_inv_sorted_inverse ... ok
+test boundary::boundary_tests::analog_window_excludes_caps_stable ... ok
+test boundary::boundary_tests::aggregate_tie_keeps_first_seen ... ok
+test boundary::boundary_tests::first_smiles_follows_sorted_codes ... ok
+test boundary::boundary_tests::group_positions_sorted_unique ... ok
+test boundary::boundary_tests::holdouts_match_python_semantics ... ok
+test boundary::boundary_tests::lib_index_stable_groups ... ok
+test boundary::boundary_tests::neutral_sort_stable_ties ... ok
+test boundary::boundary_tests::pool_mask_ci_and_window ... ok
+test boundary::boundary_tests::ppm_window_lo_inclusive_hi_exclusive ... ok
+test boundary::boundary_tests::searchsorted_edges ... ok
+test boundary::boundary_tests::snake_partition_balances ... ok
+test boundary::boundary_tests::pool_parity_composition_excludes_caps ... FAILED
+test boundary::boundary_tests::snake_ties_keep_query_order ... ok
+test boundary::boundary_tests::structs_payload_schema ... ok
+test boundary::boundary_tests::submission_rules_and_csv ... ok
+test boundary::boundary_tests::uniq_first_order ... ok
+test boundary::boundary_tests::window_count_edges ... ok
+test engine_tests::adduct_table_matches_python ... ok
+test engine_tests::ce_band_edges ... ok
+test engine_tests::channels_match_python_reference ... ok
+test engine_tests::clean_cases ... ok
+test engine_tests::entropy_single_peak_quarter_and_self_is_one ... ok
+test engine_tests::gate_vacuous_passes_and_subset_logic ... ok
+test engine_tests::lazy_prep_matches_eager_and_caches ... ok
+test engine_tests::lossgate_partition_stable_pass_first ... ok
+test engine_tests::mass_grading_v8_numbers ... ok
+test engine_tests::median_std_rank_match_pandas ... ok
+test engine_tests::pure_fusion_sums_channels ... ok
+test engine_tests::quantize_matches_python ... ok
+test engine_tests::mass_replace_moves_bad_leader ... ok
+test engine_tests::molecule_rrf_single_equals_rank_and_fuses ... ok
+test engine_tests::stein_mass_weighted_self_and_far ... ok
+test engine_tests::z_rrf_match_pandas ... ok
+test engine_tests::weighted_genome_moves_rankings ... ok
+test slim::slim_tests::delta_codec_single_and_empty ... ok
+test slim::slim_tests::delta_codec_descending_wraps ... ok
+test slim::slim_tests::delta_codec_bit_exact_tricky ... ok
+test slim::slim_tests::delta_len_mismatch_fails_loud ... ok
+test slim::slim_tests::raw_round_trip_preserves_bytes ... ok
+test slim::slim_tests::loader_rejects_bad_codec ... ok
+test slim::slim_tests::loader_round_trip_and_accessors ... ok
+test slim::slim_tests::loader_detects_tamper ... ok
+
+failures:
+
+---- boundary::boundary_tests::pool_parity_composition_excludes_caps stdout ----
+
+thread 'boundary::boundary_tests::pool_parity_composition_excludes_caps' (3066) panicked at src/boundary.rs:457:9:
+assertion `left == right` failed
+  left: ["a"]
+ right: ["c", "a"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    boundary::boundary_tests::pool_parity_composition_excludes_caps
+
+test result: FAILED. 42 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `--bin binvec`

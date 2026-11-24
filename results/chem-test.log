@@ -30,13 +30,13 @@ warning: value assigned to `k` is never read
 warning: `chem` (lib) generated 3 warnings
    Compiling chem v0.1.0 (/home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem)
 warning: `chem` (lib test) generated 3 warnings (3 duplicates)
-    Finished `release` profile [optimized] target(s) in 0.66s
+    Finished `release` profile [optimized] target(s) in 0.40s
      Running unittests src/lib.rs (target/release/build/chem/f004fa49c475d024/out/chem-f004fa49c475d024)
 
 running 4 tests
 test tests::empty_is_zero ... ok
-test tests::self_tanimoto_is_one ... ok
 test tests::key14_stable_and_sized ... ok
+test tests::self_tanimoto_is_one ... ok
 test tests::similar_outscores_distant ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -45,5 +45,5 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 0 tests
 
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 

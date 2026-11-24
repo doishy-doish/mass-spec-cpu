@@ -29,4 +29,4 @@ warning: value assigned to `k` is never read
     |                             ^^^^^^ this value is reassigned later and never used
 
 warning: `chem` (lib) generated 3 warnings
-    Finished `release` profile [optimized] target(s) in 0.57s
+    Finished `release` profile [optimized] target(s) in 0.43s
