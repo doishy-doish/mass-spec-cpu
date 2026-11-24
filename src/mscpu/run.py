@@ -909,12 +909,15 @@ def main() -> None:
         except Exception:
             pass
     pool = V.query_pool(T).tolist()
+    # PHONEBOOK-ARM (-pb in suffix): lift key-exclusion for this run only —
+    # same queries (RNG untouched), full library. Default keeps the strip.
+    _pb = "-pb" in str(getattr(a, "suffix", "") or "")
     if a.mask == "class2":
-        library, queries, _held = V.split_class2(T, pool, a.n, a.seed)
+        library, queries, _held = V.split_class2(T, pool, a.n, a.seed, phonebook=_pb)
     elif a.mask == "class3":
-        library, queries, _held = V.split_class3(T, pool, a.n, a.seed)
+        library, queries, _held = V.split_class3(T, pool, a.n, a.seed, phonebook=_pb)
     else:
-        library, queries, _held = V.split_cross_instrument(T, pool, a.n, a.seed)
+        library, queries, _held = V.split_cross_instrument(T, pool, a.n, a.seed, phonebook=_pb)
     # one structs round trip: neutrals for the pool + qnm per query.
     # Slim path: neutrals ship IN the store (builder ran structs once), so
     # the per-run call is qnm-only (empty ktable, tiny payload). Same qnm
@@ -1443,6 +1446,9 @@ def main() -> None:
     _tq_top1 = _tq_best = 0.0
     _tq_hit08 = _tq_n = 0
     _tq_cache: dict = {}
+    # Per-query rows for outlier hunts (which queries get lucky, and why).
+    _tq_top1_rows: list = []
+    _tq_best_rows: list = []
 
     def _tq_bits(_s):
         _b = _tq_cache.get(_s)
@@ -1454,6 +1460,21 @@ def main() -> None:
             _tq_cache[_s] = _b
         return _b
 
+    # SHUFFLED BASELINE (M13 for the lens): random-over-rankable-pool, same
+    # queries, seeded default_rng (deterministic). Adjudication is
+    # real-vs-shuffled, never real-vs-rhetoric. Universe = pool keys with
+    # known SMILES (what the engine could rank); held non-truth pool keys
+    # have no SMILES parent-side and are excluded — documented, not hidden.
+    _sel_by_qi: dict = {}
+    try:
+        for _s in selected:
+            if _s is not None and len(_s) > 4:
+                _sel_by_qi[int(_s[1])] = (list(_s[3]) + list(_s[4]))
+    except Exception:
+        _sel_by_qi = {}
+    _shuf_rng = np.random.default_rng(20261124)
+    _tq_s_top1 = _tq_s_best = 0.0
+    _tq_s_n = 0
     for _qi2, _row2, _plen2, _ranked2, _line2, _swap2 in results:
         try:
             _t = str((_SE.get("qkey") or {}).get(int(_qi2), ""))
@@ -1468,9 +1489,21 @@ def main() -> None:
             _tq_top1 += _trow[0]
             _bb = max(_trow)
             _tq_best += _bb
+            _tq_top1_rows.append(round(float(_trow[0]), 4))
+            _tq_best_rows.append(round(float(_bb), 4))
             if _bb >= 0.8:
                 _tq_hit08 += 1
             _tq_n += 1
+            _pk = [str(_k) for _k in (_sel_by_qi.get(int(_qi2), []) or [])]
+            _pk = [_k for _k in _pk if _smi_sub.get(_k, "")]
+            if _pk:
+                for _ss in range(10):
+                    _samp = list(_shuf_rng.choice(_pk, size=min(25, len(_pk)), replace=False))
+                    _srow = [Q.tanimoto(_tq_bits(_smi_sub.get(_k, "")), _tb) for _k in _samp]
+                    if _srow:
+                        _tq_s_top1 += _srow[0]
+                        _tq_s_best += max(_srow)
+                        _tq_s_n += 1
         except Exception:
             continue
     out = {"mask": a.mask, "engine": "rust", "shard": a.shard, "shards": a.shards, "n": len(rrs["z"]), "mrr": _avg(rrs["z"]),
@@ -1499,6 +1532,7 @@ def main() -> None:
             "sword_on": bool(_sword_level),
             "sword_level": int(_sword_level),
             "sword_only": bool(_sword_only),
+            "phonebook": bool(_pb),
             "sword_cand0": int(_sword_c[0]),
             "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
             "sword_stages": [int(v) for v in _sword_c],
@@ -1519,7 +1553,14 @@ def main() -> None:
             "tanimoto_top1": (_tq_top1 / _tq_n) if _tq_n else 0.0,
             "tanimoto_best": (_tq_best / _tq_n) if _tq_n else 0.0,
             "tanimoto_hit08": (_tq_hit08 / _tq_n) if _tq_n else 0.0,
-            "tanimoto_n": int(_tq_n)}
+            "tanimoto_n": int(_tq_n),
+            "tanimoto_top1_row": _tq_top1_rows,
+            "tanimoto_best_row": _tq_best_rows,
+            "tanimoto_top1_med": float(np.median(_tq_top1_rows)) if _tq_top1_rows else 0.0,
+            "tanimoto_best_med": float(np.median(_tq_best_rows)) if _tq_best_rows else 0.0,
+            "tanimoto_shuf_top1": (_tq_s_top1 / _tq_s_n) if _tq_s_n else 0.0,
+            "tanimoto_shuf_best": (_tq_s_best / _tq_s_n) if _tq_s_n else 0.0,
+            "tanimoto_shuf_n": int(_tq_s_n)}
     with open(out_path, "w") as f:
         json.dump(out, f)
     try:
