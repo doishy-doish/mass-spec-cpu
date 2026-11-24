@@ -11,10 +11,10 @@ on:
         description: "queries"
         default: "200"
       task:
-        description: "validate, predict, slimbuild (one-time store), or gates (checks-only: build+test, no data, no run)"
+        description: "validate, predict, slimbuild (one-time store), train-fp (Phase 1 MLP train), or gates (checks-only: build+test, no data, no run)"
         default: "validate"
         type: choice
-        options: [validate, predict, slimbuild, gates]
+        options: [validate, predict, slimbuild, train-fp, gates]
       shard:
         description: "shard index"
         default: "0"
@@ -177,6 +177,19 @@ jobs:
         with:
           path: data/slim
           key: slim-store-v1
+      - name: train fp MLP (Phase 1, CPU)
+        if: ${{ inputs.task == 'train-fp' }}
+        timeout-minutes: 75
+        run: PYTHONPATH=src python scripts/train_fp.py --train data/train.parquet --engine rust-bitvec/target/release/binvec --out data/fp_mlp.bin --metrics results/train-fp.json
+      - name: commit fp weights (acceptance only)
+        if: ${{ inputs.task == 'train-fp' }}
+        run: |
+          git config user.name "mscpu"
+          git config user.email "mscpu@users.noreply.github.com"
+          git add data/fp_mlp.bin
+          git diff --cached --quiet || git commit -m "cpu train-fp weights $(date -u +%F)"
+          git pull --rebase origin main
+          git push
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         timeout-minutes: 60  # backend auto-cancels hung masks; no manual deadman kills
