@@ -32,7 +32,7 @@
 //!     -> {"ranked": {variant: [keys<=25]}, "pools": n}
 //! Progress heartbeats go to stderr (the launcher forwards them).
 
-use chem::{morgan_bits_2048, parse_smiles, tanimoto as chem_tanimoto};
+use chem::{morgan_bits_2048, parse_smiles};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
@@ -42,24 +42,14 @@ mod boundary;
 #[allow(dead_code)]
 mod slim;
 
-// spectrum binary channel (unchanged math, validated bit-exact vs Python)
-const QNBITS: u64 = 4096;
-const KNUTH: u64 = 2654435761;
-const SALT_K: u64 = 0x9E3779B9;
+// (phonebook bit-channels deleted 2026-11-24: binned spectral Jaccard was library recall)
 
-// channel + fusion constants (moved from run.py; single definition)
-const TOL: f64 = 0.02;
-const MS_THRESH: f64 = 0.3;
-const TOP_N_ANALOG: usize = 10;
-const FUNNEL_MIN: usize = 400;
-const FUNNEL_K: usize = 300;
-const POOL_CAP: usize = 1500;
+// (phonebook channel constants deleted 2026-11-24 with their channels)
 const RRF_BASE: f64 = 60.0;
 const MASS_CENTER: f64 = -1.5;
 const MASS_FREE: f64 = 3.0;
 const MASS_FULL: f64 = 8.0;
 const MASS_LEAD_OFF: f64 = 5.0;
-const MASS_LIB_TAU: f64 = 0.9;
 const ROUTER_LIB: f64 = 0.5;
 const ROUTER_BIN: f64 = 0.4;
 const ROUTER_BINW: f64 = 0.4;
@@ -75,90 +65,11 @@ const VARIANTS: [&str; 18] = [
     "zw", "rrfw", "pure", "libce", "ent", "gate",
 ];
 
-fn mix(x: u64, salt: u64) -> u64 {
-    x.wrapping_add(salt.wrapping_mul(SALT_K))
-        .wrapping_mul(KNUTH)
-        & 0xFFFF_FFFF
-}
+// (mix/jaccard deleted 2026-11-24 with the bit-channels)
 
-fn jaccard(a: &[u64; 64], b: &[u64; 64]) -> f64 {
-    let (mut inter, mut union) = (0u32, 0u32);
-    for k in 0..64 {
-        inter += (a[k] & b[k]).count_ones();
-        union += (a[k] | b[k]).count_ones();
-    }
-    if inter == 0 {
-        0.0
-    } else {
-        inter as f64 / (union as f64).max(1.0)
-    }
-}
+// (build_w/wjaccard deleted 2026-11-24 with the bit-channels)
 
-fn build_w(p: &[u64], pw: &[f32], l: &[u64], lw: &[f32]) -> Vec<(u16, f32)> {
-    // sort+max-combine — identical output to the old HashMap fold,
-    // 2.15x faster in the JS mirror (n<=128, HashMap overhead dominates).
-    let mut v: Vec<(u16, f32)> = Vec::with_capacity(p.len() + l.len());
-    for (i, &b) in p.iter().enumerate() {
-        let w = pw.get(i).copied().unwrap_or(0.0);
-        if w > 0.0 {
-            v.push(((mix(b, 0) % QNBITS) as u16, w));
-        }
-    }
-    for (i, &b) in l.iter().enumerate() {
-        let w = lw.get(i).copied().unwrap_or(0.0);
-        if w > 0.0 {
-            v.push(((mix(b, 1) % QNBITS) as u16, w));
-        }
-    }
-    v.sort_by_key(|e| e.0);
-    let mut out: Vec<(u16, f32)> = Vec::with_capacity(v.len());
-    for (b, w) in v {
-        if let Some(last) = out.last_mut() {
-            if last.0 == b {
-                if w > last.1 {
-                    last.1 = w;
-                }
-                continue;
-            }
-        }
-        out.push((b, w));
-    }
-    out
-}
-
-fn wjaccard(a: &[(u16, f32)], b: &[(u16, f32)]) -> f64 {
-    let (mut i, mut j) = (0usize, 0usize);
-    let (mut inter, mut union) = (0.0f64, 0.0f64);
-    while i < a.len() && j < b.len() {
-        let (ka, va) = (a[i].0, a[i].1 as f64);
-        let (kb, vb) = (b[j].0, b[j].1 as f64);
-        if ka == kb {
-            inter += va.min(vb);
-            union += va.max(vb);
-            i += 1;
-            j += 1;
-        } else if ka < kb {
-            union += va;
-            i += 1;
-        } else {
-            union += vb;
-            j += 1;
-        }
-    }
-    while i < a.len() {
-        union += a[i].1 as f64;
-        i += 1;
-    }
-    while j < b.len() {
-        union += b[j].1 as f64;
-        j += 1;
-    }
-    if inter <= 0.0 || union <= 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
-}
+// (wjaccard body deleted 2026-11-24 with the bit-channels)
 
 fn adduct_shift(a: &str) -> Option<f64> {
     match a {
@@ -211,115 +122,22 @@ fn clean(mzs: &[f64], ints: &[f64], prec: f64) -> (Vec<f64>, Vec<f64>) {
     )
 }
 
-fn qbin(mz: f64, q: f64) -> u64 {
-    ((mz / q).round() as i64 as u64) & 0xFFFF_FFFF
-}
-
-/// Cleaned spectrum + every derived layer.
+/// Cleaned spectrum: mz + sqrt weights + precursor. Per-spectrum library
+/// fingerprints (bits/wb/mass-weights/losses) deleted 2026-11-24 with the
+/// phonebook channels; query losses recompute from mz on use (S2).
 #[derive(Clone)]
 struct CSpectra {
     mz: Vec<f64>,
     w: Vec<f64>,
     prec: f64,
-    norm: f64,
-    sw: Vec<f64>,
-    snorm: f64,
-    bits: [u64; 64],
-    wb: Vec<(u16, f32)>,
-    /// Neutral-loss set, precomputed once per spectrum (the frag channel used
-    /// to rebuild it per candidate spec per query — same inputs, same output).
-    floss: Vec<f64>,
-    /// Collision-energy band source (None = unknown/merged ramp).
-    ce: Option<f64>,
 }
 
-fn prepare(mzs: &[f64], ints: &[f64], prec: f64, qpeak: f64, qloss: f64, ce: Option<f64>) -> CSpectra {
+fn prepare(mzs: &[f64], ints: &[f64], prec: f64) -> CSpectra {
     let (mz, w) = clean(mzs, ints, prec);
-    let norm = w.iter().map(|x| x * x).sum();
-    // Stein-Scott-lite mass weights (mass-linear, mz/1000 scale): same peaks, high-mass
-    // peaks count more. snorm precomputed once per spectrum (fixed per run).
-    let sw: Vec<f64> = mz.iter().zip(w.iter()).map(|(m, x)| m / 1000.0 * x).collect();
-    let snorm: f64 = sw.iter().map(|x| x * x).sum();
-    let pb: Vec<u64> = mz.iter().map(|m| qbin(*m, qpeak)).collect();
-    let pw: Vec<f32> = w.iter().map(|x| *x as f32).collect();
-    let (lb, lw) = if prec != 0.0 {
-        (
-            mz.iter().map(|m| qbin(prec - m, qloss)).collect(),
-            pw.clone(),
-        )
-    } else {
-        (vec![], vec![])
-    };
-    let mut bits = [0u64; 64];
-    for &b in &pb {
-        let i = (mix(b, 0) % QNBITS) as usize;
-        bits[i / 64] |= 1u64 << (i % 64);
-    }
-    for &b in &lb {
-        let i = (mix(b, 1) % QNBITS) as usize;
-        bits[i / 64] |= 1u64 << (i % 64);
-    }
-    let wb = build_w(&pb, &pw, &lb, &lw);
-    let floss = loss_set(&mz, prec);
-    CSpectra { mz, w, prec, norm, sw, snorm, bits, wb, floss, ce }
+    CSpectra { mz, w, prec }
 }
 
-fn match_dot(amz: &[f64], ai: &[f64], bmz: &[f64], bi: &[f64], delta: f64, tol: f64) -> f64 {
-    let (mut i, mut j) = (0usize, 0usize);
-    let mut dot = 0.0f64;
-    while i < amz.len() && j < bmz.len() {
-        let d = amz[i] - bmz[j] - delta;
-        if d < -tol {
-            i += 1;
-        } else if d > tol {
-            j += 1;
-        } else {
-            dot += ai[i] * bi[j];
-            i += 1;
-            j += 1;
-        }
-    }
-    dot
-}
-
-fn cosine_row(q: &CSpectra, s: &CSpectra, tol: f64) -> f64 {
-    if q.mz.is_empty() || s.mz.is_empty() {
-        return 0.0;
-    }
-    let den = (q.norm * s.norm).sqrt();
-    if !(den > 0.0) {
-        return 0.0;
-    }
-    match_dot(&q.mz, &q.w, &s.mz, &s.w, 0.0, tol) / den
-}
-
-fn modified_row(q: &CSpectra, s: &CSpectra, tol: f64) -> f64 {
-    if q.mz.is_empty() || s.mz.is_empty() {
-        return 0.0;
-    }
-    let den = (q.norm * s.norm).sqrt();
-    if !(den > 0.0) {
-        return 0.0;
-    }
-    match_dot(&q.mz, &q.w, &s.mz, &s.w, 0.0, tol)
-        .max(match_dot(&q.mz, &q.w, &s.mz, &s.w, q.prec - s.prec, tol))
-        / den
-}
-
-/// Stein-Scott-lite: mass-weighted cosine. Same two-pointer matches as cosine,
-/// weights folded with mz/1000 so high-mass peaks dominate. Self = 1.0, far = 0.0.
-/// Pure-algo replication (akmalkhaniub Stein-Scott + neutral-loss hybrid): no chemistry,
-/// no learning, one more two-pointer per candidate — standalone channel, NOT fused yet.
-fn stein_row(q: &CSpectra, s: &CSpectra, tol: f64) -> f64 {
-    if q.mz.is_empty() || s.mz.is_empty() {
-        return 0.0;
-    }
-    let den = (q.snorm * s.snorm).sqrt();
-    if !(den > 0.0) {
-        return 0.0;
-    }
-    match_dot(&q.mz, &q.sw, &s.mz, &s.sw, 0.0, tol) / den
-}
+// (match_dot/cosine_row/modified_row/stein_row deleted 2026-11-24: library spectral recall)
 
 /// v8-mass-lite (romanrozen Version-22 numbers): graded neutral-mass error.
 /// ppm = (cand_neutral - qnm)/qnm * 1e6. 1.0 inside |ppm-CENTER|<=FREE,
@@ -346,6 +164,7 @@ fn r2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+#[allow(dead_code)]
 fn loss_set(mz: &[f64], prec: f64) -> Vec<f64> {
     let mut v: Vec<f64> = mz.iter().take(32).map(|m| r2(prec - m)).collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -353,6 +172,7 @@ fn loss_set(mz: &[f64], prec: f64) -> Vec<f64> {
     v
 }
 
+#[allow(dead_code)]
 fn overlap_count(a: &[f64], b: &[f64]) -> usize {
     let (mut i, mut j, mut n) = (0usize, 0usize, 0usize);
     while i < a.len() && j < b.len() {
@@ -541,6 +361,7 @@ fn def_rbin() -> f64 {
 /// canary fits the values on class2 n=50 (never class3). Missing keys in the
 /// params JSON (old launchers) also default neutral — backward compatible.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct EngineParams {
     qpeak: f64,
     qloss: f64,
@@ -709,6 +530,7 @@ struct Ready {
     ready: bool,
 }
 
+#[allow(dead_code)]
 struct CandData {
     key: String,
     specs: Vec<CSpectra>,
@@ -729,17 +551,16 @@ struct TableEntry {
     formula: Option<BTreeMap<String, u32>>,
 }
 
-/// M209: prepare-on-first-use. prepare() is a pure function of (raw spectra,
-/// qpeak, qloss) and morgan_bits_2048 a pure function of smiles, so cached
-/// values equal the old eager-preload values bit-for-bit — only the WHEN
-/// changes. Raw is dropped after preparing to bound engine memory:
-/// raw(untouched keys) + prepared(touched keys).
-fn ensure_prepared(e: &mut TableEntry, qpeak: f64, qloss: f64) {
+/// M209: prepare-on-first-use. prepare() is a pure function of the raw spectra
+/// (and morgan_bits_2048 of the smiles), so cached values equal the old eager-preload
+/// values bit-for-bit — only the WHEN changes. Raw is dropped after preparing
+/// to bound engine memory: raw(untouched keys) + prepared(touched keys).
+fn ensure_prepared(e: &mut TableEntry, _qpeak: f64, _qloss: f64) {
     if e.specs.is_none() {
         let specs: Vec<CSpectra> = e
             .raw
             .iter()
-            .map(|s| prepare(&s.mzs, &s.ints, s.prec, qpeak, qloss, s.ce))
+            .map(|s| prepare(&s.mzs, &s.ints, s.prec))
             .collect();
         e.specs = Some(specs);
         e.raw = Vec::new();
@@ -907,15 +728,7 @@ fn ensure_key(
 /// R2: collision-energy band. Query and library CE are single eV values
 /// (merged ramps arrive as None from the launcher); bands split the three
 /// acquisition energies the test set uses (20 / 40 / 60 eV).
-fn ce_band(ce: f64) -> u8 {
-    if ce <= 25.0 {
-        0
-    } else if ce <= 50.0 {
-        1
-    } else {
-        2
-    }
-}
+// (ce_band deleted 2026-11-24 with libce: same-band library recall)
 
 /// R2: diagnostic neutral losses (exact monoisotopic masses, verified by
 /// arithmetic 2026-11-23): water, ammonia, CO, CO2, formic acid, hexose,
@@ -1060,6 +873,7 @@ fn partition_by_gate(list: &mut Vec<String>, gate_of: &HashMap<String, f64>) {
 
 /// R2: dynamic spectral-entropy weight exponent (Li & Fiehn shape): sparse
 /// spectra (S < 3 nats) boost minor peaks, busy spectra stay linear.
+#[allow(dead_code)]
 fn entropy_exp(rel: &[f64]) -> f64 {
     let sum: f64 = rel.iter().sum();
     if !(sum > 0.0) {
@@ -1079,107 +893,42 @@ fn entropy_exp(rel: &[f64]) -> f64 {
     }
 }
 
-/// R2: entropy-weighted cosine. Relative intensities recovered as w^2
-/// (clean stores sqrt), raised to the dynamic exponent, cosine-normalized.
-/// Self-match is exactly 1.0 (same accumulation order both sides).
-fn ent_row(qmz: &[f64], qw: &[f64], smz: &[f64], sw: &[f64], tol: f64) -> f64 {
-    if qmz.is_empty() || smz.is_empty() {
-        return 0.0;
-    }
-    let qe = entropy_exp(&qw.iter().map(|x| x * x).collect::<Vec<f64>>());
-    let se = entropy_exp(&sw.iter().map(|x| x * x).collect::<Vec<f64>>());
-    let qew: Vec<f64> = qw.iter().map(|x| (x * x).powf(qe)).collect();
-    let sew: Vec<f64> = sw.iter().map(|x| (x * x).powf(se)).collect();
-    let qn: f64 = qew.iter().map(|x| x * x).sum();
-    let sn: f64 = sew.iter().map(|x| x * x).sum();
-    let den = (qn * sn).sqrt();
-    if !(den > 0.0) {
-        return 0.0;
-    }
-    match_dot(qmz, &qew, smz, &sew, 0.0, tol) / den
+// (ent_row deleted 2026-11-24: entropy-weighted cosine vs library spectra)
+
+/// z-score with pandas semantics: sample std (ddof=1), +1e-9 guard.
+/// Shared by fuse_rank and the molecule-batch per-spectrum columns so S=1
+/// equals the single-query rank exactly.
+fn zscore(xs: &[f64]) -> Vec<f64> {
+    let mean = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
+    let s = sample_std(xs, mean) + 1e-9;
+    xs.iter().map(|&x| (x - mean) / s).collect()
 }
 
 fn fuse_rank(
     keys: &[String],
     cols: &HashMap<String, Vec<f64>>,
-    fw: &EngineParams,
+    _fw: &EngineParams,
 ) -> HashMap<String, Vec<String>> {
+    // Post-phonebook (2026-11-24): only computed columns survive (mass =
+    // neutral grading, gate = loss/subformula gate). Deleted spectral-recall
+    // channels emit empty lists (RR 0, honest) — never a NaN-tie lottery.
     let n = keys.len();
-    // borrow channels in place (was: one Vec clone per channel here, plus
-    // another per rrf/rrfb/rrfw call below). Missing channel == all-NaN,
-    // exactly like the old fallback.
     let nan = vec![f64::NAN; n];
     let col = |c: &str| -> &[f64] { cols.get(c).map(Vec::as_slice).unwrap_or(&nan) };
-    let lib = col("lib");
-    let analog = col("analog");
-    let frag = col("frag");
-    let bin = col("bin");
-    let binw = col("binw");
-    let stein = col("stein"); // standalone (Loop-2 replication): ranked, NOT fused yet
-    let mass = col("mass"); // standalone (Loop-3 v8-mass-lite): ranked, NOT fused yet
-    let libce = col("libce"); // standalone (R2 CE band): ranked, NOT fused yet
-    let ent = col("ent"); // standalone (R2 entropy-weighted cosine): ranked, NOT fused yet
-    let gate = col("gate"); // standalone (R2 diagnostic-loss gate): ranked, NOT fused yet
-    let z_of = |xs: &[f64]| -> Vec<f64> {
-        let mean = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
-        let s = sample_std(xs, mean) + 1e-9;
-        xs.iter().map(|&x| (x - mean) / s).collect()
-    };
-    let libz = z_of(lib);
-    let analogz = z_of(analog);
-    let fragz = z_of(frag);
-    let steinz = z_of(stein);
-    let massz = z_of(mass);
-    // pure (pure-algo canary v0): equal-weight z of stein + frag + mass.
-    // All three already exist as standalone channels; this only fuses them.
-    // Predicted class2 N=10: lands between frag and stein (~0.7-0.8); measures
-    // whether the combo beats stein alone. N=10 is smoke + direction, fit nothing.
-    let pure: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut s = 0.0;
-            if !steinz[i].is_nan() {
-                s += steinz[i];
-            }
-            if !fragz[i].is_nan() {
-                s += fragz[i];
-            }
-            if !massz[i].is_nan() {
-                s += massz[i];
-            }
-            s
-        })
-        .collect();
+    let mass = col("mass");
+    let gate = col("gate");
+    let massz = zscore(mass);
+    let gatez = zscore(gate);
+    // z = computed fusion: z-scored mass + z-scored gate. pure keeps the
+    // canary name on computed evidence only.
     let z: Vec<f64> = (0..n)
         .map(|i| {
-            [libz[i], analogz[i], fragz[i]]
+            [massz[i], gatez[i]]
                 .iter()
                 .filter(|&&x| !x.is_nan())
                 .sum()
         })
         .collect();
-    // zw: weighted z (genome wl/wa/wf; neutral 1.0 == z bit-identically)
-    let zw: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut s = 0.0;
-            if !libz[i].is_nan() {
-                s += fw.wl * libz[i];
-            }
-            if !analogz[i].is_nan() {
-                s += fw.wa * analogz[i];
-            }
-            if !fragz[i].is_nan() {
-                s += fw.wf * fragz[i];
-            }
-            s
-        })
-        .collect();
-    // ranks computed ONCE per channel and shared by rrf/rrfb/rrfw (the old
-    // code re-ranked lib/analog/frag three times each — same inputs, so the
-    // shared ranks are bit-identical, at ~1/3 the rank cost).
-    let rlib = rank_min_desc(lib);
-    let rana = rank_min_desc(analog);
-    let rfrag = rank_min_desc(frag);
-    let rbin = rank_min_desc(bin);
     let rrf_of = |ranks: &[&[f64]], ws: &[f64]| -> Vec<f64> {
         (0..n)
             .map(|i| {
@@ -1198,47 +947,24 @@ fn fuse_rank(
             })
             .collect()
     };
-    let rrf = rrf_of(&[&rlib, &rana, &rfrag], &[1.0, 1.0, 1.0]);
-    let rrfb = rrf_of(&[&rlib, &rana, &rfrag, &rbin], &[1.0, 1.0, 1.0, 1.0]);
-    // rrfw: weighted RRF (genome rl/ra/rf; neutral 1.0 == rrf bit-identically)
-    let rrfw = rrf_of(&[&rlib, &rana, &rfrag], &[fw.rl, fw.ra, fw.rf]);
-    let max_skipnan = |xs: &[f64]| -> f64 {
-        xs.iter()
-            .filter(|&&x| !x.is_nan())
-            .cloned()
-            .fold(f64::NAN, f64::max)
-    };
-    let cascade: Vec<f64> = if max_skipnan(&libz) > fw.casc_z {
-        libz.clone()
-    } else {
-        analogz.clone()
-    };
-    let overlap = max_skipnan(&lib) > fw.rout_lib
-        || max_skipnan(&bin) > fw.rout_bin
-        || max_skipnan(&binw) > fw.rout_binw;
-    let router = if overlap { cascade.clone() } else { analog.to_vec() };
+    // ranks computed ONCE and shared (the old code re-ranked lib/analog/frag
+    // three times each — same inputs, same outputs, at ~1/3 the rank cost).
+    let rrank = rank_min_desc(mass);
+    let grank = rank_min_desc(gate);
+    let rrf = rrf_of(&[&rrank, &grank], &[1.0, 1.0]);
     let mut out = HashMap::new();
-    // borrows, not clones: every output here is read-only from here on
-    // (was: a Vec clone per channel, including a redundant mass.clone()).
+    // computed lists, ranked desc.
     let named: Vec<(&str, &[f64])> = vec![
-        ("lib", lib),
-        ("analog", analog),
-        ("frag", frag),
-        ("bin", bin),
-        ("binw", binw),
-        ("stein", stein),
         ("mass", mass),
-        ("z", &z),
-        ("rrf", &rrf),
-        ("rrfb", &rrfb),
-        ("cascade", &cascade),
-        ("router", &router),
-        ("zw", &zw),
-        ("rrfw", &rrfw),
-        ("pure", &pure),
-        ("libce", libce),
-        ("ent", ent),
         ("gate", gate),
+        ("z", &z),
+        ("pure", &z),
+        ("zw", &z),
+        ("cascade", &z),
+        ("router", &z),
+        ("rrf", &rrf),
+        ("rrfb", &rrf),
+        ("rrfw", &rrf),
     ];
     for (name, vals) in named {
         let kv: Vec<String> = order_desc(vals)
@@ -1248,36 +974,14 @@ fn fuse_rank(
             .collect();
         out.insert(name.to_string(), kv);
     }
+    // deleted spectral-recall channels: empty lists, never ranked.
+    for dead in ["lib", "analog", "frag", "bin", "binw", "stein", "libce", "ent"] {
+        out.insert(dead.to_string(), Vec::new());
+    }
     out
 }
 
-/// v8 rank-1-by-mass (info only): lib-leader |ppm-CENTER|>LEAD_OFF && lib<TAU.
-fn mass_swap_flag(lib: &[f64], _mass: &[f64], qnm: Option<f64>, neutrals: &[Option<f64>]) -> bool {
-    if qnm.is_none() {
-        return false;
-    }
-    let q = qnm.unwrap();
-    if !(q > 0.0) || lib.is_empty() {
-        return false;
-    }
-    let mut best = 0usize;
-    for i in 1..lib.len() {
-        let (a, b) = (lib[best], lib[i]);
-        if b.is_nan() {
-            continue;
-        }
-        if a.is_nan() || b > a {
-            best = i;
-        }
-    }
-    if lib[best].is_nan() || lib[best] >= MASS_LIB_TAU {
-        return false;
-    }
-    match neutrals.get(best).copied().flatten() {
-        Some(c) => ((c - q) / q * 1e6 - MASS_CENTER).abs() > MASS_LEAD_OFF,
-        None => false,
-    }
-}
+// (mass_swap_flag deleted 2026-11-24: the swap rule keyed off the lib leader)
 
 /// v8 rank-1-by-mass replace, engine follow-up (I6): per ranked list, if the
 /// rank-1 key's |ppm-CENTER| exceeds LEAD_OFF, move the list's min-|ppm| key
@@ -1314,11 +1018,7 @@ fn apply_mass_replace(ranked: &mut HashMap<String, Vec<String>>, ppm_of: &HashMa
     }
 }
 
-/// funnel recall probe (I6): first-K keys of the funnel-ordered pool.
-/// Pure slice — the engine echoes these so Python can score truth retention.
-fn funnel_topk(ordered_keys: &[String], k: usize) -> Vec<String> {
-    ordered_keys.iter().take(k).cloned().collect()
-}
+// (funnel_topk deleted 2026-11-24: the funnel filtered library spectra)
 
 /// Molecule-batch fuse (microsec lane): S per-spectrum score columns over the
 /// same candidate order -> one fused ranked list per variant via RRF across
@@ -1338,7 +1038,14 @@ fn fuse_molecule_rrf(
     }
     let n = keys.len();
     let nan = vec![f64::NAN; n];
+    // Deleted spectral-recall channels emit empty lists (honest RR 0) —
+    // same contract as fuse_rank; only computed variants fuse here.
+    const DEAD: [&str; 8] = ["lib", "analog", "frag", "bin", "binw", "stein", "libce", "ent"];
     for v in VARIANTS {
+        if DEAD.contains(v) {
+            out.insert(v.to_string(), Vec::new());
+            continue;
+        }
         let ranks: Vec<Vec<f64>> = per_spec
             .iter()
             .map(|cols| {
@@ -1516,170 +1223,64 @@ fn sengine(params: EngineParams) {
                 }
             }
             let t_qprep = t0.elapsed();
-            let pool_keys = m.pool_keys.unwrap_or_default();
-            // Pool entries carry all first-spectra (prec from specs[0]); per-
-            // spectrum distance is computed against each qc below.
-            let mut pool_first: Vec<(String, CSpectra, [u64; 32])> = Vec::with_capacity(pool_keys.len());
-            for k in &pool_keys {
-                ensure_key(&mut table, slim_store.as_ref(), &slim_rows, &slim_pos, k);
-                if let Some(e) = table.get_mut(k) {
-                    ensure_prepared(e, params.qpeak, params.qloss);
-                    if let Some(s) = e.specs.as_ref().and_then(|v| v.first()) {
-                        pool_first.push((k.clone(), s.clone(), e.fp.unwrap_or([0u64; 32])));
-                    }
-                }
-            }
+            // (library pool deleted 2026-11-24: pool spectra fed analog/funnel/bin)
             let t_cands = t0.elapsed();
             // Per-spectrum: qc + funnel + hits + channels (same math as single).
             let mut per_spec: Vec<HashMap<String, Vec<f64>>> = Vec::with_capacity(qs.len());
-            let mut pool_union: usize = 0;
-            let mut mass_swap_any = false;
+            let pool_union: usize = 0;
+            let mass_swap_any = false;
             let mut neutrals: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
             let _ = &mut neutrals;
             for (si, q) in qs.iter().enumerate() {
-                let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss, q.ce);
-                let qloss = loss_set(&qc.mz, qc.prec);
-                let qn = qloss.len().max(1) as f64;
+                let qc = prepare(&q.mzs, &q.ints, q.prec);
                 let qnm: Option<f64> = qnms.get(si).copied().flatten();
-                let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_first.len());
-                for (k, s, fp) in &pool_first {
-                    pool.push((k.clone(), s.clone(), (s.prec - qc.prec).abs(), *fp));
-                }
-                let mut pool_idx: Vec<usize> = (0..pool.len()).collect();
-                if pool.len() > FUNNEL_MIN && params.funnel_off < 0.5 && qc.bits.iter().any(|&w| w != 0) {
-                    let mut scored: Vec<(f64, f64, usize)> = pool
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, s, dist, _))| (jaccard(&qc.bits, &s.bits), *dist, i))
-                        .collect();
-                    scored.sort_by(|a, b| {
-                        b.0.partial_cmp(&a.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap())
-                    });
-                    pool_idx = scored.into_iter().take(FUNNEL_K).map(|(_, _, i)| i).collect();
-                }
-                if pool_idx.len() > POOL_CAP {
-                    pool_idx.truncate(POOL_CAP);
-                }
-                pool_union = pool_union.max(pool_idx.len());
-                let mut hits: Vec<([u64; 32], f64)> = Vec::new();
-                for &i in &pool_idx {
-                    let (_, s, _, fp) = &pool[i];
-                    if fp == &[0u64; 32] {
-                        continue;
-                    }
-                    let msv = modified_row(&qc, s, TOL);
-                    if msv > MS_THRESH {
-                        hits.push((*fp, msv));
-                    }
-                }
-                hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                hits.truncate(TOP_N_ANALOG);
-                let mut vlib = Vec::with_capacity(cands.len());
-                let mut vanalog = Vec::with_capacity(cands.len());
-                let mut vfrag = Vec::with_capacity(cands.len());
-                let mut vbin = Vec::with_capacity(cands.len());
-                let mut vbinw = Vec::with_capacity(cands.len());
-                let mut vstein = Vec::with_capacity(cands.len());
+                // (library pool + funnel + analog hits deleted 2026-11-24)
+                // computed channels only: neutral-mass grading + loss/gate.
                 let mut vmass = Vec::with_capacity(cands.len());
-                let mut vlibce = Vec::with_capacity(cands.len());
-                let mut vent = Vec::with_capacity(cands.len());
                 let mut vgate = Vec::with_capacity(cands.len());
                 for c in &cands {
-                    let mut lib = 0.0;
-                    let mut stein = 0.0;
-                    let mut ent = 0.0;
-                    for s in &c.specs {
-                        let v = cosine_row(&qc, s, TOL);
-                        if v > lib {
-                            lib = v;
-                        }
-                    }
-                    let mut libce = lib;
-                    if let Some(qce) = qc.ce {
-                        let qb = ce_band(qce);
-                        let mut found = false;
-                        let mut best = 0.0;
-                        for s in &c.specs {
-                            if s.ce.map(ce_band) == Some(qb) {
-                                found = true;
-                                let v = cosine_row(&qc, s, TOL);
-                                if v > best {
-                                    best = v;
-                                }
-                            }
-                        }
-                        if found {
-                            libce = best;
-                        }
-                    }
-                    let mut analog = 0.0;
-                    if let Some(cfp) = c.fp {
-                        for (ofp, msv) in &hits {
-                            let v = msv * chem_tanimoto(&cfp, ofp);
-                            if v > analog {
-                                analog = v;
-                            }
-                        }
-                    }
-                    let mut frag = 0.0;
-                    for s in c.specs.iter().take(2) {
-                        let v = overlap_count(&qloss, &s.floss) as f64 / qn;
-                        if v > frag {
-                            frag = v;
-                        }
-                    }
-                    let (mut bscore, mut bwscore) = (0.0, 0.0);
-                    for s in &c.specs {
-                        let j = jaccard(&qc.bits, &s.bits);
-                        if j > bscore {
-                            bscore = j;
-                        }
-                        let wj = wjaccard(&qc.wb, &s.wb);
-                        if wj > bwscore {
-                            bwscore = wj;
-                        }
-                        let st = stein_row(&qc, s, TOL);
-                        if st > stein {
-                            stein = st;
-                        }
-                        let en = ent_row(&qc.mz, &qc.w, &s.mz, &s.w, TOL);
-                        if en > ent {
-                            ent = en;
-                        }
-                    }
-                    vlib.push(lib);
-                    vanalog.push(analog);
-                    vfrag.push(frag);
-                    vbin.push(bscore);
-                    vbinw.push(bwscore);
-                    vstein.push(stein);
                     vmass.push(mass_score(qnm, c.neutral));
-                    vlibce.push(libce);
-                    vent.push(ent);
                     vgate.push(gate_frac(&qc.mz, qc.prec, c.formula.as_ref()));
                 }
-                let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(VARIANTS.len() * 2);
-                cols.insert("lib".to_string(), vlib);
-                cols.insert("analog".to_string(), vanalog);
-                cols.insert("frag".to_string(), vfrag);
-                cols.insert("bin".to_string(), vbin);
-                cols.insert("binw".to_string(), vbinw);
-                cols.insert("stein".to_string(), vstein);
+                // Computed fusions per spectrum (same math as fuse_rank, so S=1
+                // equals the single-query rank exactly; RRF fuses spectra).
+                let zm = zscore(&vmass);
+                let zg = zscore(&vgate);
+                let z: Vec<f64> = (0..cands.len())
+                    .map(|i| {
+                        let mut s = 0.0;
+                        for x in [zm[i], zg[i]] {
+                            if !x.is_nan() {
+                                s += x;
+                            }
+                        }
+                        s
+                    })
+                    .collect();
+                let rm = rank_min_desc(&vmass);
+                let rg = rank_min_desc(&vgate);
+                let rrf: Vec<f64> = (0..cands.len())
+                    .map(|i| {
+                        let mut s = 0.0;
+                        for r in [rm[i], rg[i]] {
+                            if !r.is_nan() {
+                                s += 1.0 / (RRF_BASE + r);
+                            }
+                        }
+                        s
+                    })
+                    .collect();
+                let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(10);
                 cols.insert("mass".to_string(), vmass);
-                cols.insert("libce".to_string(), vlibce);
-                cols.insert("ent".to_string(), vent);
                 cols.insert("gate".to_string(), vgate);
-                // mass-replace + lossgate + swap are molecule-level (applied
-                // after fuse); per-spectrum swap contributes OR.
-                let neutrals_s: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
-                if mass_swap_flag(
-                    cols.get("lib").map(|v| v.as_slice()).unwrap_or(&[]),
-                    cols.get("mass").map(|v| v.as_slice()).unwrap_or(&[]),
-                    qnm,
-                    &neutrals_s,
-                ) {
-                    mass_swap_any = true;
-                }
+                cols.insert("z".to_string(), z.clone());
+                cols.insert("pure".to_string(), z.clone());
+                cols.insert("zw".to_string(), z.clone());
+                cols.insert("cascade".to_string(), z.clone());
+                cols.insert("router".to_string(), z);
+                cols.insert("rrf".to_string(), rrf.clone());
+                cols.insert("rrfb".to_string(), rrf.clone());
+                cols.insert("rrfw".to_string(), rrf);
                 per_spec.push(cols);
                 let _ = qis.get(si);
             }
@@ -1762,9 +1363,7 @@ fn sengine(params: EngineParams) {
         };
         let t_parse = t0.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let qc = prepare(&q.mzs, &q.ints, q.prec, params.qpeak, params.qloss, q.ce);
-        let qloss = loss_set(&qc.mz, qc.prec);
-        let qn = qloss.len().max(1) as f64;
+        let qc = prepare(&q.mzs, &q.ints, q.prec);
         let qi: i64 = m.qi.unwrap_or(0);
         let qnm: Option<f64> = m.qnm;
         // candidates (table lookups only — prepared once at preload)
@@ -1787,160 +1386,23 @@ fn sengine(params: EngineParams) {
         // pool (input order = distance order from the launcher; keep it).
         // Pool entry = first spectrum of the key — the same spectra the
         // launcher used to send per query as first-spectrum messages.
+        // (library pool deleted 2026-11-24)
         let t_cands = t0.elapsed();
-        let pool_keys = m.pool_keys.unwrap_or_default();
-        let mut pool: Vec<(String, CSpectra, f64, [u64; 32])> = Vec::with_capacity(pool_keys.len());
-        for k in &pool_keys {
-            ensure_key(&mut table, slim_store.as_ref(), &slim_rows, &slim_pos, k);
-            if let Some(e) = table.get_mut(k) {
-                ensure_prepared(e, params.qpeak, params.qloss);
-                if let Some(s) = e.specs.as_ref().and_then(|v| v.first()) {
-                    let d = (s.prec - qc.prec).abs();
-                    pool.push((k.clone(), s.clone(), d, e.fp.unwrap_or([0u64; 32])));
-                }
-            }
-        }
-        // funnel: jaccard over first-spectrum bits when the pool is big.
-        // funnel_off = 1 disables it (I6 A/B: donor-retention question).
+        // (pool vec deleted 2026-11-24)
+        // (funnel + recall probe deleted 2026-11-24: funnel filtered library spectra)
         let t_pool = t0.elapsed();
-        let mut pool_idx: Vec<usize> = (0..pool.len()).collect();
-        if pool.len() > FUNNEL_MIN && params.funnel_off < 0.5 && qc.bits.iter().any(|&w| w != 0) {
-            let mut scored: Vec<(f64, f64, usize)> = pool
-                .iter()
-                .enumerate()
-                .map(|(i, (_, s, dist, _))| (jaccard(&qc.bits, &s.bits), *dist, i))
-                .collect();
-            scored.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap()
-                    .then(a.1.partial_cmp(&b.1).unwrap())
-            });
-            pool_idx = scored.into_iter().take(FUNNEL_K).map(|(_, _, i)| i).collect();
-        }
-        if pool_idx.len() > POOL_CAP {
-            pool_idx.truncate(POOL_CAP);
-        }
-        // I6 funnel recall probe: echo first-K pool keys in funnel order.
-        let prefilter_topk: Option<Vec<String>> = if params.recall_topk > 0.0 {
-            let ordered: Vec<String> = pool_idx.iter().map(|&i| pool[i].0.clone()).collect();
-            Some(funnel_topk(&ordered, params.recall_topk as usize))
-        } else {
-            None
-        };
-        // analog hits: first-spectrum mass-shift matches, ms > thresh, top 10
-        let t_funnel = t0.elapsed();
-        let mut hits: Vec<([u64; 32], f64)> = Vec::new();
-        for &i in &pool_idx {
-            let (_, s, _, fp) = &pool[i];
-            if fp == &[0u64; 32] {
-                continue;
-            }
-            let ms = modified_row(&qc, s, TOL);
-            if ms > MS_THRESH {
-                hits.push((*fp, ms));
-            }
-        }
-        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        hits.truncate(TOP_N_ANALOG);
-        // channels per candidate, accumulated in locals then inserted once
-        // (was: a HashMap lookup per channel per candidate).
-        let t_analog = t0.elapsed();
-        let mut vlib: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vanalog: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vfrag: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vbin: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vbinw: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vstein: Vec<f64> = Vec::with_capacity(cands.len());
+        let t_funnel = t_pool;
+        let t_analog = t_pool;
+        let prefilter_topk: Option<Vec<String>> = None;
+        // computed channels only: neutral-mass grading + loss/gate.
         let mut vmass: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vlibce: Vec<f64> = Vec::with_capacity(cands.len());
-        let mut vent: Vec<f64> = Vec::with_capacity(cands.len());
         let mut vgate: Vec<f64> = Vec::with_capacity(cands.len());
         for c in &cands {
-            let mut lib = 0.0;
-            let mut stein = 0.0;
-            let mut ent = 0.0;
-            for s in &c.specs {
-                let v = cosine_row(&qc, s, TOL);
-                if v > lib {
-                    lib = v;
-                }
-            }
-            // R2 CE band: same-band max; missing CE anywhere falls back to
-            // lib, so the variant never scores below lib on missing data.
-            let mut libce = lib;
-            if let Some(qce) = qc.ce {
-                let qb = ce_band(qce);
-                let mut found = false;
-                let mut best = 0.0;
-                for s in &c.specs {
-                    if s.ce.map(ce_band) == Some(qb) {
-                        found = true;
-                        let v = cosine_row(&qc, s, TOL);
-                        if v > best {
-                            best = v;
-                        }
-                    }
-                }
-                if found {
-                    libce = best;
-                }
-            }
-            let mut analog = 0.0;
-            if let Some(cfp) = c.fp {
-                for (ofp, ms) in &hits {
-                    let v = ms * chem_tanimoto(&cfp, ofp);
-                    if v > analog {
-                        analog = v;
-                    }
-                }
-            }
-            let mut frag = 0.0;
-            for s in c.specs.iter().take(2) {
-                let v = overlap_count(&qloss, &s.floss) as f64 / qn;
-                if v > frag {
-                    frag = v;
-                }
-            }
-            let (mut bscore, mut bwscore) = (0.0, 0.0);
-            for s in &c.specs {
-                let j = jaccard(&qc.bits, &s.bits);
-                if j > bscore {
-                    bscore = j;
-                }
-                let wj = wjaccard(&qc.wb, &s.wb);
-                if wj > bwscore {
-                    bwscore = wj;
-                }
-                let st = stein_row(&qc, s, TOL);
-                if st > stein {
-                    stein = st;
-                }
-                let en = ent_row(&qc.mz, &qc.w, &s.mz, &s.w, TOL);
-                if en > ent {
-                    ent = en;
-                }
-            }
-            vlib.push(lib);
-            vanalog.push(analog);
-            vfrag.push(frag);
-            vbin.push(bscore);
-            vbinw.push(bwscore);
-            vstein.push(stein);
             vmass.push(mass_score(qnm, c.neutral));
-            vlibce.push(libce);
-            vent.push(ent);
             vgate.push(gate_frac(&qc.mz, qc.prec, c.formula.as_ref()));
         }
-        let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(VARIANTS.len() * 2);
-        cols.insert("lib".to_string(), vlib);
-        cols.insert("analog".to_string(), vanalog);
-        cols.insert("frag".to_string(), vfrag);
-        cols.insert("bin".to_string(), vbin);
-        cols.insert("binw".to_string(), vbinw);
-        cols.insert("stein".to_string(), vstein);
+        let mut cols: HashMap<String, Vec<f64>> = HashMap::with_capacity(4);
         cols.insert("mass".to_string(), vmass);
-        cols.insert("libce".to_string(), vlibce);
-        cols.insert("ent".to_string(), vent);
         cols.insert("gate".to_string(), vgate);
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
         let t_chan = t0.elapsed();
@@ -1972,20 +1434,15 @@ fn sengine(params: EngineParams) {
                 partition_by_gate(list, &gate_of);
             }
         }
-        let neutrals: Vec<Option<f64>> = cands.iter().map(|c| c.neutral).collect();
-        let mass_swap = mass_swap_flag(
-            cols.get("lib").map(|v| v.as_slice()).unwrap_or(&[]),
-            cols.get("mass").map(|v| v.as_slice()).unwrap_or(&[]),
-            qnm,
-            &neutrals,
-        );
+        // (mass_swap deleted 2026-11-24: the swap rule keyed off the lib leader)
+        let mass_swap = false;
         let t_fuse = t0.elapsed();
         writeln!(
             h,
             "{}",
             serde_json::to_string(&EngineReply {
                 ranked,
-                pools: pool_idx.len(),
+                pools: 0,
                 mass_swap,
                 prefilter_topk,
                 // 8 stages, all known before serialization (ser+io stay on the
@@ -2007,7 +1464,7 @@ fn sengine(params: EngineParams) {
         .unwrap();
         h.flush().unwrap();
         let t_ser = t0.elapsed();
-        writeln!(err, "sengine q={} cands={} pool={} ipc={} t_parse={:.1} t_qprep={:.1} t_cands={:.1} t_pool={:.1} t_funnel={:.1} t_analog={:.1} t_chan={:.1} t_fuse={:.1} t_ser={:.1} t_tot={:.1}", qi, keys.len(), pool_idx.len(), ipc_bytes, ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), ms(t_pool - t_cands), ms(t_funnel - t_pool), ms(t_analog - t_funnel), ms(t_chan - t_analog), ms(t_fuse - t_chan), ms(t_ser - t_fuse), ms(t_ser))
+        writeln!(err, "sengine q={} cands={} pool={} ipc={} t_parse={:.1} t_qprep={:.1} t_cands={:.1} t_pool={:.1} t_funnel={:.1} t_analog={:.1} t_chan={:.1} t_fuse={:.1} t_ser={:.1} t_tot={:.1}", qi, keys.len(), 0, ipc_bytes, ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), ms(t_pool - t_cands), ms(t_funnel - t_pool), ms(t_analog - t_funnel), ms(t_chan - t_analog), ms(t_fuse - t_chan), ms(t_ser - t_fuse), ms(t_ser))
             .unwrap();
     }
 }
@@ -2089,16 +1546,8 @@ mod engine_tests {
         assert_eq!(clean(&big, &ones, 500.0).0.len(), 64);
     }
 
-    #[test]
-    fn quantize_matches_python() {
-        // int(round(mz/0.05)) & 0xFFFFFFFF from the banked reference battery
-        assert_eq!(qbin(100.0, 0.05), 2000);
-        assert_eq!(qbin(200.5, 0.05), 4010);
-        assert_eq!(qbin(350.25, 0.05), 7005);
-        assert_eq!(qbin(400.0 - 100.0, 0.01), 30000);
-        assert_eq!(qbin(400.0 - 200.5, 0.01), 19950);
-        assert_eq!(qbin(400.0 - 350.25, 0.01), 4975);
-    }
+    // (quantize_matches_python deleted 2026-11-24 with qbin: binned spectral
+    // Jaccard was library recall)
 
     #[test]
     fn adduct_table_matches_python() {
@@ -2120,28 +1569,15 @@ mod engine_tests {
         assert!(adduct_shift("[NOPE]").is_none());
     }
 
-    #[test]
-    fn ce_band_edges() {
-        assert_eq!(ce_band(20.0), 0);
-        assert_eq!(ce_band(25.0), 0);
-        assert_eq!(ce_band(25.1), 1);
-        assert_eq!(ce_band(40.0), 1);
-        assert_eq!(ce_band(50.0), 1);
-        assert_eq!(ce_band(50.1), 2);
-        assert_eq!(ce_band(60.0), 2);
-    }
+    // (ce_band_edges deleted 2026-11-24 with ce_band: same-band library recall)
 
     #[test]
-    fn entropy_single_peak_quarter_and_self_is_one() {
+    fn entropy_single_peak_quarter_and_empty_linear() {
         // single peak: S = 0 -> exponent 0.25.
         assert!(approx(entropy_exp(&[3.0]), 0.25));
         // empty/zero -> linear fallback.
         assert!(approx(entropy_exp(&[]), 1.0));
-        // self-match is exactly 1.0 (same accumulation order both sides).
-        let mz = vec![100.0, 200.0, 300.0];
-        let w = vec![1.0, 0.5, 0.25];
-        assert!(approx(ent_row(&mz, &w, &mz, &w, 0.01), 1.0));
-        assert_eq!(ent_row(&[], &[], &mz, &w, 0.01), 0.0);
+        assert!(approx(entropy_exp(&[0.0, 0.0]), 1.0));
     }
 
     #[test]
@@ -2198,47 +1634,20 @@ mod engine_tests {
         assert_eq!(rank_min_desc(&[0.5, 0.9, 0.9, 0.1]), vec![3.0, 1.0, 1.0, 4.0]);
     }
 
-    #[test]
-    fn channels_match_python_reference() {
-        // banked reference: q=(100,200) vs k1 identical, k2 far, k3 near-miss
-        let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01, None);
-        let k1 = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01, None);
-        let k2 = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
-        let k3 = prepare(&[100.05, 300.0], &[0.9, 0.8], 301.0, 0.05, 0.01, None);
-        assert!(approx(cosine_row(&q, &k1, TOL), 1.0));
-        assert!(approx(cosine_row(&q, &k2, TOL), 0.0));
-        let ql = loss_set(&q.mz, q.prec);
-        let f1 = loss_set(&k1.mz, k1.prec);
-        let f3 = loss_set(&k3.mz, k3.prec);
-        let qn = ql.len().max(1) as f64;
-        assert!(approx(overlap_count(&ql, &f1) as f64 / qn, 1.0));
-        // frag k3 == 0.5 in the banked reference
-        assert!(approx(overlap_count(&ql, &f3) as f64 / qn, 0.5));
-        // bin self-channel is exact Jaccard 1.0
-        assert!(approx(jaccard(&q.bits, &k1.bits), 1.0));
-        assert!(approx(wjaccard(&q.wb, &k1.wb), 1.0));
-    }
+    // (channels_match_python_reference deleted 2026-11-24 with cosine_row /
+    // modified_row / jaccard / wjaccard: spectral-recall channel parity)
 
     #[test]
-    fn z_rrf_match_pandas() {
-        // banked: lib [0.9,0.5,0.0] etc. pandas rank(ascending=False, method="min"),
-        // RRF base 60: 1/(60+rank) summed over 3 channels.
-        // a: ranks 1,2,2 -> 1/61+1/62+1/62 = 0.048651507139079855
-        // b: ranks 2,1,2 -> same 0.048651507139079855
-        // c: ranks 3,3,1 -> 1/63+1/63+1/61 = 0.04813947436898257
-        let lib = vec![0.9, 0.5, 0.0];
-        let analog = vec![0.2, 0.8, 0.1];
-        let frag = vec![0.3, 0.3, 0.9];
+    fn z_rrf_computed_fusion() {
+        // Post-phonebook (2026-11-24): mass (neutral grading) + gate
+        // (loss/subformula) only. mass a>b>c, gate b>c>a.
+        // z = z(mass)+z(gate): mass z [1,0,-1], gate z [-1,1,0] -> [0,1,-1].
+        // rrf over mass ranks [1,2,3] + gate ranks [3,1,2] -> b wins.
         let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut cols = HashMap::new();
-        cols.insert("lib".to_string(), lib.clone());
-        cols.insert("analog".to_string(), analog.clone());
-        cols.insert("frag".to_string(), frag.clone());
-        cols.insert("bin".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("binw".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("stein".to_string(), vec![0.0, 0.0, 0.0]);
         cols.insert("mass".to_string(), vec![1.0, 0.5, 0.0]);
-        // exact RRF scores via the same rank helper (locks base + min-rank)
+        cols.insert("gate".to_string(), vec![0.0, 1.0, 0.5]);
+        // exact RRF scores via the same rank helper (locks base + min-rank).
         let rrf_of = |chs: &[Vec<f64>]| -> Vec<f64> {
             let rs: Vec<Vec<f64>> = chs.iter().map(|c| rank_min_desc(c)).collect();
             (0..3)
@@ -2249,44 +1658,38 @@ mod engine_tests {
                 })
                 .collect()
         };
-        let rrf = rrf_of(&[lib, analog, frag]);
-        assert!((rrf[0] - 0.048651507139079855).abs() < 1e-12);
-        assert!((rrf[1] - 0.048651507139079855).abs() < 1e-12);
-        assert!((rrf[2] - 0.04813947436898257).abs() < 1e-12);
+        let rrf = rrf_of([vec![1.0, 0.5, 0.0], vec![0.0, 1.0, 0.5]].as_slice());
+        assert!((rrf[1] - (1.0 / 62.0 + 1.0 / 61.0)).abs() < 1e-12);
+        assert!(rrf[1] > rrf[0] && rrf[1] > rrf[2]);
         let fw = EngineParams::neutral(0.05, 0.01);
         let ranked = fuse_rank(&keys, &cols, &fw);
-        // neutral genome reproduces legacy fusions bit-identically
+        // one evidence source, several names: all computed aliases agree.
         assert_eq!(ranked["zw"], ranked["z"]);
+        assert_eq!(ranked["pure"], ranked["z"]);
+        assert_eq!(ranked["cascade"], ranked["z"]);
+        assert_eq!(ranked["router"], ranked["z"]);
         assert_eq!(ranked["rrfw"], ranked["rrf"]);
-        let z = &ranked["z"];
-        assert_eq!(z[0], "b"); // banked z: b=0.6412 > a=-0.0566 > c=-0.5846
-        // rrf top-25 contains all three, ties keep candidate order
+        assert_eq!(ranked["rrfb"], ranked["rrf"]);
+        assert_eq!(ranked["z"], vec!["b".to_string(), "a".to_string(), "c".to_string()]);
+        assert_eq!(ranked["rrf"][0], "b");
         assert_eq!(ranked["rrf"].len(), 3);
-        // rrf order: a,b tie on 0.04865... -> stable candidate order keeps a first
-        assert_eq!(ranked["rrf"][0], "a");
-        assert_eq!(ranked["rrf"][1], "b");
-        assert_eq!(ranked["rrf"][2], "c");
+        // deleted spectral-recall channels emit empty lists, never ranked.
+        for dead in ["lib", "analog", "frag", "bin", "binw", "stein", "libce", "ent"] {
+            assert!(ranked[dead].is_empty());
+        }
     }
 
     #[test]
-    fn pure_fusion_sums_channels() {
-        // pure = z(stein) + z(frag) + z(mass), equal weights, NaN-skipped.
-        // stein [0.9,0.5,0.0] -> z [0.9610,0.0739,-1.0349]
-        // frag  [0.3,0.3,0.9] -> z [-0.5774,-0.5774,1.1547]
-        // mass  [1.0,0.5,0.0] -> z [1.0,0.0,-1.0]
-        // pure = [1.3836,-0.5035,-0.8802] -> order a,b,c.
+    fn pure_is_computed_z() {
+        // pure keeps the canary name on computed evidence only: pure == z.
         let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut cols = HashMap::new();
-        cols.insert("lib".to_string(), vec![0.9, 0.5, 0.0]);
-        cols.insert("analog".to_string(), vec![0.2, 0.8, 0.1]);
-        cols.insert("frag".to_string(), vec![0.3, 0.3, 0.9]);
-        cols.insert("bin".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("binw".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("stein".to_string(), vec![0.9, 0.5, 0.0]);
         cols.insert("mass".to_string(), vec![1.0, 0.5, 0.0]);
+        cols.insert("gate".to_string(), vec![0.0, 1.0, 0.5]);
         let fw = EngineParams::neutral(0.05, 0.01);
         let ranked = fuse_rank(&keys, &cols, &fw);
-        assert_eq!(ranked["pure"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(ranked["pure"], ranked["z"]);
+        assert_eq!(ranked["pure"], vec!["b".to_string(), "a".to_string(), "c".to_string()]);
     }
 
     #[test]
@@ -2299,7 +1702,7 @@ mod engine_tests {
         ];
         let eager: Vec<CSpectra> = raws
             .iter()
-            .map(|s| prepare(&s.mzs, &s.ints, s.prec, 0.05, 0.01, None))
+            .map(|s| prepare(&s.mzs, &s.ints, s.prec))
             .collect();
         let mut e = TableEntry {
             raw: raws, specs: None, smiles: "CCO".to_string(), fp: None,
@@ -2313,12 +1716,6 @@ mod engine_tests {
             assert_eq!(a.mz, b.mz);
             assert_eq!(a.w, b.w);
             assert_eq!(a.prec, b.prec);
-            assert_eq!(a.norm, b.norm);
-            assert_eq!(a.sw, b.sw);
-            assert_eq!(a.snorm, b.snorm);
-            assert_eq!(a.bits, b.bits);
-            assert_eq!(a.wb, b.wb);
-            assert_eq!(a.floss, b.floss);
         }
         assert_eq!(e.fp, Some(morgan_bits_2048("CCO")));
         let fp_before = e.fp;
@@ -2335,55 +1732,27 @@ mod engine_tests {
     }
 
     #[test]
-    fn weighted_genome_moves_rankings() {
-        // genome: per-channel z + RRF weights, cascade/router gates (defaults neutral).
-        let lib = vec![0.9, 0.5, 0.0];
-        let analog = vec![0.2, 0.8, 0.1];
-        let frag = vec![0.3, 0.3, 0.9];
+    fn genome_weights_ignored_post_phonebook() {
+        // Weights are parked (user order): the engine ignores _fw, so genome
+        // variations must NOT move rankings. Locks the no-fitting rule.
         let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut cols = HashMap::new();
-        cols.insert("lib".to_string(), lib);
-        cols.insert("analog".to_string(), analog);
-        cols.insert("frag".to_string(), frag);
-        cols.insert("bin".to_string(), vec![0.1, 0.2, 0.3]);
-        cols.insert("binw".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("stein".to_string(), vec![0.0, 0.0, 0.0]);
         cols.insert("mass".to_string(), vec![1.0, 0.5, 0.0]);
-        // analog-heavy genome (novel-lane shape): zw top flips from b to a... verify known flip:
-        // neutral zw top is b (banked z: b=0.6412 first). lib-heavy genome keeps b.
-        let mut fw = EngineParams::neutral(0.05, 0.01);
-        assert_eq!(fuse_rank(&keys, &cols, &fw)["zw"][0], "b");
-        fw.wl = 3.0;
-        fw.wa = 0.1;
-        fw.wf = 0.1;
-        assert_eq!(fuse_rank(&keys, &cols, &fw)["zw"][0], "a");
-        // cascade gate: default 3.0 -> analog leg (max libz ~1.0 < 3); gate 0.0 -> lib leg
-        let mut fw2 = EngineParams::neutral(0.05, 0.01);
-        let leg_default = fuse_rank(&keys, &cols, &fw2)["cascade"].clone();
-        fw2.casc_z = 0.0;
-        let leg_zero = fuse_rank(&keys, &cols, &fw2)["cascade"].clone();
-        assert_ne!(leg_default, leg_zero);
-        // rrfw neutral == rrf; analog-heavy rrfw flips c (frag-best) down
-        let fw3 = EngineParams::neutral(0.05, 0.01);
-        assert_eq!(fuse_rank(&keys, &cols, &fw3)["rrfw"], fuse_rank(&keys, &cols, &fw3)["rrf"]);
+        cols.insert("gate".to_string(), vec![0.0, 1.0, 0.5]);
+        let fw = EngineParams::neutral(0.05, 0.01);
+        let base = fuse_rank(&keys, &cols, &fw);
+        let mut heavy = EngineParams::neutral(0.05, 0.01);
+        heavy.wl = 3.0;
+        heavy.wa = 0.1;
+        heavy.wf = 0.1;
+        heavy.casc_z = 0.0;
+        assert_eq!(fuse_rank(&keys, &cols, &heavy)["z"], base["z"]);
+        assert_eq!(fuse_rank(&keys, &cols, &heavy)["rrf"], base["rrf"]);
+        assert_eq!(fuse_rank(&keys, &cols, &heavy)["cascade"], base["cascade"]);
     }
 
-    #[test]
-    fn stein_mass_weighted_self_and_far() {
-        // Stein-Scott-lite: self 1.0, far 0.0, and high-mass matches outweigh low-mass.
-        let q = prepare(&[100.0, 900.0], &[1.0, 1.0], 901.0, 0.05, 0.01, None);
-        let same = prepare(&[100.0, 900.0], &[1.0, 1.0], 901.0, 0.05, 0.01, None);
-        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
-        assert!((stein_row(&q, &same, TOL) - 1.0).abs() < 1e-9);
-        assert_eq!(stein_row(&q, &far, TOL), 0.0);
-        // low-only vs high-only match: high-mass partial scores higher than low-mass partial
-        let low = prepare(&[100.0, 500.0], &[1.0, 1.0], 501.0, 0.05, 0.01, None);
-        let high = prepare(&[900.0, 500.0], &[1.0, 1.0], 901.0, 0.05, 0.01, None);
-        assert!(stein_row(&q, &high, TOL) > stein_row(&q, &low, TOL));
-        // cosine ties single-peak matches (both 0.5); stein separates by mass
-        assert!((cosine_row(&q, &high, TOL) - cosine_row(&q, &low, TOL)).abs() < 1e-9);
-        assert!(stein_row(&q, &high, TOL) > stein_row(&q, &low, TOL));
-    }
+    // (stein_mass_weighted_self_and_far deleted 2026-11-24 with stein_row:
+    // mass-weighted library recall)
 
     #[test]
     fn mass_grading_v8_numbers() {
@@ -2396,11 +1765,8 @@ mod engine_tests {
         assert!((mass_score(Some(1000.0), Some(1000.005)) - 0.3).abs() < 1e-9);
         assert_eq!(mass_score(None, Some(500.0)), 0.0);
         assert_eq!(mass_score(Some(500.0), None), 0.0);
-        // swap flag: lib-leader off-mass + weak lib => true; strong lib => false
-        assert!(mass_swap_flag(&[0.5], &[0.0], Some(1000.0), &[Some(1020.0)]));
-        assert!(!mass_swap_flag(&[0.95], &[0.0], Some(1000.0), &[Some(1020.0)]));
-        assert!(!mass_swap_flag(&[0.5], &[1.0], Some(1000.0), &[Some(1000.0)]));
-        assert!(!mass_swap_flag(&[0.5], &[0.0], None, &[Some(1020.0)]));
+        // (swap asserts deleted 2026-11-24 with mass_swap_flag: the swap rule
+        // keyed off the lib leader; mass_score grading above is computed)
     }
 
     #[test]
@@ -2426,66 +1792,51 @@ mod engine_tests {
         assert_eq!(ranked3["z"], vec!["a".to_string()]);
     }
 
-    fn funnel_topk_slices_in_order() {
-        let keys: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(funnel_topk(&keys, 2), vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(funnel_topk(&keys, 0), Vec::<String>::new());
-        assert_eq!(funnel_topk(&keys, 99).len(), 3);
-    }
-
-    fn analog_empty_pool_is_zero() {
-        // TRULY far pool (100 Da away): neither direct nor shifted matches.
-        // (An earlier revision of this test used prec 251 for `far` and
-        // expected modified==0 — wrong: 251 is 50 Da away, i.e. INSIDE the
-        // analog pool, and shifting it by (201-251)=-50 aligns it exactly,
-        // so modified==1.0 is the CORRECT analog signal, not a false hit.
-        // The runner caught the bad expectation; this is the corrected one.)
-        let q = prepare(&[100.0, 200.0], &[1.0, 1.0], 201.0, 0.05, 0.01, None);
-        let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 301.0, 0.05, 0.01, None);
-        assert_eq!(modified_row(&q, &far, TOL), 0.0);
-        assert_eq!(cosine_row(&q, &far, TOL), 0.0);
-        // in-pool shifted matches DO hit — that is the analog signal itself.
-        let near = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
-        assert_eq!(modified_row(&q, &near, TOL), 1.0);
-        assert_eq!(cosine_row(&q, &near, TOL), 0.0);
-    }
+    // (funnel_topk_slices_in_order + analog_empty_pool_is_zero deleted 2026-11-24
+    // with funnel_topk / modified_row / cosine_row: library-recall probes)
 
     #[test]
     fn molecule_rrf_single_equals_rank_and_fuses() {
-        // S=1: RRF over one spectrum is monotonic in rank -> same order as
-        // order_desc on the raw scores (NaN last in both).
+        // S=1: per-spectrum z/rrf use the same math as the single path, and RRF
+        // over one spectrum is monotonic in rank -> same order as order_desc
+        // on the raw scores (NaN last in both).
         let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut cols = HashMap::new();
-        cols.insert("lib".to_string(), vec![0.9, 0.5, 0.0]);
-        cols.insert("analog".to_string(), vec![0.2, 0.8, 0.1]);
-        cols.insert("frag".to_string(), vec![0.3, 0.3, 0.9]);
-        cols.insert("bin".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("binw".to_string(), vec![0.0, 0.0, 0.0]);
-        cols.insert("stein".to_string(), vec![0.0, 0.0, 0.0]);
         cols.insert("mass".to_string(), vec![1.0, 0.5, 0.0]);
-        cols.insert("libce".to_string(), vec![0.9, 0.5, 0.0]);
-        cols.insert("ent".to_string(), vec![0.9, 0.5, 0.0]);
         cols.insert("gate".to_string(), vec![1.0, 1.0, 1.0]);
+        cols.insert("z".to_string(), vec![1.0, 0.0, -1.0]);
+        cols.insert("pure".to_string(), vec![1.0, 0.0, -1.0]);
+        cols.insert("zw".to_string(), vec![1.0, 0.0, -1.0]);
+        cols.insert("cascade".to_string(), vec![1.0, 0.0, -1.0]);
+        cols.insert("router".to_string(), vec![1.0, 0.0, -1.0]);
+        cols.insert("rrf".to_string(), vec![1.0 / 61.0, 1.0 / 62.0, 1.0 / 63.0]);
+        cols.insert("rrfb".to_string(), vec![1.0 / 61.0, 1.0 / 62.0, 1.0 / 63.0]);
+        cols.insert("rrfw".to_string(), vec![1.0 / 61.0, 1.0 / 62.0, 1.0 / 63.0]);
         let fused = fuse_molecule_rrf(&[cols], &keys);
-        // lib single: a(0.9) b(0.5) c(0.0) -> a,b,c.
-        assert_eq!(fused["lib"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // mass single: a(1.0) b(0.5) c(0.0) -> a,b,c.
+        assert_eq!(fused["mass"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(fused["z"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
         // S=2 agreeing spectra keep the winner: both rank a first.
         let mut c2 = HashMap::new();
-        for v in VARIANTS {
+        for v in ["mass", "gate", "z", "pure", "zw", "cascade", "router", "rrf", "rrfb", "rrfw"] {
             c2.insert(v.to_string(), vec![0.9, 0.1, 0.0]);
         }
         let mut c3 = HashMap::new();
-        for v in VARIANTS {
+        for v in ["mass", "gate", "z", "pure", "zw", "cascade", "router", "rrf", "rrfb", "rrfw"] {
             c3.insert(v.to_string(), vec![0.8, 0.2, 0.0]);
         }
         let fused2 = fuse_molecule_rrf(&[c2, c3], &keys);
-        assert_eq!(fused2["lib"][0], "a");
-        // All-NaN stays empty-order (NaN last, stable).
+        assert_eq!(fused2["mass"][0], "a");
+        assert_eq!(fused2["z"][0], "a");
+        // deleted spectral-recall channels emit empty lists, never fused.
+        assert!(fused["lib"].is_empty());
+        assert!(fused2["analog"].is_empty());
+        // All-NaN computed stays candidate order (NaN last, stable).
         let mut cn = HashMap::new();
-        for v in VARIANTS {
+        for v in ["mass", "gate", "z", "pure", "zw", "cascade", "router", "rrf", "rrfb", "rrfw"] {
             cn.insert(v.to_string(), vec![f64::NAN; 3]);
         }
         let fusedn = fuse_molecule_rrf(&[cn], &keys);
-        assert_eq!(fusedn["lib"].len(), 3);
+        assert_eq!(fusedn["mass"], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 }
