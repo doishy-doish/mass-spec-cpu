@@ -27,7 +27,8 @@ from . import metric as M
 from . import validation as V
 from . import input_plugs as IP
 
-VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure", "libce", "ent", "gate"]
+VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure", "libce", "ent", "gate",
+            "cleav", "fp", "entw", "lgbma", "lgbmb", "lgbmc"]
 
 # BET-EVOLVE genome defaults (replication queue #3): neutral = legacy behavior
 # bit-identically (wl/wa/wf/rl/ra/rf = 1.0, casc_z = 3.0, rout_* = legacy gates).
@@ -653,6 +654,56 @@ def assemble_row(out, truth, qi, row_order):
     return row, ranked_z, bool(out.get("mass_swap", False))
 
 
+def mol_group_by_key(selected, qkey_map) -> dict:
+    """Q3b per-molecule grouping: selected queries -> {molecule_key: [sel]}.
+    Groups by truth key (validation proxy for molecule_id grouping on test).
+    Pure, testable; grouping uses keys only, never structures.
+    """
+    groups: dict = {}
+    for sel in selected:
+        if sel is None:
+            continue
+        qi = int(sel[1])
+        mk = str(qkey_map.get(qi, qi))
+        groups.setdefault(mk, []).append(sel)
+    return groups
+
+
+def tta_qnms(qi, qnm_map, adduct, prec) -> list:
+    """Q7 test-time augmentation: self qnm + up to 2 neighbor-adduct qnms.
+    Pure; neighbor shifts come from input_plugs (Da deltas vs [M+H]+/[M-H]- frames).
+    Returns [(label, qnm)] with Nones dropped, self first.
+    """
+    out = []
+    q0 = qnm_map.get(int(qi))
+    if q0 is not None:
+        out.append(("self", float(q0)))
+    try:
+        nbs = IP.adduct_neighbors(str(adduct))
+        base = str(adduct)
+        for alt in nbs[1:3]:
+            try:
+                p2 = IP.retry_precisions(float(prec), base, str(alt))
+                # neighbor qnm = shifted prec under self adduct frame approx:
+                # reuse structs shift via prec delta (method-light, no binary).
+                if q0 is not None:
+                    # shift qnm by the same prec delta (neutral preserved).
+                    dq = float(p2) - float(prec)
+                    out.append((str(alt), float(q0) + dq))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # dedupe near-identical
+    uniq = []
+    for lab, v in out:
+        if v is None or v != v:
+            continue
+        if all(abs(v - u[1]) > 1e-6 for u in uniq):
+            uniq.append((lab, v))
+    return uniq[:3]
+
+
 _SE = {}
 
 _STATUS_PATH = None
@@ -763,6 +814,10 @@ def main() -> None:
                     help="SWORD pure-cut level, cumulative and sequential: 0=off, 1=+prec-ppm, 2=+CE-band, 3=+adduct-exact. Isolation arms (non-cumulative): 11=prec-only, 12=CE-only, 13=adduct-only. Each stage recall-locked (empty->uncut, unknown->kept)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
+    ap.add_argument("--mol-rrf", type=int, default=0,
+                    help="Q3b per-molecule RRF: RRF-fuse per-spectrum ranked lists within each truth-key group (validation proxy for molecule_id consensus on test); assigns fused list to every query in the group")
+    ap.add_argument("--tta", type=int, default=0,
+                    help="Q7 test-time augmentation: self + up to 2 neighbor-adduct qnms per query, RRF-fused per variant (wall x3, off by default)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--out-suffix", default="",
                     help="inserted before the extension of --out, e.g. '-binwprobe'; "
@@ -778,6 +833,17 @@ def main() -> None:
     a = ap.parse_args()
     if "poolcheck" in (a.out_suffix or ""):
         a.pool_check = 1  # input-cap: workflow_dispatch allows max 25 inputs; bench flag rides the suffix
+    # 25-input cap: Q3b/Q7 flags ride the suffix (no new workflow inputs, M235).
+    if "molrrf" in (a.out_suffix or ""):
+        try:
+            a.mol_rrf = 1
+        except Exception:
+            pass
+    if "tta" in (a.out_suffix or "").lower():
+        try:
+            a.tta = 1
+        except Exception:
+            pass
     signal.signal(signal.SIGTERM, _sigterm_loud)
     import atexit as _atexit
     _atexit.register(_cleanup_engine)
@@ -1024,6 +1090,7 @@ def main() -> None:
                    qce={qi: _SLmod.row_ce(S, int(qi)) for qi in qset},
                    qkey={qi: str(T["key14"][int(qi)]) for qi in qset},
                    qinst={qi: str(T["instrument"][int(qi)]) for qi in qset},
+                   qadduct={qi: str(T["adduct"][int(qi)]) for qi in qset},
                    key2inst=key2inst,
                    inst_bonus=bool(a.inst_bonus),
                    adduct_retry=bool(a.adduct_retry),
@@ -1040,6 +1107,7 @@ def main() -> None:
                    qce={qi: T["ce"][int(qi)] for qi in qset},
                    qkey={qi: str(T["key14"][qi]) for qi in qset},
                    qinst={qi: str(T["instrument"][qi]) for qi in qset},
+                   qadduct={qi: str(T["adduct"][qi]) for qi in qset},
                    key2inst=key2inst,
                    inst_bonus=bool(a.inst_bonus),
                    adduct_retry=bool(a.adduct_retry),
@@ -1226,6 +1294,65 @@ def main() -> None:
     for sel in selected:
         if sel is None:
             continue
+        # Q7 TTA: self + neighbor-adduct qnms, RRF-fused per variant.
+        # Default off (wall x1); on = up to 3 engine queries, fused lists.
+        if getattr(a, "tta", 0):
+            try:
+                _qpos, _qi, _tot, _ck, _pk, _pq, _ts = sel
+                # T is freed after precompute (memory); query adduct rides _SE.
+                _ad0 = str((_SE.get("qadduct") or {}).get(int(_qi), ""))
+                _qnms = tta_qnms(int(_qi), _SE.get("qnm") or {}, _ad0, float(_pq))
+            except Exception:
+                _qnms = []
+            if len(_qnms) > 1:
+                # multi-attempt: query each qnm, RRF-fuse ranked lists per variant.
+                from collections import defaultdict as _dd
+                _fused_ranked = {}
+                _ok_any = False
+                for _lab, _qv in _qnms:
+                    if _SE.get("erun"):
+                        _qm = build_engine_query_erun(int(_qi), list(sel[3]), list(sel[4]), float(_qv))
+                    else:
+                        _qr = {"mzs": _SE["qmzs"][int(_qi)], "ints": _SE["qints"][int(_qi)],
+                               "prec": float(sel[5]), "ce": (_SE.get("qce") or {}).get(int(_qi))}
+                        _qm = build_engine_query(_qr, list(sel[3]), list(sel[4]), int(_qi), float(_qv))
+                    try:
+                        _o = engine.query(_qm)
+                    except Exception:
+                        continue
+                    _ok_any = True
+                    for _v in VARIANTS:
+                        _lst = (_o.get("ranked") or {}).get(_v, [])
+                        _fused_ranked.setdefault(_v, []).append(list(_lst))
+                if _ok_any:
+                    # RRF fuse across attempts per variant (rank->1/(60+rank)).
+                    _rr = {}
+                    for _v, _lists in _fused_ranked.items():
+                        _sc = {}
+                        for _lst in _lists:
+                            _seen = set()
+                            for _i, _k in enumerate(_lst):
+                                if _i >= 25 or not _k or _k in _seen:
+                                    continue
+                                _seen.add(_k)
+                                _sc[_k] = _sc.get(_k, 0.0) + 1.0 / (60.0 + (_i + 1))
+                        _rr[_v] = sorted(_sc, key=lambda _k: -_sc[_k])[:25]
+                    _truth = str(_SE["qkey"][int(sel[1])])
+                    _row = {}
+                    for _v in VARIANTS:
+                        _row[_v] = M.reciprocal_rank(_truth, _rr.get(_v, []))
+                    _rz = _rr.get("z", [])
+                    _line = ("shard " + str(_SE["shard"]) + " " + str(sel[0] + 1) + "/" + str(sel[2])
+                             + " q=" + str(sel[1]) + " pool=" + str(len(sel[3])) + " tta=" + str(len(_qnms)))
+                    print(_line, flush=True)
+                    results.append((int(sel[1]), _row, len(sel[3]), _rz, _line, False))
+                    if len(results) % _hb_every == 0:
+                        try:
+                            with open(_STATUS_PATH, "a") as sf:
+                                sf.write("QUERY done=" + str(len(results)) + " of=" + str(len(selected)) + "\n")
+                        except Exception:
+                            pass
+                    continue
         res = score_one(sel, engine)
         if res is None:
             continue
@@ -1237,6 +1364,52 @@ def main() -> None:
             except Exception:
                 pass
 
+    # Q3b per-molecule RRF consensus (validation proxy for molecule_id grouping).
+    # Groups per-spectrum ranked lists by truth key, RRF-fuses within each group,
+    # assigns the fused list to every query in the group. Off by default.
+    _mol_on = bool(getattr(a, "mol_rrf", 0))
+    if _mol_on and results:
+        try:
+            from collections import defaultdict as _dd2
+            # rebuild per-query ranked lists from preds (z-lists saved) + rows for others?
+            # We have preds[str(qi)] = z-list only; for full-variant fusion we need
+            # per-variant lists. Re-derive: results carry rows, not lists. So fuse
+            # at score level: per-group mean RR is NOT RRF. Correct path: store
+            # fused z-lists in preds, then re-score rows from fused lists.
+            # Here we fuse z-lists (saved) and re-score z only; other variants keep
+            # per-spectrum rows (documented limitation, bench compares z/mrr).
+            _by_mol: dict = _dd2(list)
+            _qi_to_row = {}
+            for (_qi, _row, _plen, _ranked, _line, _swap) in results:
+                _mk = str(_SE["qkey"][int(_qi)])
+                _by_mol[_mk].append((int(_qi), list(_ranked or [])))
+                _qi_to_row[int(_qi)] = (_row, _plen, _line, _swap)
+            _fused_by_qi = {}
+            for _mk, _ql in _by_mol.items():
+                _sc = {}
+                for (_qi, _lst) in _ql:
+                    _seen = set()
+                    for _i, _k in enumerate(_lst):
+                        if _i >= 25 or not _k or _k in _seen:
+                            continue
+                        _seen.add(_k)
+                        _sc[_k] = _sc.get(_k, 0.0) + 1.0 / (60.0 + (_i + 1))
+                _fused = sorted(_sc, key=lambda _k: -_sc[_k])[:25]
+                for (_qi, _lst) in _ql:
+                    _fused_by_qi[int(_qi)] = _fused
+            # rewrite z rows + preds from fused lists
+            _new_results = []
+            for (_qi, _row, _plen, _ranked, _line, _swap) in results:
+                _fl = _fused_by_qi.get(int(_qi), list(_ranked or []))
+                _truth = str(_SE["qkey"][int(_qi)])
+                _row = dict(_row)
+                _row["z"] = M.reciprocal_rank(_truth, _fl)
+                _new_results.append((int(_qi), _row, int(_plen), list(_fl), str(_line), bool(_swap)))
+            results = _new_results
+            print("mol-rrf consensus groups=" + str(len(_by_mol)), flush=True)
+        except Exception as _e:
+            print("mol-rrf skipped (" + str(_e)[:120] + ")", flush=True)
+
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
     pools: list = []
@@ -1245,7 +1418,7 @@ def main() -> None:
     for qi, row, plen, ranked, line, swap in results:
         pools.append(int(plen))  # M201: searchsorted yields int64 — json can't serialize it
         for v in VARIANTS:
-            rrs[v].append(row[v])
+            rrs[v].append(row.get(v, 0.0))
         if ranked is not None:
             preds[str(qi)] = ranked
         qidx.append(int(qi))
@@ -1264,30 +1437,38 @@ def main() -> None:
             "mrr_pure": _avg(rrs["pure"]),
             "mrr_libce": _avg(rrs["libce"]), "mrr_ent": _avg(rrs["ent"]),
             "mrr_gate": _avg(rrs["gate"]),
+            "mrr_cleav": _avg(rrs.get("cleav", [])),
+            "mrr_fp": _avg(rrs.get("fp", [])),
+            "mrr_entw": _avg(rrs.get("entw", [])),
+            "mrr_lgbma": _avg(rrs.get("lgbma", [])),
+            "mrr_lgbmb": _avg(rrs.get("lgbmb", [])),
+            "mrr_lgbmc": _avg(rrs.get("lgbmc", [])),
             "fusion": fusion,
-           "recall_topk_k": float(a.recall_topk or 0.0),
-           "recall_at_k": _avg(_SE.get("recall_hits") or []),
-           "qpeak": a.qpeak, "qloss": a.qloss,
-           "mass_swap_rate": _avg(swaps),
-           "truth_in_union": _tin, "keys_in_lib": _hit,
-           "sword_on": bool(_sword_level),
-           "sword_level": int(_sword_level),
-           "sword_only": bool(_sword_only),
-           "sword_cand0": int(_sword_c[0]),
-           "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
-           "sword_stages": [int(v) for v in _sword_c],
-           "sword_fb_rate": (_sword_fb / _sword_fn) if _sword_fn else None,
-           "pool_parity_rate": (_pc_hit / _pc_n if _pc_n else None),
-           "pool_parity_n": int(_pc_n), "pool_parity_nulls": int(_pc_null),
-           "keys_total": _ncand + _npool, "n_truths": len(_truths),
-           "hit1": _avg([r == 1.0 for r in rrs["z"]]),
-           "hit25": _avg([r > 0 for r in rrs["z"]]),
-           "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
-           "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
-           "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
-           "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps],
-           "qhit_lib": "".join("1" if float(x) > 0 else "0" for x in rrs["lib"]),
-           "qhit_z": "".join("1" if float(x) > 0 else "0" for x in rrs["z"])}
+            "recall_topk_k": float(a.recall_topk or 0.0),
+            "recall_at_k": _avg(_SE.get("recall_hits") or []),
+            "qpeak": a.qpeak, "qloss": a.qloss,
+            "mass_swap_rate": _avg(swaps),
+            "truth_in_union": _tin, "keys_in_lib": _hit,
+            "sword_on": bool(_sword_level),
+            "sword_level": int(_sword_level),
+            "sword_only": bool(_sword_only),
+            "sword_cand0": int(_sword_c[0]),
+            "sword_cand1": int(_sword_c[_sword_level] if _sword_level else _sword_c[0]),
+            "sword_stages": [int(v) for v in _sword_c],
+            "sword_fb_rate": (_sword_fb / _sword_fn) if _sword_fn else None,
+            "pool_parity_rate": (_pc_hit / _pc_n if _pc_n else None),
+            "pool_parity_n": int(_pc_n), "pool_parity_nulls": int(_pc_null),
+            "keys_total": _ncand + _npool, "n_truths": len(_truths),
+            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
+            "hit25": _avg([r > 0 for r in rrs["z"]]),
+            "hit1_cascade": _avg([r == 1.0 for r in rrs["cascade"]]),
+            "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
+            "mol_rrf": bool(_mol_on),
+            "tta": bool(getattr(a, "tta", 0)),
+            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
+            "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps],
+            "qhit_lib": "".join("1" if float(x) > 0 else "0" for x in rrs["lib"]),
+            "qhit_z": "".join("1" if float(x) > 0 else "0" for x in rrs["z"])}
     with open(out_path, "w") as f:
         json.dump(out, f)
     try:
