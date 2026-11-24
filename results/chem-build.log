@@ -1,0 +1,32 @@
+   Compiling chem v0.1.0 (/home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem)
+warning: value assigned to `charge` is never read
+   --> src/lib.rs:123:39
+    |
+123 |                 let mut charge: i32 = 0;
+    |                                       ^ this value is reassigned later and never used
+...
+173 |                 charge = explicit.unwrap_or(plus - minus);
+    |                 ----------------------------------------- `charge` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `k` is never read
+   --> src/lib.rs:142:29
+    |
+135 | ...                   k += 2;
+    |                       ------ `k` is overwritten here before the previous value is read
+...
+142 | ...                   k += 1;
+    |                       ^^^^^^ this value is reassigned later and never used
+
+warning: value assigned to `k` is never read
+   --> src/lib.rs:135:29
+    |
+128 |                     k += 1;
+    |                     ------ `k` is overwritten here before the previous value is read
+...
+135 |                             k += 2;
+    |                             ^^^^^^ this value is reassigned later and never used
+
+warning: `chem` (lib) generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 0.57s

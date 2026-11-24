@@ -1,0 +1,122 @@
+warning: value assigned to `charge` is never read
+   --> /home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem/src/lib.rs:123:39
+    |
+123 |                 let mut charge: i32 = 0;
+    |                                       ^ this value is reassigned later and never used
+...
+173 |                 charge = explicit.unwrap_or(plus - minus);
+    |                 ----------------------------------------- `charge` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `k` is never read
+   --> /home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem/src/lib.rs:142:29
+    |
+135 | ...                   k += 2;
+    |                       ------ `k` is overwritten here before the previous value is read
+...
+142 | ...                   k += 1;
+    |                       ^^^^^^ this value is reassigned later and never used
+
+warning: value assigned to `k` is never read
+   --> /home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem/src/lib.rs:135:29
+    |
+128 |                     k += 1;
+    |                     ------ `k` is overwritten here before the previous value is read
+...
+135 |                             k += 2;
+    |                             ^^^^^^ this value is reassigned later and never used
+
+warning: `chem` (lib) generated 3 warnings
+   Compiling binvec v0.1.0 (/home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-bitvec)
+error[E0499]: cannot borrow `w` as mutable more than once at a time
+   --> src/slim.rs:441:24
+    |
+434 |         let mut ri32 = |n: &str, x: &[i32]| {
+    |                        -------------------- first mutable borrow occurs here
+...
+439 |             w(n, zenc(&b));
+    |             - first borrow occurs due to use of `w` in closure
+440 |         };
+441 |         let mut rf64 = |n: &str, x: &[f64]| {
+    |                        ^^^^^^^^^^^^^^^^^^^^ second mutable borrow occurs here
+...
+446 |             w(n, zenc(&b));
+    |             - second borrow occurs due to use of `w` in closure
+447 |         };
+448 |         ri32("key_idx.int32.zst", &key_idx);
+    |         ---- first borrow later used here
+
+error[E0499]: cannot borrow `w` as mutable more than once at a time
+   --> src/slim.rs:450:9
+    |
+434 |         let mut ri32 = |n: &str, x: &[i32]| {
+    |                        -------------------- first mutable borrow occurs here
+...
+439 |             w(n, zenc(&b));
+    |             - first borrow occurs due to use of `w` in closure
+...
+450 |         w("adduct.u8.zst", zenc(&ad));
+    |         ^ second mutable borrow occurs here
+...
+462 |         ri32("key_inst.int32.zst", &[1, 0]);
+    |         ---- first borrow later used here
+
+error[E0499]: cannot borrow `w` as mutable more than once at a time
+   --> src/slim.rs:451:9
+    |
+434 |         let mut ri32 = |n: &str, x: &[i32]| {
+    |                        -------------------- first mutable borrow occurs here
+...
+439 |             w(n, zenc(&b));
+    |             - first borrow occurs due to use of `w` in closure
+...
+451 |         w("inst.u8.zst", zenc(&inst));
+    |         ^ second mutable borrow occurs here
+...
+462 |         ri32("key_inst.int32.zst", &[1, 0]);
+    |         ---- first borrow later used here
+
+error[E0499]: cannot borrow `w` as mutable more than once at a time
+   --> src/slim.rs:457:13
+    |
+434 |         let mut ri32 = |n: &str, x: &[i32]| {
+    |                        -------------------- first mutable borrow occurs here
+...
+439 |             w(n, zenc(&b));
+    |             - first borrow occurs due to use of `w` in closure
+...
+457 |             w("mz_off.int64.zst", zenc(&b));
+    |             ^ second mutable borrow occurs here
+...
+462 |         ri32("key_inst.int32.zst", &[1, 0]);
+    |         ---- first borrow later used here
+
+error[E0499]: cannot borrow `w` as mutable more than once at a time
+   --> src/slim.rs:459:9
+    |
+434 |         let mut ri32 = |n: &str, x: &[i32]| {
+    |                        -------------------- first mutable borrow occurs here
+...
+439 |             w(n, zenc(&b));
+    |             - first borrow occurs due to use of `w` in closure
+...
+459 |         w("mz_data.zst", enc_deltas_f64(&mz_all));
+    |         ^ second mutable borrow occurs here
+...
+462 |         ri32("key_inst.int32.zst", &[1, 0]);
+    |         ---- first borrow later used here
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1262:9
+     |
+1262 |     let mut lines = stdin.lock().lines();
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0499`.
+warning: `binvec` (bin "binvec" test) generated 1 warning
+error: could not compile `binvec` (bin "binvec" test) due to 5 previous errors; 1 warning emitted

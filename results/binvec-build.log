@@ -1,0 +1,142 @@
+    Updating crates.io index
+     Locking 32 packages to highest compatible versions
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding sha2 v0.10.9 (available: v0.11.1)
+      Adding zstd v0.13.5 (available: v0.14.4)
+ Downloading crates ...
+  Downloaded cfg-if v1.0.5
+  Downloaded block-buffer v0.10.4
+  Downloaded crypto-common v0.1.7
+  Downloaded cpufeatures v0.2.17
+  Downloaded cc v1.11.3
+  Downloaded version_check v0.9.5
+  Downloaded itoa v1.0.19
+  Downloaded generic-array v0.14.7
+  Downloaded zmij v1.0.23
+  Downloaded jobserver v0.1.35
+  Downloaded quote v1.0.47
+  Downloaded digest v0.10.7
+  Downloaded pkg-config v0.3.34
+  Downloaded shlex v2.0.1
+  Downloaded find-msvc-tools v0.1.15
+  Downloaded sha2 v0.10.9
+  Downloaded zstd v0.13.5
+  Downloaded zstd-safe v7.4.1
+  Downloaded serde_derive v1.0.229
+  Downloaded proc-macro2 v1.0.107
+  Downloaded serde_core v1.0.229
+  Downloaded unicode-ident v1.0.27
+  Downloaded serde v1.0.229
+  Downloaded memchr v2.8.3
+  Downloaded typenum v1.20.1
+  Downloaded serde_json v1.0.154
+  Downloaded syn v3.0.10
+  Downloaded zstd-sys v2.1.3+zstd.1.5.7
+  Downloaded libc v0.2.191
+   Compiling libc v0.2.191
+   Compiling find-msvc-tools v0.1.15
+   Compiling version_check v0.9.5
+   Compiling shlex v2.0.1
+   Compiling pkg-config v0.3.34
+   Compiling proc-macro2 v1.0.107
+   Compiling generic-array v0.14.7
+   Compiling unicode-ident v1.0.27
+   Compiling typenum v1.20.1
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling zstd-safe v7.4.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling syn v3.0.10
+   Compiling jobserver v0.1.35
+   Compiling cc v1.11.3
+   Compiling digest v0.10.7
+   Compiling cfg-if v1.0.5
+   Compiling memchr v2.8.3
+   Compiling cpufeatures v0.2.17
+   Compiling serde_derive v1.0.229
+   Compiling itoa v1.0.19
+   Compiling zstd-sys v2.1.3+zstd.1.5.7
+   Compiling sha2 v0.10.9
+   Compiling chem v0.1.0 (/home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem)
+warning: value assigned to `charge` is never read
+   --> /home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem/src/lib.rs:123:39
+    |
+123 |                 let mut charge: i32 = 0;
+    |                                       ^ this value is reassigned later and never used
+...
+173 |                 charge = explicit.unwrap_or(plus - minus);
+    |                 ----------------------------------------- `charge` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `k` is never read
+   --> /home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem/src/lib.rs:142:29
+    |
+135 | ...                   k += 2;
+    |                       ------ `k` is overwritten here before the previous value is read
+...
+142 | ...                   k += 1;
+    |                       ^^^^^^ this value is reassigned later and never used
+
+warning: value assigned to `k` is never read
+   --> /home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-chem/src/lib.rs:135:29
+    |
+128 |                     k += 1;
+    |                     ------ `k` is overwritten here before the previous value is read
+...
+135 |                             k += 2;
+    |                             ^^^^^^ this value is reassigned later and never used
+
+warning: `chem` (lib) generated 3 warnings
+   Compiling zstd v0.13.5
+   Compiling binvec v0.1.0 (/home/runner/work/mass-spec-cpu/mass-spec-cpu/rust-bitvec)
+warning: variable does not need to be mutable
+    --> src/main.rs:1262:9
+     |
+1262 |     let mut lines = stdin.lock().lines();
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `ROUTER_LIB` is never used
+  --> src/main.rs:63:7
+   |
+63 | const ROUTER_LIB: f64 = 0.5;
+   |       ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `ROUTER_BIN` is never used
+  --> src/main.rs:64:7
+   |
+64 | const ROUTER_BIN: f64 = 0.4;
+   |       ^^^^^^^^^^
+
+warning: constant `ROUTER_BINW` is never used
+  --> src/main.rs:65:7
+   |
+65 | const ROUTER_BINW: f64 = 0.4;
+   |       ^^^^^^^^^^^
+
+warning: constant `CASCADE_Z` is never used
+  --> src/main.rs:66:7
+   |
+66 | const CASCADE_Z: f64 = 3.0;
+   |       ^^^^^^^^^
+
+warning: associated function `neutral` is never used
+   --> src/main.rs:588:8
+    |
+587 | impl EngineParams {
+    | ----------------- associated function in this implementation
+588 |     fn neutral(qpeak: f64, qloss: f64) -> Self {
+    |        ^^^^^^^
+
+warning: `binvec` (bin "binvec") generated 6 warnings (run `cargo fix --bin "binvec" -p binvec` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 33.69s
