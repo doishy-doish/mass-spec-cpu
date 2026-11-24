@@ -353,8 +353,7 @@ def union_selected_keys(selected) -> list:
 
     Selection is deterministic, so preloading exactly this set is identical
     to preloading everything: every key a query can touch is in the union.
-    sel layout: (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel,
-    sword_n0, sword_n1, sword_fb).
+    sel layout: (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel).
     """
     u = set()
     for sel in selected:
@@ -466,6 +465,28 @@ def mol_union_keys(selected: list) -> tuple:
     return (sorted(cand), sorted(pool))
 
 
+def sword_cut_cands(cand_keys, key2prec, qprec, ppm=8.5) -> tuple:
+    """SWORD-1b: pure prec-ppm window over candidate keys (given value 8.5ppm).
+
+    Returns (kept, n0, n1, fb). Empty-after-cut falls back to uncut (recall
+    lock); unknown-prec keys (missing/NaN) are never cut. Pure: no _SE, no
+    engine — unit-testable. Analog pool untouched (SWORD-1 pool cut collapsed
+    analog 0.17->0.08 on -n50s1: the pool IS the analog channel's working set).
+    """
+    cand_keys = list(cand_keys)
+    n0 = len(cand_keys)
+    try:
+        tol = qprec * ppm * 1e-6
+    except TypeError:
+        return cand_keys, n0, n0, None
+    kept = [k for k in cand_keys
+            if (key2prec.get(str(k)) is None
+                or abs(key2prec[str(k)] - qprec) <= tol)]
+    if kept:
+        return kept, n0, len(kept), 0.0
+    return cand_keys, n0, n0, 1.0
+
+
 def select_task(task):
     """One query's key selection (engine-free; runs in forked workers).
 
@@ -501,26 +522,6 @@ def select_task(task):
         near.append((abs(precs[idx] - prec_q), k))
     near.sort(key=lambda t: t[0])
     pool_keys = [k for _, k in near[:1500]]
-    # SWORD-1 (pure prec-ppm, given value 8.5ppm): shrink the analog pool to
-    # the query precursor window. Empty-after-cut falls back to the uncut pool
-    # (recall lock). Pool sizes + fallback flag ride the sel tuple for
-    # parent-side aggregation (fork workers can't write back to _SE).
-    # NOTE: the pool excludes candidates by construction, so "truth in pool"
-    # is structurally 0 — the real recall lock for cut 1 is that cand_keys
-    # (truth's lib path) are untouched: mrr_lib must be bit-identical on/off.
-    sword_n0, sword_n1, sword_fb = len(pool_keys), len(pool_keys), None
-    if _SE.get("sword_prec"):
-        try:
-            sword_tol = prec_q * 8.5e-6
-            sword_cut = [k for _d, k in near[:1500] if _d <= sword_tol]
-            if sword_cut:
-                pool_keys = sword_cut
-                sword_fb = 0.0
-            else:
-                sword_fb = 1.0
-            sword_n1 = len(pool_keys)
-        except Exception:
-            pass
     if _SE.get("inst_bonus"):
         try:
             pool_keys = IP.pool_rerank_by_instrument(
@@ -528,8 +529,7 @@ def select_task(task):
         except Exception:
             pass
     tsel = (time.perf_counter() - t0) * 1000.0
-    return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel,
-            sword_n0, sword_n1, sword_fb)
+    return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel)
 
 
 def assemble_row(out, truth, qi, row_order):
@@ -555,7 +555,7 @@ def score_one(sel, engine):
     sel = select_task output. Returns the standard results tuple
     (qi, row, plen, ranked_z, line, swap); never raises.
     """
-    qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel[:7]
+    qpos, qi, total, cand_keys, pool_keys, prec_q, tsel = sel
     V_ = _SE["variants"]
     if _SE.get("erun"):
         # E1: row-ref + keys only — the engine owns the spectra.
@@ -628,7 +628,7 @@ def main() -> None:
     ap.add_argument("--loss-gate", type=int, default=0,
                     help="1 = demote candidates failing diagnostic-loss/subformula gate (R2)")
     ap.add_argument("--sword-prec", type=int, default=0,
-                    help="1 = SWORD-1 pure prec-ppm analog-pool cut at 8.5ppm (recall-locked fallback)")
+                    help="1 = SWORD-1b pure prec-ppm candidate cut at 8.5ppm (recall-locked fallback)")
     ap.add_argument("--formula-ppm", type=float, default=0.0,
                     help="0 = off; else formula-gate primitive ppm (wiring-ready for COCONUT/fingerprint lane)")
     ap.add_argument("--out", required=True)
@@ -829,6 +829,16 @@ def main() -> None:
     lib_pkeys = [k for _, k in _prec_pairs]
 
     key2neutral = {str(k): float(v) for k, v in zip(skeys.tolist(), masses.tolist())}
+    # SWORD-1b: first-occurrence precursor per key (mirrors key2inst
+    # convention; NaN precisions skipped so unknown-prec candidates are
+    # never cut). Transient dict, freed with T after precompute.
+    _k14s = [str(k) for k in T["key14"].tolist()]
+    _kprs = [float(x) for x in T["prec"].tolist()]
+    key2prec = {}
+    for _kk, _pp in zip(_k14s, _kprs):
+        if _kk not in key2prec and _pp == _pp:
+            key2prec[_kk] = _pp
+    del _k14s, _kprs
     fusion = {"wl": a.wl, "wa": a.wa, "wf": a.wf, "rl": a.rl, "ra": a.ra,
               "rf": a.rf, "casc_z": a.casc_z, "rout_lib": a.rout_lib,
               "rout_bin": a.rout_bin, "rout_binw": a.rout_binw,
@@ -854,7 +864,6 @@ def main() -> None:
                    qinst={qi: str(T["instrument"][int(qi)]) for qi in qset},
                    key2inst=key2inst,
                    inst_bonus=bool(a.inst_bonus),
-                   sword_prec=bool(a.sword_prec),
                    adduct_retry=bool(a.adduct_retry),
                    mass_replace=bool(a.mass_replace),
                    formula_ppm=float(a.formula_ppm or 0.0),
@@ -871,7 +880,6 @@ def main() -> None:
                    qinst={qi: str(T["instrument"][qi]) for qi in qset},
                    key2inst=key2inst,
                    inst_bonus=bool(a.inst_bonus),
-                   sword_prec=bool(a.sword_prec),
                    adduct_retry=bool(a.adduct_retry),
                    mass_replace=bool(a.mass_replace),
                    formula_ppm=float(a.formula_ppm or 0.0),
@@ -883,14 +891,39 @@ def main() -> None:
             selected = list(ex.map(select_task, tasks))
     else:
         selected = [select_task(t) for t in tasks]
+    # SWORD-1b: pure prec-ppm candidate cut (parent-side: needs key2prec).
+    # Analog pool untouched (SWORD-1 pool cut killed analog 0.17->0.08).
+    _sword_c0 = _sword_c1 = 0
+    _sword_fb = 0.0
+    _sword_fn = 0
+    if a.sword_prec:
+        _cut_sel = []
+        _qp = _SE.get("qprec") or {}
+        for _s in selected:
+            if _s is None or len(_s) <= 3:
+                _cut_sel.append(_s)
+                continue
+            _qq = _qp.get(_s[1])
+            if _qq is None:
+                _cut_sel.append(_s)
+                continue
+            _kc, _n0, _n1, _fb = sword_cut_cands(_s[3], key2prec, float(_qq))
+            _sword_c0 += _n0
+            _sword_c1 += _n1
+            _sword_fn += 1
+            if _fb is not None:
+                _sword_fb += _fb
+            _sl = list(_s)
+            _sl[3] = _kc
+            _cut_sel.append(tuple(_sl))
+        selected = _cut_sel
     union = union_selected_keys(selected)
     sub = subset_lib(lib_by_key, union)
     # M217: silent-skip coverage heartbeat. The engine SKIPS keys absent from
     # the preload with no error, so a coverage hole reads as MRR 0.00, not a
     # crash (C3-RED: 463/463 zeros, pools non-empty). Count it here, where
     # the keys still exist to be counted. sel layout (qpos,qi,total,cand,pool,
-    # prec,tsel,sword_n0,sword_n1,sword_fb) copied from select_task
-    # (M212-class: producer is source).
+    # prec,tsel) copied from select_task (M212-class: producer is source).
     _subkeys = set(sub)
     _ncand = _npool = _hit = 0
     for _sel in selected:
@@ -904,11 +937,7 @@ def main() -> None:
             _npool += 1
             if _k in _subkeys:
                 _hit += 1
-    # SWORD-1 aggregation: mean pool sizes + fallback rate (None = cut off;
-    # excluded from the fallback mean).
-    _sw0 = [_s[7] for _s in selected if _s is not None and len(_s) > 9]
-    _sw1 = [_s[8] for _s in selected if _s is not None and len(_s) > 9]
-    _swf = [_s[9] for _s in selected if _s is not None and len(_s) > 9 and _s[9] is not None]
+    # SWORD-1b: candidate cut applied parent-side before union (see above).
     _truths = [str(_SE["qkey"][int(_qi)]) for _, _qi, _ in tasks]
     _tin = sum(1 for _t in _truths if _t in _subkeys)
     print("coverage truth_in_union=" + str(_tin) + "/" + str(len(_truths))
@@ -1009,9 +1038,9 @@ def main() -> None:
            "mass_swap_rate": _avg(swaps),
            "truth_in_union": _tin, "keys_in_lib": _hit,
            "sword_on": bool(a.sword_prec),
-           "sword_pool0": (sum(_sw0) / len(_sw0)) if _sw0 else 0.0,
-           "sword_pool1": (sum(_sw1) / len(_sw1)) if _sw1 else 0.0,
-           "sword_fb_rate": (sum(_swf) / len(_swf)) if _swf else None,
+           "sword_cand0": _sword_c0,
+           "sword_cand1": _sword_c1,
+           "sword_fb_rate": (_sword_fb / _sword_fn) if _sword_fn else None,
            "keys_total": _ncand + _npool, "n_truths": len(_truths),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
