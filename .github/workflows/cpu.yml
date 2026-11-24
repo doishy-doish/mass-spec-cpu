@@ -74,7 +74,7 @@ on:
         default: "0"
       erun:
         description: "E1 engine-owned store: engine resolves spectra from slim (0/1; needs slim cache, else falls back)"
-        default: "0"
+        default: "1"
       sword-prec:
         description: "SWORD-1b pure prec-ppm candidate cut at 8.5ppm (0/1; recall-locked fallback)"
         default: "0"
@@ -127,15 +127,22 @@ jobs:
             exit 1
           fi
           test -x "$GITHUB_WORKSPACE/rust-bitvec/target/release/binvec" || { echo "ENGINE BINARY MISSING"; ls -la "$GITHUB_WORKSPACE/rust-bitvec/target/release/" | head -20; exit 1; }
+      - name: restore slim cache (miss = parquet fallback, lossless)
+        if: ${{ inputs.task == 'validate' || inputs.task == 'predict' }}
+        id: slimcache
+        uses: actions/cache@v4
+        with:
+          path: data/slim
+          key: slim-store-v1
       - name: restore data cache
-        if: ${{ inputs.task != 'gates' }}
+        if: ${{ inputs.task != 'gates' && steps.slimcache.outputs.cache-hit != 'true' }}
         id: datacache
         uses: actions/cache@v4
         with:
           path: data
           key: casmi26-data-v1
       - name: download competition data
-        if: ${{ inputs.task != 'gates' && steps.datacache.outputs.cache-hit != 'true' }}
+        if: ${{ inputs.task != 'gates' && steps.datacache.outputs.cache-hit != 'true' && steps.slimcache.outputs.cache-hit != 'true' }}
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
@@ -149,12 +156,6 @@ jobs:
       - run: pip install -q pytest zstandard && python -m pytest -q tests/
         env:
           PYTHONPATH: src
-      - name: restore slim cache (miss = parquet fallback, lossless)
-        if: ${{ inputs.task == 'validate' || inputs.task == 'predict' }}
-        uses: actions/cache@v4
-        with:
-          path: data/slim
-          key: slim-store-v1
       - name: build slim store (one-time convert, then cached)
         if: ${{ inputs.task == 'slimbuild' }}
         run: PYTHONPATH=src python scripts/build_slim.py --train data/train.parquet --rust-bin rust-bitvec/target/release/binvec --out data/slim
