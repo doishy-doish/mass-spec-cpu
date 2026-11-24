@@ -173,7 +173,7 @@ jobs:
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         timeout-minutes: 60  # backend auto-cancels hung masks; no manual deadman kills
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --sword-prec "${{ inputs.sword-prec }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
+        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --sword-prec "${{ inputs.sword-prec }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --formula-ppm 0 --mol-rrf 0 --tta 0 --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
       - name: smart probe (GREEN / RED / INFRA — never ships blind, never cries code-bug on host death)
         if: ${{ always() && inputs.task == 'validate' }}
         env:
@@ -265,12 +265,12 @@ jobs:
           n = out.get("n", 0)
           need(isinstance(n, int) and n >= min(10, nreq), f"n too small ({n} < min(10,{nreq})) — queries never ran")
           rrs = out.get("rrs", {})
-          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw","pure","libce","ent","gate"},
+          need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw","pure","libce","ent","gate","cleav","fp","entw","lgbma","lgbmb","lgbmc"},
                f"variants incomplete ({sorted(rrs.keys())}) — a channel never returned")
           for v, arr in rrs.items():
               need(len(arr) == n, f"rrs[{v}] len {len(arr)} != n {n}")
           # 2. score fields present + sane (catches silent NaN/zero collapse)
-          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw","mrr_pure","mrr_libce","mrr_ent","mrr_gate"]
+          mkeys = ["mrr","mrr_lib","mrr_analog","mrr_frag","mrr_rrf","mrr_cascade","mrr_bin","mrr_rrfb","mrr_binw","mrr_router","mrr_stein","mrr_mass","mrr_zw","mrr_rrfw","mrr_pure","mrr_libce","mrr_ent","mrr_gate","mrr_cleav","mrr_fp","mrr_entw","mrr_lgbma","mrr_lgbmb","mrr_lgbmc"]
           for k in mkeys:
               v = out.get(k)
               need(isinstance(v,(int,float)) and v==v and 0.0 <= v <= 1.0, f"{k} insane ({v!r})")
@@ -323,7 +323,7 @@ jobs:
               need(out.get("pool_parity_rate") == 1.0, f"pool parity {out.get('pool_parity_rate')} != 1.0 nulls={out.get('pool_parity_nulls')} — engine pools != Python pools")
           if red:
               emit("RED", red)
-          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}" + (f" sword=on cand={out.get('sword_cand0')}/{out.get('sword_cand1')} fb={out.get('sword_fb_rate')}" if out.get("sword_on") else "") + f" qhit_lib={out.get('qhit_lib')} qhit_z={out.get('qhit_z')}" + (f" poolcheck={out.get('pool_parity_rate')} n={out.get('pool_parity_n')} nulls={out.get('pool_parity_nulls')}" if out.get("pool_parity_n") else "")])
+          emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} cleav={out.get('mrr_cleav'):.4f} fp={out.get('mrr_fp'):.4f} entw={out.get('mrr_entw'):.4f} lgbmb={out.get('mrr_lgbmb'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}" + (f" sword=on cand={out.get('sword_cand0')}/{out.get('sword_cand1')} fb={out.get('sword_fb_rate')}" if out.get("sword_on") else "") + f" qhit_lib={out.get('qhit_lib')} qhit_z={out.get('qhit_z')}" + (f" poolcheck={out.get('pool_parity_rate')} n={out.get('pool_parity_n')} nulls={out.get('pool_parity_nulls')}" if out.get("pool_parity_n") else "")])
           PY
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
