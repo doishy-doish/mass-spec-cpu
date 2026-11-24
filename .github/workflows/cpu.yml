@@ -122,6 +122,10 @@ jobs:
           (cd rust-chem && cargo test --release > /tmp/bcapture/chem-test.log 2>&1); T2=$?
           tail -3 /tmp/bcapture/chem-test.log
           if [ $B1 -ne 0 ] || [ $T1 -ne 0 ] || [ $B2 -ne 0 ] || [ $T2 -ne 0 ]; then
+            echo "===== binvec-build errors ====="
+            grep -B2 -A18 "^error" /tmp/bcapture/binvec-build.log | head -80
+            echo "===== binvec-test errors ====="
+            grep -B2 -A18 "^error" /tmp/bcapture/binvec-test.log | head -40
             cp /tmp/bcapture/*.log results/
             echo "BUILD FAILED B1=$B1 T1=$T1 B2=$B2 T2=$T2 (full logs committed to results/)"
             exit 1
