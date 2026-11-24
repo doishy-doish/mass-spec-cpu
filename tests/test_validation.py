@@ -2,7 +2,8 @@
 
 Locks split identity vs the old DataFrame implementation: sorted eligible
 sets, first-occurrence key order, one-query-per-key on class2, full holdout
-on class3, instrument-gated stays on cross.
+on class3, full holdout of held keys on cross (PHONEBOOK-STRIP 2026-11-24:
+no test-molecule spectrum anywhere in any library).
 """
 import sys
 sys.path.insert(0, "src")
@@ -38,6 +39,9 @@ def test_class2_one_query_per_held_key():
     assert not (set(queries) & set(lib))
     # k3 has 1 spectrum and is out of pool: never held
     assert "k3" not in held
+    # PHONEBOOK-STRIP: no held key keeps ANY spectrum in the library
+    libkeys = set(str(T["key14"][i]) for i in lib)
+    assert not (set(held) & libkeys)
 
 
 def test_class3_full_holdout():
@@ -50,10 +54,13 @@ def test_class3_full_holdout():
     assert not (hkeys & libkeys)
 
 
-def test_cross_keeps_other_instrument_stays():
+def test_cross_full_holdout_of_held_keys():
     T = _table()
     pool = V.query_pool(T, instrument_regex="timsTOF").tolist()
     lib, queries, held = V.split_cross_instrument(T, pool, n_struct=2, seed=1)
     # held keys must all have a non-timsTOF spectrum somewhere (k3 qualifies)
     assert set(held) <= {"k1", "k2", "k3", "k4"}
     assert not (set(queries) & set(lib))
+    # PHONEBOOK-STRIP: other-instrument stays are gone too
+    libkeys = set(str(T["key14"][i]) for i in lib)
+    assert not (set(held) & libkeys)
