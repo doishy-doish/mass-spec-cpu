@@ -24,6 +24,12 @@ jobs:
       fail-fast: false
       matrix:
         shard: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"]
+        # 20x5 variant branches (method-light, no fitting): every validate run
+        # scores all 24 variants; the branch selects the BENCH lens via suffix
+        # flags (25-input cap: flags ride the suffix, run.py parses them).
+        # base = computed-only; molrrf = Q3b consensus; tta = Q7 augmentation;
+        # both = Q3b+Q7; loss = lossgate demotion probe.
+        branch: ["base", "molrrf", "tta", "both", "loss"]
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -80,10 +86,26 @@ jobs:
           key: slim-store-v1
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
-        run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ matrix.shard }}" --shards "20" --jobs "5" --out results/${{ inputs.mask }}-${{ matrix.shard }}.json
+        run: |
+          case "${{ matrix.branch }}" in
+            molrrf) SUFFIX="-fleet${{ matrix.shard }}molrrf"; LOSSGATE=0 ;;
+            tta) SUFFIX="-fleet${{ matrix.shard }}tta"; LOSSGATE=0 ;;
+            both) SUFFIX="-fleet${{ matrix.shard }}molrrf-tta"; LOSSGATE=0 ;;
+            loss) SUFFIX="-fleet${{ matrix.shard }}loss"; LOSSGATE=1 ;;
+            *) SUFFIX="-fleet${{ matrix.shard }}"; LOSSGATE=0 ;;
+          esac
+          PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ matrix.shard }}" --shards "20" --jobs "5" --out-suffix="$SUFFIX" --loss-gate "$LOSSGATE" --formula-ppm 0 --mol-rrf 0 --tta 0 --out results/${{ inputs.mask }}-${{ matrix.shard }}-${{ matrix.branch }}.json
       - name: run predict
         if: ${{ inputs.task == 'predict' }}
-        run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
+        run: |
+          case "${{ matrix.branch }}" in
+            molrrf) VARIANT="lgbmb"; MOLRRF=1 ;;
+            tta) VARIANT="lgbmb"; MOLRRF=1 ;;
+            both) VARIANT="lgbmb"; MOLRRF=1 ;;
+            loss) VARIANT="lgbmb"; MOLRRF=1 ;;
+            *) VARIANT="lgbmb"; MOLRRF=1 ;;
+          esac
+          PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --variant "$VARIANT" --mol-rrf "$MOLRRF" --out results/predict-${{ matrix.shard }}-${{ matrix.branch }}.json
       - name: scramble + commit
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
@@ -92,6 +114,6 @@ jobs:
           git config user.name "mscpu"
           git config user.email "mscpu@users.noreply.github.com"
           git add results/
-          git diff --cached --quiet || git commit -m "cpu-fleet ${{ inputs.task }}-${{ inputs.mask }} shard ${{ matrix.shard }} $(date -u +%F)"
+          git diff --cached --quiet || git commit -m "cpu-fleet ${{ inputs.task }}-${{ inputs.mask }} shard ${{ matrix.shard }} branch ${{ matrix.branch }} $(date -u +%F)"
           git pull --rebase origin main
           git push
