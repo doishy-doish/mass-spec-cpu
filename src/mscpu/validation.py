@@ -36,7 +36,7 @@ def query_pool(T: dict, instrument_regex: str = "timsTOF",
 
 
 def split_class2(T: dict, pool_idx, n_queries: int = 400, seed: int = 0,
-                 min_count: int = 2):
+                 min_count: int = 2, phonebook: bool = False):
     """Structure stays via OTHER spectra; one query spectrum per key (keys with >=2)."""
     rng = np.random.default_rng(seed)
     allk = np.asarray(T["key14"], dtype=str)
@@ -55,12 +55,20 @@ def split_class2(T: dict, pool_idx, n_queries: int = 400, seed: int = 0,
     # entirely — every spectrum of a test molecule, not just the query rows.
     # held/qrows use the identical RNG stream as before, so the query set is
     # unchanged; only library composition changes (tin -> 0, exact MRRs -> 0).
-    heldset = set(held)
-    library = [i for i in range(len(allk)) if str(allk[i]) not in heldset]
+    # PHONEBOOK-ARM (-pb suffix): phonebook=True keeps held keys IN the
+    # library — measures what the restored lib retrieves on overlap. The RNG
+    # stream above is untouched, so the query set is byte-identical to the
+    # honest arm; only library composition differs.
+    if phonebook:
+        library = list(range(len(allk)))
+    else:
+        heldset = set(held)
+        library = [i for i in range(len(allk)) if str(allk[i]) not in heldset]
     return library, qrows, sorted(held)
 
 
-def split_class3(T: dict, pool_idx, n_struct: int = 400, seed: int = 0):
+def split_class3(T: dict, pool_idx, n_struct: int = 400, seed: int = 0,
+                 phonebook: bool = False):
     """Every spectrum of held structures leaves the library."""
     rng = np.random.default_rng(seed)
     allk = np.asarray(T["key14"], dtype=str)
@@ -68,12 +76,16 @@ def split_class3(T: dict, pool_idx, n_struct: int = 400, seed: int = 0):
     held = set(rng.choice(keys, size=min(n_struct, len(keys)),
                         replace=False).tolist())
     qrows = [int(i) for i in pool_idx if str(allk[int(i)]) in held]
-    library = [i for i in range(len(allk)) if str(allk[i]) not in held]
+    if phonebook:
+        library = list(range(len(allk)))
+    else:
+        library = [i for i in range(len(allk)) if str(allk[i]) not in held]
     return library, qrows, sorted(held)
 
 
 def split_cross_instrument(T: dict, pool_idx, n_struct: int = 400, seed: int = 0,
-                           instrument_regex: str = "timsTOF"):
+                           instrument_regex: str = "timsTOF",
+                           phonebook: bool = False):
     """Harsh class 2: query structure's timsTOF spectra held; stays via other instruments."""
     rng = np.random.default_rng(seed)
     allk = np.asarray(T["key14"], dtype=str)
@@ -88,6 +100,11 @@ def split_cross_instrument(T: dict, pool_idx, n_struct: int = 400, seed: int = 0
     # entirely — every spectrum of a test molecule, not just the query rows.
     # held/qrows use the identical RNG stream as before, so the query set is
     # unchanged; only library composition changes (tin -> 0, exact MRRs -> 0).
-    heldset = set(held)
-    library = [i for i in range(len(allk)) if str(allk[i]) not in heldset]
+    # PHONEBOOK-ARM (-pb suffix): phonebook=True keeps held keys IN the
+    # library (same byte-identical query guarantee as class2).
+    if phonebook:
+        library = list(range(len(allk)))
+    else:
+        heldset = set(held)
+        library = [i for i in range(len(allk)) if str(allk[i]) not in heldset]
     return library, qrows, sorted(held)
