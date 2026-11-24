@@ -1,4 +1,2 @@
-RED
-phonebook arm: out phonebook flag missing — arm never engaged
-phonebook arm: truth_in_union==0 — exclusion still active, arm measured nothing
-phonebook arm: mrr_lib 0.0 <= 0.5 — restored lib not retrieving
+GREEN
+results/class2-0-h50-pb.json engine=rust n=50 mrr=0.8362 lib=1.0000 analog=0.1696 stein=1.0000 mass=0.1019 cleav=0.4418 fp=0.0000 entw=0.0548 lgbmb=0.5288 zw=0.8362 swap=0.000 pure=0.8819 libce=1.0000 ent=1.0000 gate=0.0548 qhit_lib=11111111111111111111111111111111111111111111111111 qhit_z=11111111111111111111111111111111111111111111111111
