@@ -311,9 +311,18 @@ jobs:
           # 0.087 vs 0.17 banked) — hard checks above still gate, lane gates need n.
           if n >= 25:
               _pb = "-pb" in (os.environ.get("SUFFIX","") or "")
-              if mask == "class2" and not _pb:
+              _t2 = "-t2" in (os.environ.get("SUFFIX","") or "")
+              if _pb and _t2:
+                  need(False, "probe misuse: -pb and -t2 are exclusive arms (overlap vs true-novelty)")
+              if _t2 and mask != "class2":
+                  need(False, f"probe misuse: -t2 is class2-only (mask={mask})")
+              if mask == "class2" and not _pb and not _t2:
                   need(out.get("truth_in_union", -1) == 0, f"class2 phonebook: truth_in_union={out.get('truth_in_union')} — held spectra in library (strip broken)")
                   need(out.get("mrr_lib",1) < 0.2, f"class2 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
+              elif mask == "class2" and _t2:
+                  need(out.get("true2", False) == True, "true-class2 arm: out true2 flag missing — arm never engaged (M253 class?)")
+                  need(out.get("truth_in_union", -1) == 0, f"true-class2: truth_in_union={out.get('truth_in_union')} > 0 — held SPECTRA leaked, arm measures overlap not novelty")
+                  # NO lib ceiling here: mrr_lib IS the measurement (unseen exact MRR@25).
               elif mask == "class2" and _pb:
                   need(out.get("phonebook", False) == True, "phonebook arm: out phonebook flag missing — arm never engaged")
                   need(out.get("truth_in_union", -1) > 0, "phonebook arm: truth_in_union==0 — exclusion still active, arm measured nothing")
