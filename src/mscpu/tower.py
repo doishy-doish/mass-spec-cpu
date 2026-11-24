@@ -50,6 +50,20 @@ def _l2(x):
     return x / n if n > 0 else x
 
 
+def words_to_bits01(words32):
+    """32 uint64 words -> 2048 {0,1} floats, engine bit order: bit j lives
+    at word j//64, LSB position j%64 (same convention as fp_forward and
+    train_fp.py label recovery). Loud on wrong length."""
+    w = [int(x) for x in list(words32)]
+    if len(w) != 32:
+        raise ValueError("words_to_bits01 needs 32 words, got %d" % len(w))
+    out = np.zeros(MOL_IN, dtype=np.float64)
+    for j in range(MOL_IN):
+        if (w[j // 64] >> (j % 64)) & 1:
+            out[j] = 1.0
+    return out
+
+
 def forward_q(x, W1, b1, W2, b2):
     """Spectrum tower -> L2 unit vector (D,)."""
     h = _relu(np.asarray(x, dtype=np.float64).reshape(-1) @ W1 + b1)
@@ -57,8 +71,15 @@ def forward_q(x, W1, b1, W2, b2):
 
 
 def forward_c(bits01, V1, c1, V2, c2):
-    """Structure tower: 2048 {0,1} bits -> {-1,+1} -> L2 unit vector (D,)."""
-    v = np.asarray(bits01, dtype=np.float64).reshape(-1) * 2.0 - 1.0
+    """Structure tower -> L2 unit vector (D,). Accepts 2048 {0,1} bits or
+    32 uint64 words (quality.morgan_bits output — expanded via
+    words_to_bits01). Bits map {-1,+1}. Anything else raises LOUD."""
+    v = np.asarray(bits01).reshape(-1)
+    if v.shape[0] == 32:
+        v = words_to_bits01([int(x) for x in v])
+    elif v.shape[0] != MOL_IN:
+        raise ValueError("forward_c needs 32 words or 2048 bits, got %d" % v.shape[0])
+    v = np.asarray(v, dtype=np.float64) * 2.0 - 1.0
     h = _relu(v @ V1 + c1)
     return _l2(h @ V2 + c2)
 
