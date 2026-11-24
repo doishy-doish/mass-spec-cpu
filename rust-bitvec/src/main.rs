@@ -658,6 +658,33 @@ struct EngineIn {
     preload: Option<PreloadChunk>,
     #[serde(default)]
     preload_done: Option<bool>,
+    /// E2-pool parity: engine-side mirror of run.py select_task selection.
+    /// Python sends one per selected query; the engine rebuilds the neutral
+    /// window + analog pool from its slim store and returns both lists.
+    /// qrows (class2/cross) or held keys (class3) define the library split.
+    #[serde(default)]
+    pool_check: Option<PoolCheck>,
+}
+
+#[derive(Deserialize)]
+struct PoolCheck {
+    qnm: Option<f64>,
+    prec_q: f64,
+    ppm: f64,
+    mask: String,
+    qrows: Vec<usize>,
+    held: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PoolCheckOut {
+    cand_keys: Vec<String>,
+    pool_keys: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PoolCheckReply {
+    pool_check: Option<PoolCheckOut>,
 }
 
 #[derive(Serialize)]
@@ -741,6 +768,96 @@ fn build_key_maps(
         }
     }
     (rows, pos)
+}
+
+/// E2-pool: neutral-sorted + prec-sorted library views, built once per split.
+/// Mirrors run.py select_task inputs: neutral arrays cover ALL store keys
+/// (byte-sorted, stable NaN-last = numpy stable argsort over sorted ukeys);
+/// prec arrays cover LIBRARY keys only (first library-row prec per key,
+/// stable sort by prec, ties in key-index order = Python key_idx grouping).
+/// ASSUMPTIONS (bench-arbitrated, pool parity key-for-key): store keys ==
+/// table keys; builder per-key neutral == structs median; slim row order ==
+/// parquet row order; slim prec bit-identical to parquet prec.
+struct PoolArrays {
+    masses: Vec<f64>,
+    skeys: Vec<String>,
+    precs: Vec<f64>,
+    pkeys: Vec<String>,
+}
+
+fn build_pool_arrays(
+    st: &slim::SlimStore,
+    pos: &std::collections::HashMap<String, usize>,
+    mask: &str,
+    qrows: &[usize],
+    held: &[String],
+) -> PoolArrays {
+    // neutral view: all keys.
+    let mut keys_sorted: Vec<String> = st.keys.clone();
+    keys_sorted.sort();
+    let mut neut: Vec<(f64, String)> = keys_sorted
+        .into_iter()
+        .map(|k| {
+            let n = pos
+                .get(&k)
+                .and_then(|&p| st.neutrals[p])
+                .filter(|v| *v == *v);
+            (n.unwrap_or(f64::NAN), k)
+        })
+        .collect();
+    neut.sort_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
+        (false, false) => a
+            .0
+            .partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        (true, true) => std::cmp::Ordering::Equal,
+    });
+    // stable: equal/NaN keep byte-sorted key order = numpy stable semantics.
+    let masses: Vec<f64> = neut.iter().map(|(n, _)| *n).collect();
+    let skeys: Vec<String> = neut.into_iter().map(|(_, k)| k).collect();
+    // prec view: library keys only. class2/cross exclude query ROWS;
+    // class3 excludes held KEYS (mirrors validation.split_* exactly).
+    let row_excl: std::collections::HashSet<usize> = qrows.iter().copied().collect();
+    let key_excl: std::collections::HashSet<&str> =
+        held.iter().map(|x| x.as_str()).collect();
+    let mut first: std::collections::HashMap<usize, (f64, String)> =
+        std::collections::HashMap::new();
+    for (r, ki) in st.key_idx.iter().enumerate() {
+        let ki = *ki as usize;
+        let k = match st.keys.get(ki) {
+            Some(k) => k,
+            None => continue,
+        };
+        let excluded = if mask == "class2" || mask == "cross" {
+            row_excl.contains(&r)
+        } else {
+            key_excl.contains(k.as_str())
+        };
+        if excluded {
+            continue;
+        }
+        first.entry(ki).or_insert((st.prec[r], k.clone()));
+    }
+    let mut pairs: Vec<(usize, f64, String)> = first
+        .into_iter()
+        .map(|(ki, (p, k))| (ki, p, k))
+        .collect();
+    pairs.sort_by_key(|(ki, _, _)| *ki);
+    pairs.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // stable: prec ties keep key-index order = Python key_idx grouping order.
+    let precs: Vec<f64> = pairs.iter().map(|(_, p, _)| *p).collect();
+    let pkeys: Vec<String> = pairs.into_iter().map(|(_, _, k)| k).collect();
+    PoolArrays {
+        masses,
+        skeys,
+        precs,
+        pkeys,
+    }
 }
 
 /// E1: build one TableEntry straight from the slim store (same floats the
@@ -1274,6 +1391,8 @@ fn sengine(params: EngineParams) {
     let mut slim_store: Option<slim::SlimStore> = None;
     let mut slim_rows: HashMap<String, Vec<usize>> = HashMap::new();
     let mut slim_pos: HashMap<String, usize> = HashMap::new();
+    // E2-pool: cached library views, rebuilt when the split changes.
+    let mut pool_cache: Option<(String, Vec<usize>, Vec<String>, PoolArrays)> = None;
     if let Some(dir) = params.store.clone() {
         let st = slim::load_slim(std::path::Path::new(&dir));
         let (rows, pos) = build_key_maps(&st);
@@ -1311,6 +1430,69 @@ fn sengine(params: EngineParams) {
         }
         if m.preload_done.unwrap_or(false) {
             writeln!(h, "{}", serde_json::to_string(&Ready { ready: true }).unwrap()).unwrap();
+            h.flush().unwrap();
+            continue;
+        }
+        // E2-pool parity: engine rebuilds neutral window + analog pool from
+        // its slim store and returns both lists. Python compares against its
+        // own select_task output (pool_check flag); selection stays Python's.
+        if let Some(pc) = m.pool_check {
+            let reply = match slim_store.as_ref() {
+                None => PoolCheckReply { pool_check: None },
+                Some(st) => {
+                    let same = match &pool_cache {
+                        Some((km, kq, kh, _))
+                            if *km == pc.mask && *kq == pc.qrows && *kh == pc.held =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        let arr = build_pool_arrays(
+                            st,
+                            &slim_pos,
+                            &pc.mask,
+                            &pc.qrows,
+                            &pc.held,
+                        );
+                        pool_cache = Some((
+                            pc.mask.clone(),
+                            pc.qrows.clone(),
+                            pc.held.clone(),
+                            arr,
+                        ));
+                    }
+                    let arrays = &pool_cache.as_ref().expect("pool cache built").3;
+                    // qnm None or empty window mirrors select_task's None.
+                    let out = pc.qnm.and_then(|qnm| {
+                        let (_, _, ck) = boundary::ppm_window(
+                            &arrays.masses,
+                            &arrays.skeys,
+                            qnm,
+                            pc.ppm,
+                        );
+                        if ck.is_empty() {
+                            return None;
+                        }
+                        let cs: std::collections::HashSet<String> =
+                            ck.iter().cloned().collect();
+                        let pool = boundary::analog_window(
+                            &arrays.precs,
+                            &arrays.pkeys,
+                            pc.prec_q,
+                            &cs,
+                            1500,
+                        );
+                        Some(PoolCheckOut {
+                            cand_keys: ck,
+                            pool_keys: pool,
+                        })
+                    });
+                    PoolCheckReply { pool_check: out }
+                }
+            };
+            writeln!(h, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
             h.flush().unwrap();
             continue;
         }
