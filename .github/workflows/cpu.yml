@@ -280,7 +280,7 @@ jobs:
         if: ${{ inputs.task == 'predict' }}
         run: PYTHONPATH=src python -m mscpu.predict --train data/train.parquet --test data/test.parquet --out results/predict.json
       - name: scramble + commit
-        if: ${{ inputs.task != 'gates' }}
+        if: ${{always() && inputs.task != 'gates' }}
         env:
           SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
         run: |
