@@ -85,7 +85,7 @@ def test_variants_complete():
     from mscpu import run as R
     assert set(R.VARIANTS) == {"z", "lib", "analog", "frag", "rrf", "cascade",
                                "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure",
-                               "libce", "ent", "gate"}
+                               "libce", "ent", "gate", "cleav", "fp", "entw", "lgbma", "lgbmb", "lgbmc"}
 
 def test_fusion_defaults_neutral():
     from mscpu import run as R
