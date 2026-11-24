@@ -354,7 +354,7 @@ def union_selected_keys(selected) -> list:
     Selection is deterministic, so preloading exactly this set is identical
     to preloading everything: every key a query can touch is in the union.
     sel layout: (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel,
-    sword_n0, sword_n1, sword_surv).
+    sword_n0, sword_n1, sword_fb).
     """
     u = set()
     for sel in selected:
@@ -503,19 +503,22 @@ def select_task(task):
     pool_keys = [k for _, k in near[:1500]]
     # SWORD-1 (pure prec-ppm, given value 8.5ppm): shrink the analog pool to
     # the query precursor window. Empty-after-cut falls back to the uncut pool
-    # (recall lock). Pool sizes + truth survival ride the sel tuple for
+    # (recall lock). Pool sizes + fallback flag ride the sel tuple for
     # parent-side aggregation (fork workers can't write back to _SE).
-    sword_n0, sword_n1, sword_surv = len(pool_keys), len(pool_keys), None
+    # NOTE: the pool excludes candidates by construction, so "truth in pool"
+    # is structurally 0 — the real recall lock for cut 1 is that cand_keys
+    # (truth's lib path) are untouched: mrr_lib must be bit-identical on/off.
+    sword_n0, sword_n1, sword_fb = len(pool_keys), len(pool_keys), None
     if _SE.get("sword_prec"):
         try:
             sword_tol = prec_q * 8.5e-6
             sword_cut = [k for _d, k in near[:1500] if _d <= sword_tol]
             if sword_cut:
                 pool_keys = sword_cut
-            sword_truth = (_SE.get("qkey") or {}).get(qi)
+                sword_fb = 0.0
+            else:
+                sword_fb = 1.0
             sword_n1 = len(pool_keys)
-            if sword_truth is not None:
-                sword_surv = 1.0 if str(sword_truth) in [str(_k) for _k in pool_keys] else 0.0
         except Exception:
             pass
     if _SE.get("inst_bonus"):
@@ -526,7 +529,7 @@ def select_task(task):
             pass
     tsel = (time.perf_counter() - t0) * 1000.0
     return (qpos, qi, total, cand_keys, pool_keys, prec_q, tsel,
-            sword_n0, sword_n1, sword_surv)
+            sword_n0, sword_n1, sword_fb)
 
 
 def assemble_row(out, truth, qi, row_order):
@@ -886,7 +889,7 @@ def main() -> None:
     # the preload with no error, so a coverage hole reads as MRR 0.00, not a
     # crash (C3-RED: 463/463 zeros, pools non-empty). Count it here, where
     # the keys still exist to be counted. sel layout (qpos,qi,total,cand,pool,
-    # prec,tsel,sword_n0,sword_n1,sword_surv) copied from select_task
+    # prec,tsel,sword_n0,sword_n1,sword_fb) copied from select_task
     # (M212-class: producer is source).
     _subkeys = set(sub)
     _ncand = _npool = _hit = 0
@@ -901,11 +904,11 @@ def main() -> None:
             _npool += 1
             if _k in _subkeys:
                 _hit += 1
-    # SWORD-1 aggregation: mean pool sizes + truth survival (None = cut off
-    # or truth unknown; excluded from the survival mean).
+    # SWORD-1 aggregation: mean pool sizes + fallback rate (None = cut off;
+    # excluded from the fallback mean).
     _sw0 = [_s[7] for _s in selected if _s is not None and len(_s) > 9]
     _sw1 = [_s[8] for _s in selected if _s is not None and len(_s) > 9]
-    _sws = [_s[9] for _s in selected if _s is not None and len(_s) > 9 and _s[9] is not None]
+    _swf = [_s[9] for _s in selected if _s is not None and len(_s) > 9 and _s[9] is not None]
     _truths = [str(_SE["qkey"][int(_qi)]) for _, _qi, _ in tasks]
     _tin = sum(1 for _t in _truths if _t in _subkeys)
     print("coverage truth_in_union=" + str(_tin) + "/" + str(len(_truths))
@@ -1008,7 +1011,7 @@ def main() -> None:
            "sword_on": bool(a.sword_prec),
            "sword_pool0": (sum(_sw0) / len(_sw0)) if _sw0 else 0.0,
            "sword_pool1": (sum(_sw1) / len(_sw1)) if _sw1 else 0.0,
-           "sword_surv": (sum(_sws) / len(_sws)) if _sws else None,
+           "sword_fb_rate": (sum(_swf) / len(_swf)) if _swf else None,
            "keys_total": _ncand + _npool, "n_truths": len(_truths),
            "hit1": _avg([r == 1.0 for r in rrs["z"]]),
            "hit25": _avg([r > 0 for r in rrs["z"]]),
