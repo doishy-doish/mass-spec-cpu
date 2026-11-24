@@ -14,7 +14,7 @@ on:
         description: "validate, predict, slimbuild (one-time store), train-fp (Phase 1 MLP train), or gates (checks-only: build+test, no data, no run)"
         default: "validate"
         type: choice
-        options: [validate, predict, slimbuild, train-fp, gates]
+        options: [validate, predict, slimbuild, train-fp, train-lgbm, gates]
       shard:
         description: "shard index"
         default: "0"
@@ -190,6 +190,24 @@ jobs:
           git diff --cached --quiet || git commit -m "cpu train-fp weights $(date -u +%F)"
           git pull --rebase origin main
           git push
+      - name: train lgbm ranker (Phase 2, CPU)
+        if: ${{ inputs.task == 'train-lgbm' }}
+        timeout-minutes: 60
+        env:
+          SCRAMBLE_KEY: ${{ secrets.SCRAMBLE_KEY }}
+        run: |
+          mkdir -p scratch/pairs
+          for f in results/*dump*.json; do [ -e "$f" ] || continue; node scripts/scramble.mjs decrypt "$f" --out "scratch/pairs/$(basename $f)"; done
+          PYTHONPATH=src python scripts/train_lgbm.py --glob 'scratch/pairs/*.json' --out results/train-lgbm.json --model data/lgbm_model.txt
+      - name: commit lgbm weights (acceptance only)
+        if: ${{ inputs.task == 'train-lgbm' }}
+        run: |
+          git config user.name "mscpu"
+          git config user.email "mscpu@users.noreply.github.com"
+          git add data/lgbm_model.txt
+          git diff --cached --quiet || git commit -m "cpu train-lgbm weights $(date -u +%F)"
+          git pull --rebase origin main
+          git push
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         timeout-minutes: 60  # backend auto-cancels hung masks; no manual deadman kills
@@ -352,6 +370,8 @@ jobs:
               need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
           if "poolcheck" in (os.environ.get("SUFFIX","") or ""):
               need(out.get("pool_parity_n", 0) > 0, "poolcheck suffix but parity never ran (n=0) — flag wiring broken")
+          if "-dump" in (os.environ.get("SUFFIX","") or ""):
+              need(isinstance(out.get("pairs"), list) and len(out.get("pairs")) > 0, "dump suffix but no pairs collected — dump_scores wiring broken (engine scores missing?)")
           if out.get("pool_parity_n"):
               need(out.get("pool_parity_nulls", -1) == 0, f"pool parity nulls={out.get('pool_parity_nulls')} — engine store missing, parity unmeasured")
               need(out.get("pool_parity_rate") == 1.0, f"pool parity {out.get('pool_parity_rate')} != 1.0 nulls={out.get('pool_parity_nulls')} — engine pools != Python pools")
