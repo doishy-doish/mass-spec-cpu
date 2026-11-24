@@ -652,6 +652,19 @@ def main() -> None:
             sf.write("STARTED mask=" + str(a.mask) + " shard=" + str(a.shard) + "\n")
     except Exception:
         pass
+    # PROBE-V2: engine preflight — fail loud in seconds if the build step
+    # produced no binary, instead of dying after LOAD with FileNotFoundError.
+    _bin_ok = os.path.isfile(a.rust_bin) and os.access(a.rust_bin, os.X_OK)
+    try:
+        with open(_STATUS_PATH, "a") as sf:
+            sf.write("ENGINE-UP ok=" + str(bool(_bin_ok)) + " size="
+                     + str(os.path.getsize(a.rust_bin) if _bin_ok else -1)
+                     + " path=" + str(a.rust_bin) + "\n")
+    except Exception:
+        pass
+    if not _bin_ok:
+        print("BINARY-MISSING " + str(a.rust_bin), flush=True)
+        raise SystemExit(10)
 
     S = None
     _slim_manifest = os.path.join(a.slim_dir, "manifest.json")
@@ -915,6 +928,7 @@ def main() -> None:
     except Exception:
         pass
     results = []
+    _hb_every = max(1, len(selected) // 10)
     for sel in selected:
         if sel is None:
             continue
@@ -922,6 +936,12 @@ def main() -> None:
         if res is None:
             continue
         results.append(res)
+        if len(results) % _hb_every == 0:
+            try:
+                with open(_STATUS_PATH, "a") as sf:
+                    sf.write("QUERY done=" + str(len(results)) + " of=" + str(len(selected)) + "\n")
+            except Exception:
+                pass
 
     preds: dict = {}
     rrs: dict = {v: [] for v in VARIANTS}
