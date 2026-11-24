@@ -64,3 +64,19 @@ def test_cross_full_holdout_of_held_keys():
     # PHONEBOOK-STRIP: other-instrument stays are gone too
     libkeys = set(str(T["key14"][i]) for i in lib)
     assert not (set(held) & libkeys)
+
+
+def test_phonebook_arm_same_queries_full_library():
+    T = _table()
+    pool = V.query_pool(T).tolist()
+    lib0, q0, held0 = V.split_class2(T, pool, n_queries=2, seed=0)
+    lib1, q1, held1 = V.split_class2(T, pool, n_queries=2, seed=0,
+                                     phonebook=True)
+    assert q1 == q0 and held1 == held0  # RNG untouched: query set identical
+    libkeys = set(str(T["key14"][i]) for i in lib1)
+    assert len(lib1) == len(T["key14"])  # full library, nothing excluded
+    assert set(held1) <= libkeys  # held spectra present
+    assert set(lib0) < set(lib1)  # honest arm is a strict subset
+    # default keeps the strip
+    libkeys0 = set(str(T["key14"][i]) for i in lib0)
+    assert not (set(held0) & libkeys0)
