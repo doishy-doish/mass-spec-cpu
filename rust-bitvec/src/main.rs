@@ -176,6 +176,8 @@ fn adduct_shift(a: &str) -> Option<f64> {
         // formate: M + CH2O2 - H (46.005479 - 1.007276). Was 43.990901
         // (double-subtracted proton): formate neutrals off by ~1 Da.
         "[M+CH2O2-H]-" => Some(44.998203),
+        // Q1: formate alias as written in data ([M+HCOO]- == [M+CH2O2-H]-).
+        "[M+HCOO]-" => Some(44.998203),
         "[M]+" => Some(0.0),
         _ => None,
     }
@@ -1932,6 +1934,8 @@ mod engine_tests {
         assert!(approx(adduct_shift("[M-H2O-H]-").unwrap(), -19.017841));
         // R2: formate was 43.990901 (double-subtracted proton, ~1 Da off).
         assert!(approx(adduct_shift("[M+CH2O2-H]-").unwrap(), 44.998203));
+        // Q1: HCOO alias resolves to the same shift.
+        assert!(approx(adduct_shift("[M+HCOO]-").unwrap(), 44.998203));
         assert!(approx(adduct_shift("[M]+").unwrap(), 0.0));
         assert!(approx(500.0 - adduct_shift("[M+H]+").unwrap(), 498.992724));
         assert!(adduct_shift("[NOPE]").is_none());
