@@ -1042,7 +1042,7 @@ fn fuse_molecule_rrf(
     // same contract as fuse_rank; only computed variants fuse here.
     const DEAD: [&str; 8] = ["lib", "analog", "frag", "bin", "binw", "stein", "libce", "ent"];
     for v in VARIANTS {
-        if DEAD.contains(v) {
+        if DEAD.contains(&v) {
             out.insert(v.to_string(), Vec::new());
             continue;
         }
@@ -1082,7 +1082,7 @@ fn sengine(params: EngineParams) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut h = stdout.lock();
-    let mut lines = stdin.lock().lines();
+    let lines = stdin.lock().lines();
     let e = std::io::stderr();
     let mut err = e.lock();
     // Preloaded library table (protocol v2): one engine, one copy.
