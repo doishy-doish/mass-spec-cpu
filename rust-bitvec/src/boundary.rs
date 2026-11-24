@@ -454,7 +454,7 @@ mod boundary_tests {
             &cs,
             1500,
         );
-        assert_eq!(got, s(&["c", "a"]));
+        assert_eq!(got, s(&["a"])); // a only: b,c are candidates (excluded); 190/205 belong to b/c; 260/400 outside +-50
     }
 
     #[test]
