@@ -1,0 +1,2 @@
+GREEN
+results/class2-0-n10m1-pb.json engine=rust n=10 mrr=0.3000 lib=0.3000 analog=0.0210 stein=0.3000 mass=0.0242 cleav=0.1500 fp=0.0000 entw=0.0210 lgbmb=0.1500 zw=0.3000 swap=0.100 pure=0.3000 libce=0.3000 ent=0.3000 gate=0.0210 sword=on cand=1781/517 fb=0.0 qhit_lib=1000010100 qhit_z=1000010100
