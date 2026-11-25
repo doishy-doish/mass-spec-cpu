@@ -1,0 +1,2 @@
+RED
+variants incomplete (['analog', 'bin', 'binw', 'cascade', 'cleav', 'cons', 'ent', 'entw', 'fp', 'frag', 'gate', 'lgbma', 'lgbmb', 'lgbmc', 'lib', 'libce', 'mass', 'pure', 'router', 'rrf', 'rrfb', 'rrfw', 'stein', 'z', 'zw']) — a channel never returned
