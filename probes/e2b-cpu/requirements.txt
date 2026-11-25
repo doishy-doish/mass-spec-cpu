@@ -1,0 +1,7 @@
+torch
+transformers>=4.50
+accelerate
+huggingface_hub
+safetensors
+google-adk==2.15.1
+psutil
