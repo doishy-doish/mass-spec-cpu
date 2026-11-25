@@ -1,0 +1,47 @@
+name: cpu-e2b-probe
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "HF model id (e2b)"
+        default: "google/gemma-4-E2B-it"
+      probe:
+        description: "which probe"
+        default: "both"
+        type: choice
+        options: [both, parallel, thinking]
+      hf_token:
+        description: "HF token (optional, for rate limits; never committed)"
+        required: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (CPU-only torch)
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -q -r probes/e2b-cpu/requirements.txt
+          python -c "import torch, transformers, google.adk; print('torch', torch.__version__, 'threads', torch.get_num_threads())"
+          free -g
+      - name: Run e2b CPU probe (better probe = ParallelAgent concurrency/call-cap first)
+        env:
+          PROBE_HF_TOKEN: ${{ inputs.hf_token }}
+          PROBE_MODEL: ${{ inputs.model }}
+          PROBE_MODE: ${{ inputs.probe }}
+        run: |
+          echo "::add-mask::$PROBE_HF_TOKEN"
+          echo "model=$PROBE_MODEL mode=$PROBE_MODE"
+          python probes/e2b-cpu/probe.py
+      - name: Upload probe summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2b-cpu-probe-summary
+          path: probes/e2b-cpu/summary.json
+          if-no-files-found: warn
