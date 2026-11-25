@@ -31,6 +31,29 @@ from . import quality as Q
 VARIANTS = ["z", "lib", "analog", "frag", "rrf", "cascade", "bin", "rrfb", "binw", "router", "stein", "mass", "zw", "rrfw", "pure", "libce", "ent", "gate",
             "cleav", "fp", "entw", "lgbma", "lgbmb", "lgbmc"]
 
+# CONSENSUS (parallel poll, 2026-11-25): RRF fusion across the six orthogonal
+# computed evidence axes. Scoring only — the pool is untouched, so U_recall
+# is intact by construction (fusion, never veto). Members exclude phonebook
+# spectra (lib/bin/frag), dead fp, legacy fusions (z/rrf/...) and the lgbm
+# hand-set blends (their inputs are already members — no double count).
+CONS_MEMBERS = ["mass", "gate", "cleav", "entw", "stein", "analog"]
+
+
+def consensus_list(ranked_by_variant):
+    """RRF across member ranked lists. Same 1/(60+rank) rule as the
+    per-attempt fuse. Pure, testable. Empty/missing members contribute
+    nothing; output capped at 25."""
+    sc = {}
+    for v in CONS_MEMBERS:
+        lst = (ranked_by_variant or {}).get(v) or []
+        seen = set()
+        for i, k in enumerate(lst):
+            if i >= 25 or not k or k in seen:
+                continue
+            seen.add(k)
+            sc[k] = sc.get(k, 0.0) + 1.0 / (60.0 + (i + 1))
+    return sorted(sc, key=lambda k: -sc[k])[:25]
+
 # BET-EVOLVE genome defaults (replication queue #3): neutral = legacy behavior
 # bit-identically (wl/wa/wf/rl/ra/rf = 1.0, casc_z = 3.0, rout_* = legacy gates).
 # The canary fits these on class2 n=50 (never class3); knobs ride --flags below
@@ -652,6 +675,9 @@ def assemble_row(out, truth, qi, row_order):
         row[v] = M.reciprocal_rank(truth, ranked)
         if v == "z":
             ranked_z = ranked
+    ranked_all = out.get("ranked", {}) or {}
+    row["cons"] = M.reciprocal_rank(
+        truth, consensus_list({m: ranked_all.get(m, []) for m in CONS_MEMBERS}))
     return row, ranked_z, bool(out.get("mass_swap", False))
 
 
@@ -1393,9 +1419,10 @@ def main() -> None:
                                 _seen.add(_k)
                                 _sc[_k] = _sc.get(_k, 0.0) + 1.0 / (60.0 + (_i + 1))
                         _rr[_v] = sorted(_sc, key=lambda _k: -_sc[_k])[:25]
+                    _rr["cons"] = consensus_list(_rr)
                     _truth = str(_SE["qkey"][int(sel[1])])
                     _row = {}
-                    for _v in VARIANTS:
+                    for _v in VARIANTS + ["cons"]:
                         _row[_v] = M.reciprocal_rank(_truth, _rr.get(_v, []))
                     _rz = _rr.get("z", [])
                     _line = ("shard " + str(_SE["shard"]) + " " + str(sel[0] + 1) + "/" + str(sel[2])
@@ -1467,13 +1494,13 @@ def main() -> None:
             print("mol-rrf skipped (" + str(_e)[:120] + ")", flush=True)
 
     preds: dict = {}
-    rrs: dict = {v: [] for v in VARIANTS}
+    rrs: dict = {v: [] for v in VARIANTS + ["cons"]}
     pools: list = []
     qidx: list = []
     swaps: list = []
     for qi, row, plen, ranked, line, swap in results:
         pools.append(int(plen))  # M201: searchsorted yields int64 — json can't serialize it
-        for v in VARIANTS:
+        for v in VARIANTS + ["cons"]:
             rrs[v].append(row.get(v, 0.0))
         if ranked is not None:
             preds[str(qi)] = ranked
@@ -1567,6 +1594,7 @@ def main() -> None:
             "mrr_lgbma": _avg(rrs.get("lgbma", [])),
             "mrr_lgbmb": _avg(rrs.get("lgbmb", [])),
             "mrr_lgbmc": _avg(rrs.get("lgbmc", [])),
+            "mrr_cons": _avg(rrs.get("cons", [])),
             "fusion": fusion,
             "recall_topk_k": float(a.recall_topk or 0.0),
             "recall_at_k": _avg(_SE.get("recall_hits") or []),
@@ -1593,7 +1621,7 @@ def main() -> None:
             "hit25_cascade": _avg([r > 0 for r in rrs["cascade"]]),
             "mol_rrf": bool(_mol_on),
             "tta": bool(getattr(a, "tta", 0)),
-            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS},
+            "rrs": {v: [round(float(x), 6) for x in rrs[v]] for v in VARIANTS + ["cons"]},
             "pools": pools, "qidx": qidx, "mass_swaps": [int(s) for s in swaps],
             "qhit_lib": "".join("1" if float(x) > 0 else "0" for x in rrs["lib"]),
             "qhit_z": "".join("1" if float(x) > 0 else "0" for x in rrs["z"]),
