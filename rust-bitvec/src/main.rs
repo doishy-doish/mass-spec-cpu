@@ -3099,8 +3099,12 @@ mod engine_tests {
         let fp = vec![0.1, 0.8, 0.7, 0.6];
         let u = union_funnel(&keys, &lib, &fp, 2, 2);
         assert_eq!(u, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        // smax: s - max, NaN stays NaN.
-        assert_eq!(smax_normalize(&[1.0, 0.5, f64::NAN]), vec![0.0, -0.5, f64::NAN]);
+        // smax: s - max, NaN stays NaN (NaN != NaN, so compare element-wise).
+        let sm = smax_normalize(&[1.0, 0.5, f64::NAN]);
+        assert_eq!(sm.len(), 3);
+        assert_eq!(sm[0], 0.0);
+        assert_eq!(sm[1], -0.5);
+        assert!(sm[2].is_nan());
         // distinct tau: dup keys must not inflate (scores a:0.9/a:0.8 dup, b:0.5).
         let sc = vec![0.9, 0.8, 0.5];
         let k14 = vec!["A".to_string(), "A".to_string(), "B".to_string()];
