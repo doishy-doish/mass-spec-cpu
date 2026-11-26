@@ -1,0 +1,15 @@
+STARTED mask=class2 shard=0
+ENGINE-UP ok=True size=1757120 path=rust-bitvec/target/release/binvec
+LOAD-DONE rows=2539608
+PRECOMPUTE-DONE queries=50
+QUERY done=5 of=50
+QUERY done=10 of=50
+QUERY done=15 of=50
+QUERY done=20 of=50
+QUERY done=25 of=50
+QUERY done=30 of=50
+QUERY done=35 of=50
+QUERY done=40 of=50
+QUERY done=45 of=50
+QUERY done=50 of=50
+DONE n=50
