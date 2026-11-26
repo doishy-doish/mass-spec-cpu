@@ -1,2 +1,2 @@
 GREEN
-results/class2-0-n10q1.json engine=rust n=10 mrr=0.2500 lib=0.2500 analog=0.0000 stein=0.1500 mass=0.0056 zw=0.2500 swap=0.100 pure=0.3000 libce=0.2500 ent=0.2500 gate=0.0040 sword=on cand=1781/833 fb=0.0
+results/class2-0-n10q1.json engine=rust n=10 mrr=0.0000 lib=0.0000 analog=0.0000 stein=0.0000 mass=0.0000 cleav=0.0000 fp=0.0000 entw=0.0000 lgbmb=0.0000 zw=0.0000 swap=0.100 pure=0.0000 libce=0.0000 ent=0.0000 gate=0.0000 qhit_lib=0000000000 qhit_z=0000000000
