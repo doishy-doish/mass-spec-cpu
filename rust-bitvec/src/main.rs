@@ -1567,6 +1567,158 @@ fn funnel_topk(ordered_keys: &[String], k: usize) -> Vec<String> {
     ordered_keys.iter().take(k).cloned().collect()
 }
 
+/// Phase-1 union funnel (FEATURE-STORE v2): Top-L lib ∪ Top-F fp -> ~250.
+/// Never a prune: lib-sim alone kills 50/250 class-2 (shiferaxa diag), so the
+/// union keeps both. Lib-first order, fp additions after, deduped. Pure.
+fn union_funnel(
+    keys: &[String],
+    lib: &[f64],
+    fp: &[f64],
+    lib_top: usize,
+    fp_top: usize,
+) -> Vec<String> {
+    let take_ranked = |vals: &[f64], top: usize| -> Vec<usize> {
+        order_desc(vals).into_iter().filter(|&i| {
+            vals.get(i).map(|v| !v.is_nan()).unwrap_or(false)
+        }).take(top).collect()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for i in take_ranked(lib, lib_top) {
+        if let Some(k) = keys.get(i) {
+            if seen.insert(k.clone()) { out.push(k.clone()); }
+        }
+    }
+    for i in take_ranked(fp, fp_top) {
+        if let Some(k) = keys.get(i) {
+            if seen.insert(k.clone()) { out.push(k.clone()); }
+        }
+    }
+    out
+}
+
+/// MTH-12: candidate-relative deltas (s - max s). Cross-query comparable for
+/// GBDT/LightGBM; raw thresholds break across queries. NaN stays NaN. Pure.
+fn smax_normalize(xs: &[f64]) -> Vec<f64> {
+    let m = xs.iter().filter(|&&x| !x.is_nan()).cloned().fold(f64::NAN, f64::max);
+    xs.iter().map(|&x| if x.is_nan() || m.is_nan() { f64::NAN } else { x - m }).collect()
+}
+
+/// MTH-13 guard (1): tau = k-th DISTINCT Key14 (1-indexed). Dup keys in the
+/// heap inflate tau and falsely prune the true k-th distinct. Pure.
+fn key14_tau_distinct(scores: &[f64], key14s: &[String], k: usize) -> Option<f64> {
+    if k == 0 { return None; }
+    let mut best: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+    for (s, k14) in scores.iter().zip(key14s.iter()) {
+        if s.is_nan() { continue; }
+        best.entry(k14.as_str()).and_modify(|e| *e = e.max(*s)).or_insert(*s);
+    }
+    let mut v: Vec<f64> = best.into_values().collect();
+    if v.len() < k { return None; }
+    v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[k - 1])
+}
+
+/// MTH-9: max-over-tautomers collapse (pre-score must take max over variants;
+/// cleavage + circular FP are not tautomer-invariant). Returns key14 ->
+/// (max_score, representative key). Pure.
+fn key14_max_map(
+    keys: &[String],
+    scores: &[f64],
+    key14s: &[String],
+) -> std::collections::HashMap<String, (f64, String)> {
+    let mut m: std::collections::HashMap<String, (f64, String)> = std::collections::HashMap::new();
+    for ((k, s), k14) in keys.iter().zip(scores.iter()).zip(key14s.iter()) {
+        if s.is_nan() { continue; }
+        m.entry(k14.clone()).and_modify(|e| if *s > e.0 { *e = (*s, k.clone()); })
+            .or_insert((*s, k.clone()));
+    }
+    m
+}
+
+/// MTH-13 core: keep iff fast + Bmax >= tau. Fail-open on NaN/missing (never
+/// false-prune on missing evidence). Callers must supply DISTINCT tau + hard
+/// Bmax (worst-case leaves for GBDT). Pure.
+fn wand_keep(fast: f64, bmax: f64, tau: f64) -> bool {
+    if fast.is_nan() || bmax.is_nan() || tau.is_nan() { return true; }
+    fast + bmax >= tau
+}
+
+/// APEX rank-1 lock (LIB_TAU gate): weak lib evidence must never demote an
+/// exact hit (-0.50). If max lib >= tau, lib rank-1 stays first, fuzzy fills
+/// the rest deduped; else fuzzy order stands. Pure.
+fn apex_rank1_lock(
+    lib_ranked: &[String],
+    fuzzy_ranked: &[String],
+    lib_scores: &[f64],
+    tau: f64,
+) -> Vec<String> {
+    let hit = lib_scores.iter().filter(|&&x| !x.is_nan())
+        .cloned().fold(f64::NAN, f64::max);
+    let hit = !hit.is_nan() && hit >= tau;
+    if !hit { return fuzzy_ranked.to_vec(); }
+    let top = match lib_ranked.first() { Some(k) => k.clone(), None => return fuzzy_ranked.to_vec() };
+    let mut out = vec![top.clone()];
+    for k in fuzzy_ranked { if *k != top { out.push(k.clone()); } }
+    out
+}
+
+/// Bernoulli log-odds (FP channel, principled): sum bit*logit + log(1-p).
+/// Stable via softplus: bit=1 -> -softplus(-z), bit=0 -> -softplus(z).
+/// Fixes raw-dot bias toward many-bit candidates. Pure.
+fn bernoulli_logodds(bits: &[u64], logits: &[f32]) -> f64 {
+    let nbits = (bits.len() * 64).min(logits.len());
+    let softplus = |z: f64| -> f64 {
+        if z > 20.0 { z } else if z < -20.0 { 0.0 } else { (1.0 + z.exp()).ln() }
+    };
+    let mut s = 0.0;
+    for i in 0..nbits {
+        let bit = (bits[i / 64] >> (i % 64)) & 1;
+        let z = logits[i] as f64;
+        s += if bit == 1 { -softplus(-z) } else { -softplus(z) };
+    }
+    s
+}
+
+/// Molecule-batch max fuse (MTH-10: per-mol max, never flat mean): S
+/// per-spectrum score columns over the same candidate order -> one fused
+/// ranked list per variant via max across spectra (NaN skips). S=1 equals
+/// single-query rank. Pure. fp dead-handling mirrors fuse_molecule_rrf.
+fn fuse_molecule_max(
+    per_spec: &[std::collections::HashMap<String, Vec<f64>>],
+    keys: &[String],
+    fp_live: bool,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    if per_spec.is_empty() || keys.is_empty() {
+        for v in VARIANTS { out.insert(v.to_string(), Vec::new()); }
+        return out;
+    }
+    let n = keys.len();
+    let nan = vec![f64::NAN; n];
+    const DEAD: [&str; 1] = ["fp"];
+    for v in VARIANTS {
+        if !fp_live && DEAD.contains(&v) {
+            out.insert(v.to_string(), Vec::new());
+            continue;
+        }
+        let mut fused = vec![f64::NAN; n];
+        for i in 0..n {
+            let mut m = f64::NAN;
+            for cols in per_spec {
+                let c: &[f64] = cols.get(v).map(Vec::as_slice).unwrap_or(&nan);
+                let x = c.get(i).copied().unwrap_or(f64::NAN);
+                if !x.is_nan() && (m.is_nan() || x > m) { m = x; }
+            }
+            fused[i] = m;
+        }
+        let kv: Vec<String> = order_desc(&fused).into_iter().take(TOP_K_OUT)
+            .map(|i| keys[i].clone()).collect();
+        out.insert(v.to_string(), kv);
+    }
+    out
+}
+
 /// Molecule-batch fuse (microsec lane): S per-spectrum score columns over the
 /// same candidate order -> one fused ranked list per variant via RRF across
 /// spectra. No learning, no weights: rank_s -> 1/(60+rank_s), NaN ranks skip.
@@ -2937,5 +3089,51 @@ mod engine_tests {
         assert!(out[1..].iter().all(|&w| w == 0));
         // loader rejects missing files and bad magic.
         assert!(load_fp_model("/nonexistent/fp_mlp.bin").is_none());
+    }
+
+    #[test]
+    fn feature_store_kernels() {
+        // union funnel: Top-2 lib {a,b} U Top-2 fp {b,c} -> [a,b,c].
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+        let lib = vec![0.9, 0.5, 0.1, f64::NAN];
+        let fp = vec![0.1, 0.8, 0.7, 0.6];
+        let u = union_funnel(&keys, &lib, &fp, 2, 2);
+        assert_eq!(u, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // smax: s - max, NaN stays NaN.
+        assert_eq!(smax_normalize(&[1.0, 0.5, f64::NAN]), vec![0.0, -0.5, f64::NAN]);
+        // distinct tau: dup keys must not inflate (scores a:0.9/a:0.8 dup, b:0.5).
+        let sc = vec![0.9, 0.8, 0.5];
+        let k14 = vec!["A".to_string(), "A".to_string(), "B".to_string()];
+        assert_eq!(key14_tau_distinct(&sc, &k14, 1), Some(0.9));
+        assert_eq!(key14_tau_distinct(&sc, &k14, 2), Some(0.5));
+        assert_eq!(key14_tau_distinct(&sc, &k14, 3), None);
+        // max-over-tautomers: A keeps 0.9 with rep a.
+        let m = key14_max_map(&["a".to_string(), "a2".to_string()], &[0.9, 0.8], &["A".to_string(), "A".to_string()]);
+        assert_eq!(m["A"].0, 0.9);
+        // wand: fail-open on NaN, exact core otherwise.
+        assert!(wand_keep(0.5, 0.3, 0.7));
+        assert!(!wand_keep(0.5, 0.1, 0.7));
+        assert!(wand_keep(f64::NAN, 0.1, 0.7));
+        // apex: hit locks rank-1, miss leaves fuzzy.
+        let lib_r = vec!["a".to_string(), "b".to_string()];
+        let fuzzy = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(apex_rank1_lock(&lib_r, &fuzzy, &[0.95, 0.1], 0.9)[0], "a");
+        assert_eq!(apex_rank1_lock(&lib_r, &fuzzy, &[0.5, 0.1], 0.9), fuzzy);
+        // bernoulli: bit=1 with big logit beats bit=0; empty is 0.
+        let b1 = bernoulli_logodds(&[1], &[10.0, -10.0]);
+        let b0 = bernoulli_logodds(&[0], &[10.0, -10.0]);
+        assert!(b1 > b0);
+        assert_eq!(bernoulli_logodds(&[], &[]), 0.0);
+        // molecule max: max across spectra, S=1 equals rank.
+        let keys3 = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut c1 = HashMap::new();
+        for v in VARIANTS { c1.insert(v.to_string(), vec![0.9, 0.1, 0.0]); }
+        let mut c2 = HashMap::new();
+        for v in VARIANTS { c2.insert(v.to_string(), vec![0.1, 0.9, 0.0]); }
+        let fm = fuse_molecule_max(&[c1, c2], &keys3, false);
+        assert_eq!(fm["lib"].len(), 3);
+        // max keeps both winners visible: a and b both score 0.9 somewhere.
+        assert!(fm["lib"].contains(&"a".to_string()));
+        assert!(fm["lib"].contains(&"b".to_string()));
     }
 }
