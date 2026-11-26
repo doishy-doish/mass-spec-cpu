@@ -188,7 +188,7 @@ jobs:
           git config user.email "mscpu@users.noreply.github.com"
           git add data/fp_mlp.bin
           git diff --cached --quiet || git commit -m "cpu train-fp weights $(date -u +%F)"
-          git pull --rebase origin main
+          git pull --rebase --autostash origin main
           git push
       - name: train lgbm ranker (Phase 2, CPU)
         if: ${{ inputs.task == 'train-lgbm' }}
@@ -206,13 +206,13 @@ jobs:
           git config user.email "mscpu@users.noreply.github.com"
           git add data/lgbm_model.txt
           git diff --cached --quiet || git commit -m "cpu train-lgbm weights $(date -u +%F)"
-          git pull --rebase origin main
+          git pull --rebase --autostash origin main
           git push
       - name: run mask
         if: ${{ inputs.task == 'validate' }}
         timeout-minutes: 60  # backend auto-cancels hung masks; no manual deadman kills
         run: PYTHONPATH=src python -m mscpu.run --data data/train.parquet --mask "${{ inputs.mask }}" --n "${{ inputs.n }}" --rust-bin rust-bitvec/target/release/binvec --shard "${{ inputs.shard }}" --shards "${{ inputs.shards }}" --jobs "${{ inputs.jobs }}" --out-suffix="${{ inputs.suffix }}" --wl "${{ inputs.wl }}" --wa "${{ inputs.wa }}" --wf "${{ inputs.wf }}" --rl "${{ inputs.rl }}" --ra "${{ inputs.ra }}" --rf "${{ inputs.rf }}" --casc-z "${{ inputs.casc-z }}" --rout-lib "${{ inputs.rout-lib }}" --rout-bin "${{ inputs.rout-bin }}" --rout-binw "${{ inputs.rout-binw }}" --inst-bonus "${{ inputs.inst-bonus }}" --adduct-retry "${{ inputs.adduct-retry }}" --mass-replace "${{ inputs.mass-replace }}" --recall-topk "${{ inputs.recall-topk }}" --funnel-off "${{ inputs.funnel-off }}" --sword-prec "${{ inputs.sword-prec }}" --erun "${{ inputs.erun }}" --loss-gate "${{ inputs.loss-gate }}" --formula-ppm 0 --mol-rrf 0 --tta 0 --out results/${{ inputs.mask }}-${{ inputs.shard }}.json
-      - name: smart probe (GREEN / RED / INFRA — never ships blind, never cries code-bug on host death)
+      - name: smart probe (GREEN / RED / INFRA â never ships blind, never cries code-bug on host death)
         if: ${{ always() && inputs.task == 'validate' }}
         env:
           MASK: ${{ inputs.mask }}
@@ -245,7 +245,7 @@ jobs:
                   print(f"(verdict file unwritable: {e})", flush=True)
               # INFRA exits 3 so the step table tells host-death apart from code-RED (exit 1).
               sys.exit({"GREEN": 0, "RED": 1, "INFRA": 3}[verdict])
-          # M199: exact dispatched path only — the glob fallback once graded a
+          # M199: exact dispatched path only â the glob fallback once graded a
           # STALE committed probe file (engineswap) as this run's output.
           fp = path if os.path.exists(path) else None
           status_txt = None
@@ -257,7 +257,7 @@ jobs:
               status_txt = None
           # PROBE-V2: crash-aware classification. A committed crash file turns a
           # generic INFRA into a mechanism; a missing engine binary is RED
-          # (build/config, actionable) — never host death.
+          # (build/config, actionable) â never host death.
           crash_path = f"results/crash{suffix}.txt"
           crash_txt = None
           try:
@@ -278,13 +278,13 @@ jobs:
                       f"sidecar started={started} precompute={pre} sigterm={sigterm}"
                       + (f" last={lastq}" if lastq else "")]
               if binmiss or (crash_txt and "FileNotFoundError" in crash_txt and "binvec" in crash_txt):
-                  emit("RED", base + ["engine binary absent — build produced nothing (check cargo cache key + build log)",
-                                      "NOT host death — do NOT retry blindly, fix the build"] + crash_tail)
+                  emit("RED", base + ["engine binary absent â build produced nothing (check cargo cache key + build log)",
+                                      "NOT host death â do NOT retry blindly, fix the build"] + crash_tail)
               if crash_txt:
                   emit("INFRA" if not pre else "RED",
                        base + ["crash hook fired before JSON existed"] + crash_tail
                        + (["retry with backoff, do NOT revert code"] if not pre else []))
-              emit("INFRA", base + ["host died before JSON existed — retry with backoff, do NOT revert code"])
+              emit("INFRA", base + ["host died before JSON existed â retry with backoff, do NOT revert code"])
           print(f"SMART-PROBE checking {fp} (+ {status_path})");
           red = []
           def need(cond, msg):
@@ -292,19 +292,19 @@ jobs:
           try:
               out = json.load(open(fp))
           except Exception as e:
-              # M202: DONE-line match — "DONE" is a substring of "PRECOMPUTE-DONE",
+              # M202: DONE-line match â "DONE" is a substring of "PRECOMPUTE-DONE",
               # so a plain `in` check always sees DONE and mislabels mid-write kills.
               _done = bool(status_txt) and any(l.startswith("DONE") for l in status_txt.splitlines())
               if status_txt and not _done:
-                  emit("INFRA", [f"unreadable JSON {fp}: {e}", "run never reached DONE — host died mid-write, retry"])
+                  emit("INFRA", [f"unreadable JSON {fp}: {e}", "run never reached DONE â host died mid-write, retry"])
               emit("RED", [f"unreadable JSON {fp}: {e}"])
           # 1. engine + shape: the probe ran the Rust engine on real queries
-          need(out.get("engine") == "rust", f"engine != rust ({out.get('engine')!r}) — wrong binary path or fallback")
+          need(out.get("engine") == "rust", f"engine != rust ({out.get('engine')!r}) â wrong binary path or fallback")
           n = out.get("n", 0)
-          need(isinstance(n, int) and n >= min(10, nreq), f"n too small ({n} < min(10,{nreq})) — queries never ran")
+          need(isinstance(n, int) and n >= min(10, nreq), f"n too small ({n} < min(10,{nreq})) â queries never ran")
           rrs = out.get("rrs", {})
           need(set(rrs.keys()) == {"z","lib","analog","frag","rrf","cascade","bin","rrfb","binw","router","stein","mass","zw","rrfw","pure","libce","ent","gate","cleav","fp","entw","lgbma","lgbmb","lgbmc","cons"},
-               f"variants incomplete ({sorted(rrs.keys())}) — a channel never returned")
+               f"variants incomplete ({sorted(rrs.keys())}) â a channel never returned")
           for v, arr in rrs.items():
               need(len(arr) == n, f"rrs[{v}] len {len(arr)} != n {n}")
           # 2. score fields present + sane (catches silent NaN/zero collapse)
@@ -312,21 +312,21 @@ jobs:
           for k in mkeys:
               v = out.get(k)
               need(isinstance(v,(int,float)) and v==v and 0.0 <= v <= 1.0, f"{k} insane ({v!r})")
-          need(out.get("fusion") is not None, "fusion params missing — genome not recorded")
-          need("mass_swap_rate" in out, "mass_swap_rate missing — mass channel signal discarded (old bug)")
+          need(out.get("fusion") is not None, "fusion params missing â genome not recorded")
+          need("mass_swap_rate" in out, "mass_swap_rate missing â mass channel signal discarded (old bug)")
           need(isinstance(out.get("mass_swap_rate"),(int,float)), "mass_swap_rate insane")
-          # M199: defensive — the probe must end in a verdict, never a traceback.
+          # M199: defensive â the probe must end in a verdict, never a traceback.
           pools = out.get("pools") or []
-          need(len(pools) == n and (sum(pools)/max(1,n)) > 0, "pools empty — candidate pool never built")
+          need(len(pools) == n and (sum(pools)/max(1,n)) > 0, "pools empty â candidate pool never built")
           # M218: class3 novelty-consistency. Full holdout is locked+tested
           # (held truths can never enter the library, hence never the
           # preload): tin==0 with mrr==0 is the HEALTHY state. tin>0 is a
           # LEAK (split violated); mrr>0 with tin==0 is engine hallucination.
           if mask == "class3":
-              need(out.get("truth_in_union", -1) == 0, f"class3 LEAK: truth_in_union={out.get('truth_in_union')} != 0 — held truth entered the preload")
+              need(out.get("truth_in_union", -1) == 0, f"class3 LEAK: truth_in_union={out.get('truth_in_union')} != 0 â held truth entered the preload")
           # 3. lane sanity, mask-conditional (catches blindness/pool breaks the old probes walked past).
           # n-aware (M205): at n<25 the lane means are noise-dominated (n=10 analog
-          # 0.087 vs 0.17 banked) — hard checks above still gate, lane gates need n.
+          # 0.087 vs 0.17 banked) â hard checks above still gate, lane gates need n.
           if n >= 25:
               _pb = "-pb" in (os.environ.get("SUFFIX","") or "")
               _t2 = "-t2" in (os.environ.get("SUFFIX","") or "")
@@ -335,23 +335,23 @@ jobs:
               if _t2 and mask != "class2":
                   need(False, f"probe misuse: -t2 is class2-only (mask={mask})")
               if mask == "class2" and not _pb and not _t2:
-                  need(out.get("truth_in_union", -1) == 0, f"class2 phonebook: truth_in_union={out.get('truth_in_union')} — held spectra in library (strip broken)")
-                  need(out.get("mrr_lib",1) < 0.2, f"class2 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
+                  need(out.get("truth_in_union", -1) == 0, f"class2 phonebook: truth_in_union={out.get('truth_in_union')} â held spectra in library (strip broken)")
+                  need(out.get("mrr_lib",1) < 0.2, f"class2 mrr_lib {out.get('mrr_lib')} >= 0.2 â blindness violated (leak?)")
               elif mask == "class2" and _t2:
-                  need(out.get("true2", False) == True, "true-class2 arm: out true2 flag missing — arm never engaged (M253 class?)")
-                  need(out.get("truth_in_union", -1) == 0, f"true-class2: truth_in_union={out.get('truth_in_union')} > 0 — held SPECTRA leaked, arm measures overlap not novelty")
+                  need(out.get("true2", False) == True, "true-class2 arm: out true2 flag missing â arm never engaged (M253 class?)")
+                  need(out.get("truth_in_union", -1) == 0, f"true-class2: truth_in_union={out.get('truth_in_union')} > 0 â held SPECTRA leaked, arm measures overlap not novelty")
                   # NO lib ceiling here: mrr_lib IS the measurement (unseen exact MRR@25).
               elif mask == "class2" and _pb:
-                  need(out.get("phonebook", False) == True, "phonebook arm: out phonebook flag missing — arm never engaged")
-                  need(out.get("truth_in_union", -1) > 0, "phonebook arm: truth_in_union==0 — exclusion still active, arm measured nothing")
-                  need(out.get("mrr_lib", 0) > 0.5, f"phonebook arm: mrr_lib {out.get('mrr_lib')} <= 0.5 — restored lib not retrieving")
+                  need(out.get("phonebook", False) == True, "phonebook arm: out phonebook flag missing â arm never engaged")
+                  need(out.get("truth_in_union", -1) > 0, "phonebook arm: truth_in_union==0 â exclusion still active, arm measured nothing")
+                  need(out.get("mrr_lib", 0) > 0.5, f"phonebook arm: mrr_lib {out.get('mrr_lib')} <= 0.5 â restored lib not retrieving")
               elif mask == "class3":
                   # M218: exact-key MRR on full-holdout novelty is 0 by
                   # construction (furnace ended full-library scanning; the
                   # 0.22 banked line belongs to that lost era). Gate the
                   # consistency instead: mrr must be exactly 0 when tin==0.
-                  need(out.get("mrr",1) == 0.0, f"class3 integrity: mrr={out.get('mrr')} > 0 with truth_in_union=0 — engine ranked keys it never received")
-                  need(out.get("mrr_lib",1) < 0.2, f"class3 mrr_lib {out.get('mrr_lib')} >= 0.2 — blindness violated (leak?)")
+                  need(out.get("mrr",1) == 0.0, f"class3 integrity: mrr={out.get('mrr')} > 0 with truth_in_union=0 â engine ranked keys it never received")
+                  need(out.get("mrr_lib",1) < 0.2, f"class3 mrr_lib {out.get('mrr_lib')} >= 0.2 â blindness violated (leak?)")
           # 4. genome actually applied (the thing -genomeA/L were sent to check and never did)
           try:
               wl,wa,wf,rl,ra,rf = float(os.environ["WL"]),float(os.environ["WA"]),float(os.environ["WF"]),float(os.environ["RL"]),float(os.environ["RA"]),float(os.environ["RF"])
@@ -360,21 +360,21 @@ jobs:
               wl=wa=wf=rl=ra=rf=1.0; cz=3.0; rlib=0.5
           f = out.get("fusion",{})
           for k, want in [("wl",wl),("wa",wa),("wf",wf),("rl",rl),("ra",ra),("rf",rf),("casc_z",cz),("rout_lib",rlib)]:
-              need(abs(float(f.get(k, float("nan"))) - want) < 1e-9, f"fusion.{k} {f.get(k)!r} != dispatched {want} — genome never reached engine")
+              need(abs(float(f.get(k, float("nan"))) - want) < 1e-9, f"fusion.{k} {f.get(k)!r} != dispatched {want} â genome never reached engine")
           neutral = (wl==1.0 and wa==1.0 and wf==1.0 and rl==1.0 and ra==1.0 and rf==1.0 and cz==3.0)
           if neutral:
-              need(abs(out["mrr_zw"]-out["mrr"]) < 1e-9, f"neutral genome moved zw ({out['mrr_zw']} vs z {out['mrr']}) — bit-identity broken")
+              need(abs(out["mrr_zw"]-out["mrr"]) < 1e-9, f"neutral genome moved zw ({out['mrr_zw']} vs z {out['mrr']}) â bit-identity broken")
               need(abs(out["mrr_rrfw"]-out["mrr_rrf"]) < 1e-9, f"neutral genome moved rrfw ({out['mrr_rrfw']} vs rrf {out['mrr_rrf']})")
           else:
               moved = (rrs.get("zw") != rrs.get("z")) or (rrs.get("rrfw") != rrs.get("rrf"))
-              need(moved, "non-neutral genome left zw==z AND rrfw==rrf — genome ignored, probe measured nothing")
+              need(moved, "non-neutral genome left zw==z AND rrfw==rrf â genome ignored, probe measured nothing")
           if "poolcheck" in (os.environ.get("SUFFIX","") or ""):
-              need(out.get("pool_parity_n", 0) > 0, "poolcheck suffix but parity never ran (n=0) — flag wiring broken")
+              need(out.get("pool_parity_n", 0) > 0, "poolcheck suffix but parity never ran (n=0) â flag wiring broken")
           if "-dump" in (os.environ.get("SUFFIX","") or ""):
-              need(isinstance(out.get("pairs"), list) and len(out.get("pairs")) > 0, "dump suffix but no pairs collected — dump_scores wiring broken (engine scores missing?)")
+              need(isinstance(out.get("pairs"), list) and len(out.get("pairs")) > 0, "dump suffix but no pairs collected â dump_scores wiring broken (engine scores missing?)")
           if out.get("pool_parity_n"):
-              need(out.get("pool_parity_nulls", -1) == 0, f"pool parity nulls={out.get('pool_parity_nulls')} — engine store missing, parity unmeasured")
-              need(out.get("pool_parity_rate") == 1.0, f"pool parity {out.get('pool_parity_rate')} != 1.0 nulls={out.get('pool_parity_nulls')} — engine pools != Python pools")
+              need(out.get("pool_parity_nulls", -1) == 0, f"pool parity nulls={out.get('pool_parity_nulls')} â engine store missing, parity unmeasured")
+              need(out.get("pool_parity_rate") == 1.0, f"pool parity {out.get('pool_parity_rate')} != 1.0 nulls={out.get('pool_parity_nulls')} â engine pools != Python pools")
           if red:
               emit("RED", red)
           emit("GREEN", [f"{fp} engine={out.get('engine')} n={n} mrr={out.get('mrr'):.4f} lib={out.get('mrr_lib'):.4f} analog={out.get('mrr_analog'):.4f} stein={out.get('mrr_stein'):.4f} mass={out.get('mrr_mass'):.4f} cleav={out.get('mrr_cleav'):.4f} fp={out.get('mrr_fp'):.4f} entw={out.get('mrr_entw'):.4f} lgbmb={out.get('mrr_lgbmb'):.4f} zw={out.get('mrr_zw'):.4f} swap={out.get('mass_swap_rate'):.3f} pure={out.get('mrr_pure'):.4f} libce={out.get('mrr_libce'):.4f} ent={out.get('mrr_ent'):.4f} gate={out.get('mrr_gate'):.4f}" + (f" sword=on cand={out.get('sword_cand0')}/{out.get('sword_cand1')} fb={out.get('sword_fb_rate')}" if out.get("sword_on") else "") + f" qhit_lib={out.get('qhit_lib')} qhit_z={out.get('qhit_z')}" + (f" poolcheck={out.get('pool_parity_rate')} n={out.get('pool_parity_n')} nulls={out.get('pool_parity_nulls')}" if out.get("pool_parity_n") else "")])
@@ -392,5 +392,5 @@ jobs:
           git config user.email "mscpu@users.noreply.github.com"
           git add results/
           git diff --cached --quiet || git commit -m "cpu-r3 ${{ inputs.task }}-${{ inputs.mask }} $(date -u +%F)"
-          git pull --rebase origin main
+          git pull --rebase --autostash origin main
           git push
