@@ -1,4 +1,4 @@
-//! sengine — the single Rust retrieval engine.
+//! sengine â the single Rust retrieval engine.
 //!
 //! All compute lives here. Python (run.py/predict.py) is a thin launcher:
 //! parquet load, mask splits, pool shortlists, output assembly, submission.
@@ -12,10 +12,10 @@
 //!
 //! Known non-identical edges (functional MRR parity is the gate, A3/A9):
 //! - round-half-away (Rust .round()) vs Python banker's round() in 2dp loss
-//!   sets and quantization — exact-.5 cases are measure-zero in float mz data
+//!   sets and quantization â exact-.5 cases are measure-zero in float mz data
 //!   (0/2000 sampled); the cheap-mask canary decides.
 //! - top-64/peaksort ties: numpy argpartition order is unspecified, Rust takes
-//!   a full descending sort — same SET except adversarial ties.
+//!   a full descending sort â same SET except adversarial ties.
 //! - ranked-list ties: pandas quicksort (unstable) vs Rust stable sort that
 //!   preserves candidate order. Deterministic; chance-level ties only.
 //!
@@ -69,7 +69,7 @@ const TOP_K_OUT: usize = 25;
 /// prepared on first use and cached (M209). prepare() and morgan are pure
 /// functions of these inputs, so lazy values equal eager ones bit-for-bit.
 /// Pool takes position 0. Replaces the old eager preload (prepared all 275k
-/// keys, 7.3min, before query 1 — most keys are never touched).
+/// keys, 7.3min, before query 1 â most keys are never touched).
 /// LIB-RESTORED 2026-11-24 (user: money first): 18 library-recall + computed
 /// names live again (key-exclusion in validation keeps them honest) + 6 new
 /// computed (S2 cleavage, quarantined fp, Q6 entw, 3x hand-set stumps). 24 total.
@@ -98,7 +98,7 @@ fn jaccard(a: &[u64; 64], b: &[u64; 64]) -> f64 {
 }
 
 fn build_w(p: &[u64], pw: &[f32], l: &[u64], lw: &[f32]) -> Vec<(u16, f32)> {
-    // sort+max-combine — identical output to the old HashMap fold,
+    // sort+max-combine â identical output to the old HashMap fold,
     // 2.15x faster in the JS mirror (n<=128, HashMap overhead dominates).
     let mut v: Vec<(u16, f32)> = Vec::with_capacity(p.len() + l.len());
     for (i, &b) in p.iter().enumerate() {
@@ -230,7 +230,7 @@ struct CSpectra {
     bits: [u64; 64],
     wb: Vec<(u16, f32)>,
     /// Neutral-loss set, precomputed once per spectrum (the frag channel used
-    /// to rebuild it per candidate spec per query — same inputs, same output).
+    /// to rebuild it per candidate spec per query â same inputs, same output).
     floss: Vec<f64>,
     /// Collision-energy band source (None = unknown/merged ramp).
     ce: Option<f64>,
@@ -312,7 +312,7 @@ fn modified_row(q: &CSpectra, s: &CSpectra, tol: f64) -> f64 {
 /// Stein-Scott-lite: mass-weighted cosine. Same two-pointer matches as cosine,
 /// weights folded with mz/1000 so high-mass peaks dominate. Self = 1.0, far = 0.0.
 /// Pure-algo replication (akmalkhaniub Stein-Scott + neutral-loss hybrid): no chemistry,
-/// no learning, one more two-pointer per candidate — standalone channel, NOT fused yet.
+/// no learning, one more two-pointer per candidate â standalone channel, NOT fused yet.
 fn stein_row(q: &CSpectra, s: &CSpectra, tol: f64) -> f64 {
     if q.mz.is_empty() || s.mz.is_empty() {
         return 0.0;
@@ -394,7 +394,7 @@ fn sample_std(xs: &[f64], mean: f64) -> f64 {
 }
 
 /// pandas rank(ascending=False, method="min"): 1 + #(strictly greater).
-/// O(n log n) sort-based — bit-identical to the old O(n^2) count
+/// O(n log n) sort-based â bit-identical to the old O(n^2) count
 /// (JS mirror: 30x at n=1500, same output incl. NaN + tie handling).
 fn rank_min_desc(vals: &[f64]) -> Vec<f64> {
     let mut idx: Vec<usize> = (0..vals.len()).filter(|&i| !vals[i].is_nan()).collect();
@@ -432,7 +432,7 @@ fn order_desc(vals: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..vals.len()).collect();
     if vals.len() <= 32 {
         // insertion sort: at tiny n it beats the general sort's setup cost,
-        // and with a strict comparator it is stable — same order, bit for bit.
+        // and with a strict comparator it is stable â same order, bit for bit.
         for i in 1..idx.len() {
             let mut j = i;
             while j > 0 && less_desc(vals[idx[j]], vals[idx[j - 1]]) {
@@ -542,7 +542,7 @@ fn def_rbin() -> f64 {
 /// Every default reproduces the old behavior bit-identically (neutral = 1.0,
 /// casc_z = CASCADE_Z, rout_* = ROUTER_*): machinery lands MRR-neutral, the
 /// canary fits the values on class2 n=50 (never class3). Missing keys in the
-/// params JSON (old launchers) also default neutral — backward compatible.
+/// params JSON (old launchers) also default neutral â backward compatible.
 #[derive(Deserialize)]
 struct EngineParams {
     qpeak: f64,
@@ -570,24 +570,24 @@ struct EngineParams {
     /// I6: v8 rank-1-by-mass replace on every ranked list (0 = off, 1 = on).
     #[serde(default = "def0")]
     mass_replace: f64,
-    /// I6: funnel recall probe — echo first-K pool keys (0 = off).
+    /// I6: funnel recall probe â echo first-K pool keys (0 = off).
     #[serde(default = "def0")]
     recall_topk: f64,
-    /// I6: funnel A/B — disable the Jaccard prefilter (0 = funnel on, 1 = off).
+    /// I6: funnel A/B â disable the Jaccard prefilter (0 = funnel on, 1 = off).
     #[serde(default = "def0")]
     funnel_off: f64,
-    /// R2: diagnostic-loss demotion — stable-partition ranked lists so
+    /// R2: diagnostic-loss demotion â stable-partition ranked lists so
     /// candidates failing the loss/subformula gate sink below passing ones.
     /// 0 = off (bit-identical lists), 1 = on.
     #[serde(default = "def0")]
     lossgate: f64,
     /// LGBM pairs: emit per-candidate per-channel scores in the reply
     /// (channel -> per-cand floats in cand_keys order) for OOF ranker
-    /// training. Observation only — never touches scoring. 0 = off.
+    /// training. Observation only â never touches scoring. 0 = off.
     #[serde(default = "def0")]
     dump_scores: f64,
     /// E1: engine-owned store. Slim dir path; when set, the engine loads it
-    /// at startup and resolves library + query spectra from it on demand —
+    /// at startup and resolves library + query spectra from it on demand â
     /// no preload chunks, no per-query spectra JSON. Python sends keys +
     /// row refs only. None = protocol v2 (preload chunks) as before.
     #[serde(default)]
@@ -628,7 +628,7 @@ impl EngineParams {
 /// WIN-FIRST Phase 1: trained spectrum->Morgan MLP (TRAIN_PLAN).
 /// Bins must match scripts/train_fp.py featurize EXACTLY:
 /// bins 0..1535 Da @1Da of max cleaned weight (clean stores sqrt of normalized
-/// intensity — train_fp.py applies the same single sqrt), feat[1536]=prec/2000.
+/// intensity â train_fp.py applies the same single sqrt), feat[1536]=prec/2000.
 const FP_NBIN: usize = 1536;
 const FP_INDIM: usize = 1537;
 const FP_NWORDS: usize = 32;
@@ -713,7 +713,7 @@ fn fp_forward(m: &FpModel, x: &[f32]) -> [u64; FP_NWORDS] {
 }
 
 /// dump-fp: stdin {"keys":[],"smiles":[]} -> stdout {"bits":{key:hex512},"n":N}.
-/// Labels for train_fp.py — same rust-chem Morgan code that scores candidates.
+/// Labels for train_fp.py â same rust-chem Morgan code that scores candidates.
 fn dump_fp_main() {
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).expect("dump-fp: read stdin");
@@ -747,8 +747,8 @@ struct RawSpec {
 }
 
 /// One library table chunk (preload protocol v2): per-query messages carry
-/// keys only, so the ~1MB/query JSON transfer+parse+re-prepare — ~70% of
-/// per-query time on the profile — happens exactly once per engine.
+/// keys only, so the ~1MB/query JSON transfer+parse+re-prepare â ~70% of
+/// per-query time on the profile â happens exactly once per engine.
 #[derive(Deserialize)]
 struct PreloadChunk {
     keys: Vec<String>,
@@ -776,7 +776,7 @@ struct EngineIn {
     #[serde(default)]
     qnm: Option<f64>,
     /// E1: query as a slim store row index. The engine resolves
-    /// (mzs, ints, prec, ce) from its own store — zero query-spectra JSON.
+    /// (mzs, ints, prec, ce) from its own store â zero query-spectra JSON.
     /// None = full `q` RawSpec as before.
     #[serde(default)]
     qrow: Option<usize>,
@@ -831,7 +831,7 @@ struct EngineReply {
     /// per-query stage timings ms (measure-first: worker stderr is DEVNULLed
     /// by the launcher, so timings ride home in the reply and land in logs
     /// via the Python heartbeat line). 8 stages: parse,qprep,cands,pool,
-    /// funnel,analog,chan,fuse. Observation only — never touches scoring.
+    /// funnel,analog,chan,fuse. Observation only â never touches scoring.
     timing: Vec<f64>,
 }
 
@@ -862,7 +862,7 @@ struct TableEntry {
 
 /// M209: prepare-on-first-use. prepare() is a pure function of (raw spectra,
 /// qpeak, qloss) and morgan_bits_2048 a pure function of smiles, so cached
-/// values equal the old eager-preload values bit-for-bit — only the WHEN
+/// values equal the old eager-preload values bit-for-bit â only the WHEN
 /// changes. Raw is dropped after preparing to bound engine memory:
 /// raw(untouched keys) + prepared(touched keys).
 fn ensure_prepared(e: &mut TableEntry, qpeak: f64, qloss: f64) {
@@ -883,7 +883,7 @@ fn ensure_prepared(e: &mut TableEntry, qpeak: f64, qloss: f64) {
 }
 
 /// E1: key -> slim row indices + key position (ints only; spectra resolve
-/// lazily per touched key, M209 pattern — untouched keys cost indices only).
+/// lazily per touched key, M209 pattern â untouched keys cost indices only).
 fn build_key_maps(
     s: &slim::SlimStore,
 ) -> (HashMap<String, Vec<usize>>, HashMap<String, usize>) {
@@ -950,7 +950,7 @@ fn build_pool_arrays(
     let skeys: Vec<String> = neut.into_iter().map(|(_, k)| k).collect();
     // prec view: library keys only. ALL masks exclude held KEYS
     // (PHONEBOOK-STRIP 2026-11-24: every spectrum of a test molecule leaves
-    // the library — mirrors validation.split_* exactly; query rows' keys are
+    // the library â mirrors validation.split_* exactly; query rows' keys are
     // in held, so row exclusion is subsumed. qrows stay in the cache key).
     let key_excl: std::collections::HashSet<&str> =
         held.iter().map(|x| x.as_str()).collect();
@@ -989,7 +989,7 @@ fn build_pool_arrays(
 }
 
 /// E1: build one TableEntry straight from the slim store (same floats the
-/// preload path would have carried — bit-identical input to
+/// preload path would have carried â bit-identical input to
 /// ensure_prepared, so scoring is unchanged).
 fn entry_from_slim(
     s: &slim::SlimStore,
@@ -1018,7 +1018,7 @@ fn entry_from_slim(
 }
 
 /// E1: resolve one key, filling the table from slim on first touch.
-/// Unknown keys (absent from the store) stay absent — same skip semantics
+/// Unknown keys (absent from the store) stay absent â same skip semantics
 /// as the preload path (M217), so coverage behavior is unchanged.
 fn ensure_key(
     table: &mut HashMap<String, TableEntry>,
@@ -1129,8 +1129,8 @@ fn formula_counts(smiles: &str) -> Option<BTreeMap<String, u32>> {
 
 /// R2: diagnostic-loss gate fraction for one candidate: of the diagnostic
 /// neutral losses observed in the query (prec - frag within LOSS_TOL_DA),
-/// how many have atoms ⊆ candidate formula. Vacuous (no losses observed or
-/// no formula) scores 1.0 — the gate only demotes, never promotes.
+/// how many have atoms â candidate formula. Vacuous (no losses observed or
+/// no formula) scores 1.0 â the gate only demotes, never promotes.
 fn gate_frac(qmz: &[f64], qprec: f64, formula: Option<&BTreeMap<String, u32>>) -> f64 {
     let mut observed = 0u32;
     let mut explained = 0u32;
@@ -1169,7 +1169,7 @@ fn gate_frac(qmz: &[f64], qprec: f64, formula: Option<&BTreeMap<String, u32>>) -
     }
 }
 
-/// R2: loss-gate demotion — stable-partition one ranked list so gate-passing
+/// R2: loss-gate demotion â stable-partition one ranked list so gate-passing
 /// keys keep their relative order ahead of failing ones. Passing = gate
 /// fraction 1.0 (fully explained or vacuous).
 fn partition_by_gate(list: &mut Vec<String>, gate_of: &HashMap<String, f64>) {
@@ -1232,7 +1232,7 @@ fn ent_row(qmz: &[f64], qw: &[f64], smz: &[f64], sw: &[f64], tol: f64) -> f64 {
 }
 
 /// S2 cleavage score for one candidate: explained-intensity fraction of the
-/// query's cleaned peaks by the candidate's ≤2-bond cleavage fragments.
+/// query's cleaned peaks by the candidate's â¤2-bond cleavage fragments.
 /// tol 0.02 Da (fragment side). No frags / no peaks -> 0.0 (no evidence).
 fn cleavage_score(qmz: &[f64], qw: &[f64], smiles: &str) -> f64 {
     let frags = cleavage_masses(smiles);
@@ -1325,7 +1325,7 @@ fn fuse_rank(
     // overlap share pays through lib, the novel share falls to computed.
     // MONEY GATE: lib cosine >= 0.9 hit-locks cascade+router to lib order
     // (explicit; the old cascade_z path usually agrees). fp stays quarantined
-    // (cross-domain Tanimoto noise — see fp_score) and emits empty.
+    // (cross-domain Tanimoto noise â see fp_score) and emits empty.
     let n = keys.len();
     // borrow channels in place. Missing channel == all-NaN fallback.
     let nan = vec![f64::NAN; n];
@@ -1479,7 +1479,7 @@ fn fuse_rank(
         out.insert(name.to_string(), kv);
     }
     // fp: fused IFF weights are loaded (trained MLP); otherwise quarantined
-    // empty (cross-domain hash noise — see fp_score). No-weights default = safe.
+    // empty (cross-domain hash noise â see fp_score). No-weights default = safe.
     if fw.fp_weights.is_some() {
         if let Some(fp) = cols.get("fp") {
             let kv: Vec<String> = order_desc(fp)
@@ -1562,12 +1562,12 @@ fn apply_mass_replace(ranked: &mut HashMap<String, Vec<String>>, ppm_of: &HashMa
 }
 
 /// funnel recall probe (I6): first-K keys of the funnel-ordered pool.
-/// Pure slice — the engine echoes these so Python can score truth retention.
+/// Pure slice â the engine echoes these so Python can score truth retention.
 fn funnel_topk(ordered_keys: &[String], k: usize) -> Vec<String> {
     ordered_keys.iter().take(k).cloned().collect()
 }
 
-/// Phase-1 union funnel (FEATURE-STORE v2): Top-L lib ∪ Top-F fp -> ~250.
+/// Phase-1 union funnel (FEATURE-STORE v2): Top-L lib âª Top-F fp -> ~250.
 /// Never a prune: lib-sim alone kills 50/250 class-2 (shiferaxa diag), so the
 /// union keeps both. Lib-first order, fp additions after, deduped. Pure.
 fn union_funnel(
@@ -1790,7 +1790,7 @@ fn sengine(params: EngineParams) {
     // so untouched keys cost parse+store only (M209).
     let mut table: HashMap<String, TableEntry> = HashMap::new();
     // E1: engine-owned store. When params.store is set, library + query
-    // spectra resolve from slim on demand — preload chunks are unnecessary
+    // spectra resolve from slim on demand â preload chunks are unnecessary
     // (Python sends none) and per-query spectra JSON drops to zero.
     let mut slim_store: Option<slim::SlimStore> = None;
     let mut slim_rows: HashMap<String, Vec<usize>> = HashMap::new();
@@ -2177,6 +2177,42 @@ fn sengine(params: EngineParams) {
                     partition_by_gate(list, &gate_of);
                 }
             }
+            // LGBM pairs (mol path): aggregate per-spectrum channel cols
+            // across spectra (mean of non-NaN, mirroring the lossgate
+            // gmean above). Emitted only when params.dump_scores > 0.5;
+            // ranked lists untouched -- observation only.
+            let mol_scores = if params.dump_scores > 0.5 {
+                let n = keys.len();
+                let mut agg: HashMap<String, Vec<f64>> = HashMap::new();
+                if let Some(first) = per_spec.iter().find(|c| !c.is_empty()) {
+                    let mut channels: Vec<String> =
+                        first.keys().cloned().collect();
+                    channels.sort();
+                    for ch in channels {
+                        let mut v = vec![0.0f64; n];
+                        let mut cnt = vec![0u32; n];
+                        for cols in per_spec.iter() {
+                            if let Some(col) = cols.get(&ch) {
+                                for (i, x) in col.iter().enumerate() {
+                                    if i < n && !x.is_nan() {
+                                        v[i] += *x;
+                                        cnt[i] += 1;
+                                    }
+                                }
+                            }
+                        }
+                        for i in 0..n {
+                            if cnt[i] > 0 {
+                                v[i] /= cnt[i] as f64;
+                            }
+                        }
+                        agg.insert(ch, v);
+                    }
+                }
+                Some(agg)
+            } else {
+                None
+            };
             let t_fuse = t0.elapsed();
             writeln!(
                 h,
@@ -2186,7 +2222,7 @@ fn sengine(params: EngineParams) {
                     pools: pool_union,
                     mass_swap: mass_swap_any,
                     prefilter_topk: None,
-                    scores: None,
+                    scores: mol_scores,
                     timing: vec![ms(t_parse), ms(t_qprep - t_parse), ms(t_cands - t_qprep), 0.0, 0.0, 0.0, 0.0, ms(t_fuse - t_cands)],
                 })
                 .unwrap()
@@ -2199,7 +2235,7 @@ fn sengine(params: EngineParams) {
         }
         // E1: qrow resolves the query spectrum from the engine-owned store
         // (no query-spectra JSON); q (full RawSpec) stays as the fallback.
-        // qrow without params.store is a protocol error — fail loud.
+        // qrow without params.store is a protocol error â fail loud.
         let q: RawSpec = match m.qrow {
             Some(r) => {
                 let st = slim_store
@@ -2222,7 +2258,7 @@ fn sengine(params: EngineParams) {
         let qn = qloss.len().max(1) as f64;
         let qi: i64 = m.qi.unwrap_or(0);
         let qnm: Option<f64> = m.qnm;
-        // candidates (table lookups only — prepared once at preload)
+        // candidates (table lookups only â prepared once at preload)
         let t_qprep = t0.elapsed();
         let cand_keys = m.cand_keys.unwrap_or_default();
         let mut cands: Vec<CandData> = Vec::with_capacity(cand_keys.len());
@@ -2240,7 +2276,7 @@ fn sengine(params: EngineParams) {
             }
         }
         // pool (input order = distance order from the launcher; keep it).
-        // Pool entry = first spectrum of the key — the same spectra the
+        // Pool entry = first spectrum of the key â the same spectra the
         // launcher used to send per query as first-spectrum messages.
         let t_cands = t0.elapsed();
         let pool_keys = m.pool_keys.unwrap_or_default();
@@ -2435,7 +2471,7 @@ fn sengine(params: EngineParams) {
         let keys: Vec<String> = cands.iter().map(|c| c.key.clone()).collect();
         let t_chan = t0.elapsed();
         let mut ranked = fuse_rank(&keys, &cols, &params);
-        // Router: MONEY GATE first — strong library hit (>= 0.9 cosine)
+        // Router: MONEY GATE first â strong library hit (>= 0.9 cosine)
         // locks router to lib order (fuse_rank already routed overlap to
         // cascade==lib on hits); otherwise the entropy choice over computed
         // evidence (sparse: mass+cleav; busy: gate+entw).
@@ -2982,7 +3018,7 @@ mod engine_tests {
     fn analog_empty_pool_is_zero() {
         // TRULY far pool (100 Da away): neither direct nor shifted matches.
         // (An earlier revision of this test used prec 251 for `far` and
-        // expected modified==0 — wrong: 251 is 50 Da away, i.e. INSIDE the
+        // expected modified==0 â wrong: 251 is 50 Da away, i.e. INSIDE the
         // analog pool, and shifting it by (201-251)=-50 aligns it exactly,
         // so modified==1.0 is the CORRECT analog signal, not a false hit.
         // The runner caught the bad expectation; this is the corrected one.)
@@ -2990,7 +3026,7 @@ mod engine_tests {
         let far = prepare(&[150.0, 250.0], &[1.0, 1.0], 301.0, 0.05, 0.01, None);
         assert_eq!(modified_row(&q, &far, TOL), 0.0);
         assert_eq!(cosine_row(&q, &far, TOL), 0.0);
-        // in-pool shifted matches DO hit — that is the analog signal itself.
+        // in-pool shifted matches DO hit â that is the analog signal itself.
         let near = prepare(&[150.0, 250.0], &[1.0, 1.0], 251.0, 0.05, 0.01, None);
         assert_eq!(modified_row(&q, &near, TOL), 1.0);
         assert_eq!(cosine_row(&q, &near, TOL), 0.0);
