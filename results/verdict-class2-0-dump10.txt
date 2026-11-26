@@ -1,0 +1,2 @@
+RED
+dump suffix but no pairs collected — dump_scores wiring broken (engine scores missing?)
