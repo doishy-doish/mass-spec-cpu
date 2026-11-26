@@ -1,0 +1,2 @@
+GREEN
+results/class2-0-pb.json engine=rust n=10 mrr=0.8143 lib=1.0000 analog=0.0872 stein=1.0000 mass=0.0077 cleav=0.2902 fp=0.0000 entw=0.0067 lgbmb=0.3784 zw=0.8143 swap=0.000 pure=0.5463 libce=1.0000 ent=1.0000 gate=0.0067 qhit_lib=1111111111 qhit_z=1111111111
